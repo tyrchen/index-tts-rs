@@ -167,14 +167,14 @@ flowchart LR
 ### Phase 6：Actor 流式管线、Agent CLI (`apps/cli`)、Daemon 与 MCP Server
 
 #### 3.6.1 目标
-封装线程安全的 `IndexTtsEngine` Actor 流式 API，构建 `apps/cli` (`index-tts`) 命令行工具、CoreAudio 实时播放器、Unix Domain Socket 常驻守护进程、MCP Server 以及 `apps/server` HTTP 接口。
+封装线程安全的 `IndexTtsEngine` Actor 流式 API，构建 `apps/cli` (`itts`) 命令行工具、CoreAudio 实时播放器、Unix Domain Socket 常驻守护进程、MCP Server 以及 `apps/server` HTTP 接口。
 
 #### 3.6.2 涉及文件与变更清单
 1. **`crates/core/src/engine/actor.rs` & `stream.rs` & `crates/core/src/lib.rs`（新建/更新）**：
    - 实现 `MlxWorkerActor`（专属 OS 线程 + `flume::bounded` 命令通道 + `AtomicBool` 优雅停机）与 `SynthesisStream`（逐句流式产出 `AudioChunk`）。
    - 完善 `crates/core/src/lib.rs` 的公开 API 文档与 Doctests。
 2. **`apps/cli/Cargo.toml` & `apps/cli/src/main.rs`（新建）**：
-   - 创建二进制包 `index-tts`，实现 `synth`、`voice` (`add`/`list`/`inspect`/`rm`)、`models` (`pull`/`info`)、`daemon` (`start`/`stop`/`status`)、`mcp` 五大子命令。
+   - 创建二进制包 `itts`，实现 `synth`、`voice` (`add`/`list`/`inspect`/`rm`)、`models` (`pull`/`info`)、`daemon` (`start`/`stop`/`status`)、`mcp` 五大子命令。
 3. **`apps/cli/src/player.rs`（新建）**：
    - 基于 `cpal` 实现 macOS CoreAudio 实时流式播放队列（支持硬件采样率自动适配与无爆音缓冲）。
 4. **`apps/cli/src/daemon.rs`（新建）**：
@@ -186,4 +186,4 @@ flowchart LR
 
 #### 3.6.3 阶段准出标准 (Exit Criteria)
 - 全量质量门禁通过：`cargo build --release`、`cargo nextest run --all-features`、`cargo +nightly fmt --check`、`cargo clippy --all-targets -- -D warnings -W clippy::pedantic`。
-- Agent CLI 实测验证：`index-tts voice add`、`index-tts synth --play --json`、Daemon 热态毫秒级响应、以及 MCP stdio 协议交互全部通过。
+- Agent CLI 实测验证：`itts voice add`、`itts synth --play --json`、Daemon 热态毫秒级响应、以及 MCP stdio 协议交互全部通过。

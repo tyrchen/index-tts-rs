@@ -4,6 +4,12 @@ FIXTURE_DIR := crates/core/fixtures
 build:
 	@cargo build --workspace --all-targets
 
+install:
+	@cargo install --path apps/cli --locked --force
+
+serve:
+	@cargo run --release -p index-tts-rs-server -- $(SERVER_ARGS)
+
 test:
 	@cargo nextest run --all-features
 
@@ -147,4 +153,4 @@ release:
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: build test lint fmt audit bench generate-fixtures check-agent-sync release update-submodule
+.PHONY: build install serve test lint fmt audit bench generate-fixtures check-agent-sync release update-submodule

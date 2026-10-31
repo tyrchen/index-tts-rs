@@ -14,6 +14,7 @@ readme = "README.md"
 
 [workspace.dependencies]
 anyhow = "1.0.102"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
 approx = "0.5"
 arc-swap = "1.9.3"
 base64 = "0.22"
@@ -24,6 +25,7 @@ cpal = "0.18.2"
 criterion = "0.8.2"
 dashmap = "6.1"
 flume = "0.12.0"
+futures-util = "0.3.34"
 hf-hub = "1.0.0"
 hound = "3.5.1"
 memmap2 = "0.9"
@@ -31,16 +33,19 @@ mlx-rs = { version = "0.33.0", features = ["metal", "safetensors"] }
 proptest = "1.6"
 realfft = "3.5.1"
 regex = "1"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 rmcp = { version = "3.8.0", features = ["server", "transport-io"] }
 rstest = "0.26"
 rustfft = "6.4.1"
 safetensors = "0.8.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.142"
+secrecy = "0.10.3"
 symphonia = { version = "0.6.1", default-features = false, features = ["wav", "mp3", "flac", "pcm", "isomp4", "opt-simd"] }
 tempfile = "3"
 thiserror = "2.0.18"
 tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "macros", "fs", "sync", "time", "net", "io-util", "io-std", "signal"] }
+tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 typed-builder = "0.23.2"
@@ -49,3 +54,4 @@ winnow = "1.0.4"
 
 # workspace crates
 index-tts-rs-core = { path = "crates/core" }
+index-tts-rs-director = { path = "crates/director" }

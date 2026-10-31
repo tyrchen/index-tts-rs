@@ -1,4 +1,4 @@
-//! `index-tts`: AI-Agent friendly CLI, Unix Domain Socket daemon, and MCP server for
+//! `itts`: AI-Agent friendly CLI, Unix Domain Socket daemon, and MCP server for
 //! `IndexTTS-2.5` on Apple Silicon.
 
 #![forbid(unsafe_code)]
@@ -32,8 +32,12 @@ use index_tts_rs_core::{
     models::{LengthRegulator, ModelWeightKind, resolve_model_dir},
     voice::{VoiceExtractor, VoiceStore, default_voices_dir},
 };
+use index_tts_rs_director::{
+    Director, DirectorConfig, PlannedUtterance, plan_utterances, prepend_silence,
+};
 use serde::Serialize;
 use serde_json::{json, to_string, to_string_pretty};
+use tokio::task::spawn_blocking;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
@@ -62,7 +66,7 @@ const REQUIRED_REPO_FILES: &[&str] = &[
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "index-tts",
+    name = "itts",
     version,
     about = "Native Rust & MLX Metal speech synthesis engine for IndexTTS-2.5 on Apple Silicon"
 )]
@@ -87,6 +91,8 @@ struct Cli {
 enum Commands {
     /// Synthesize speech from text using a registered `.itts_voice` or raw reference audio.
     Synth(Box<SynthArgs>),
+    /// Add optional `DeepSeek` pacing controls without rewriting the source text.
+    Annotate(AnnotateArgs),
     /// Manage `.itts_voice` speaker conditioning snapshots.
     Voice {
         #[command(subcommand)]
@@ -109,6 +115,10 @@ enum Commands {
 #[derive(Debug, Args)]
 #[allow(clippy::struct_excessive_bools)]
 struct SynthArgs {
+    /// Additional silence between explicit paragraphs (`0..=5000` ms).
+    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u32).range(0..=5000))]
+    paragraph_pause: u32,
+
     /// Registered voice ID (`<voice_id>`) or path to an `.itts_voice` file.
     #[arg(long, short = 'v')]
     voice: Option<String>,
@@ -208,6 +218,22 @@ struct SynthArgs {
     /// Classifier-free guidance rate (`0.0..=2.0`, default `0.7`).
     #[arg(long, default_value_t = 0.7)]
     cfg_rate: f32,
+}
+
+#[derive(Debug, Args)]
+struct AnnotateArgs {
+    /// Text to annotate (use --stdin for a file or pipeline).
+    #[arg(long, short = 't', conflicts_with = "stdin")]
+    text: Option<String>,
+    /// Read untagged source text from standard input.
+    #[arg(long)]
+    stdin: bool,
+    /// Request poetry pacing rather than conversational pacing.
+    #[arg(long)]
+    poetry: bool,
+    /// Optional YAML configuration for the `DeepSeek` provider.
+    #[arg(long)]
+    director_config: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -317,6 +343,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Synth(args) => handle_synth_command(config, *args).await,
+        Commands::Annotate(args) => handle_annotate_command(args).await,
         Commands::Voice { action } => handle_voice_command(&config, action),
         Commands::Models { action } => handle_models_command(&config, action).await,
         Commands::Daemon { action } => handle_daemon_command(config, action).await,
@@ -361,7 +388,7 @@ async fn handle_synth_command(config: EngineConfig, args: SynthArgs) -> Result<(
     let total_start = Instant::now();
     let socket_path = args.socket.unwrap_or_else(default_daemon_socket_path);
     let sample_rate = config.sample_rate;
-    let interval_ms = req.interval_silence_ms;
+    let plan = plan_utterances(&req, args.paragraph_pause)?;
 
     let player = if args.play {
         Some(AudioPlayer::try_new()?)
@@ -371,7 +398,8 @@ async fn handle_synth_command(config: EngineConfig, args: SynthArgs) -> Result<(
     let stream_stdout_pcm = args.out.as_deref() == Some(Path::new("-"));
 
     let mut chunks: Vec<AudioChunk> = Vec::new();
-    let mut on_chunk = |chunk: AudioChunk| -> Result<()> {
+    let total_utterances = plan.len();
+    let mut on_chunk = |chunk: AudioChunk, utterance_index: usize| -> Result<()> {
         if let Some(p) = &player {
             p.enqueue_pcm_i16(&chunk.pcm_i16, chunk.sample_rate)?;
         }
@@ -386,6 +414,8 @@ async fn handle_synth_command(config: EngineConfig, args: SynthArgs) -> Result<(
         } else if args.jsonl {
             let line = to_string(&json!({
                 "event": "chunk",
+                "utteranceIndex": utterance_index,
+                "totalUtterances": total_utterances,
                 "segmentIndex": chunk.segment_index,
                 "totalSegments": chunk.total_segments,
                 "samples": chunk.pcm_i16.len(),
@@ -399,26 +429,11 @@ async fn handle_synth_command(config: EngineConfig, args: SynthArgs) -> Result<(
         Ok(())
     };
 
-    let used_daemon = if args.no_daemon {
-        false
-    } else {
-        try_synthesize_via_daemon(&socket_path, &req, &mut on_chunk).await?
-    };
-
-    let mut model_load_ms = 0.0_f64;
-    if !used_daemon {
-        let t_load = Instant::now();
-        let engine = IndexTtsEngine::start(config)?;
-        model_load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
-        let stream = engine.synthesize_stream(req)?;
-        while let Some(chunk_res) = stream.next_chunk().await {
-            on_chunk(chunk_res?)?;
-        }
-        engine.stop()?;
-    }
+    let execution =
+        execute_synthesis_plan(config, plan, &socket_path, args.no_daemon, &mut on_chunk).await?;
 
     let wall_secs = total_start.elapsed().as_secs_f32();
-    let res = merge_chunks_into_result(chunks, sample_rate, interval_ms, wall_secs);
+    let res = merge_chunks_into_result(chunks, sample_rate, wall_secs);
 
     if let Some(out_path) = &args.out
         && !stream_stdout_pcm
@@ -432,8 +447,8 @@ async fn handle_synth_command(config: EngineConfig, args: SynthArgs) -> Result<(
     emit_synth_summary(
         &res,
         args.out.as_deref(),
-        used_daemon,
-        model_load_ms,
+        execution.used_daemon,
+        execution.model_load_ms,
         wall_secs,
         args.json,
         args.jsonl,
@@ -441,20 +456,115 @@ async fn handle_synth_command(config: EngineConfig, args: SynthArgs) -> Result<(
     )
 }
 
-fn build_synthesis_request(args: &SynthArgs) -> Result<SynthesisRequest> {
-    let raw_text = if args.stdin {
-        let mut buf = String::new();
-        io::stdin()
-            .read_to_string(&mut buf)
-            .context("failed to read synthesis text from stdin")?;
-        buf
-    } else {
-        args.text.clone().ok_or_else(|| {
-            anyhow!("either `--text <TEXT>` or `--stdin` must be provided for `synth`")
-        })?
-    };
+#[derive(Debug)]
+struct PlanExecution {
+    used_daemon: bool,
+    model_load_ms: f64,
+}
 
-    let text = SynthesisText::new(raw_text)?;
+async fn execute_synthesis_plan(
+    config: EngineConfig,
+    plan: Vec<PlannedUtterance>,
+    socket_path: &Path,
+    no_daemon: bool,
+    on_chunk: &mut impl FnMut(AudioChunk, usize) -> Result<()>,
+) -> Result<PlanExecution> {
+    let mut used_daemon = false;
+    let mut model_load_ms = 0.0_f64;
+    let mut local_engine = None;
+    let synthesis_result: Result<()> = async {
+        for (utterance_index, part) in plan.into_iter().enumerate() {
+            let interval_ms = part.request.interval_silence_ms;
+            let pause_ms = part.pause_before_ms;
+            let mut on_part = |mut chunk: AudioChunk| -> Result<()> {
+                let silence = if chunk.segment_index == 0 {
+                    pause_ms
+                } else {
+                    interval_ms
+                };
+                prepend_silence(&mut chunk.pcm_i16, chunk.sample_rate, silence)?;
+                on_chunk(chunk, utterance_index)
+            };
+            let forwarded = if no_daemon {
+                false
+            } else {
+                try_synthesize_via_daemon(socket_path, &part.request, &mut on_part).await?
+            };
+            used_daemon |= forwarded;
+            if !forwarded {
+                if local_engine.is_none() {
+                    let started = Instant::now();
+                    let config = config.clone();
+                    local_engine = Some(
+                        spawn_blocking(move || {
+                            IndexTtsEngine::start(config)
+                                .context("failed to start local synthesis engine")
+                        })
+                        .await
+                        .context("local engine startup task failed")??,
+                    );
+                    model_load_ms = started.elapsed().as_secs_f64() * 1000.0;
+                }
+                if let Some(engine) = &local_engine {
+                    let stream = engine.synthesize_stream(part.request)?;
+                    while let Some(chunk) = stream.next_chunk().await {
+                        on_part(chunk?)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Some(engine) = local_engine {
+        let stop_result = spawn_blocking(move || {
+            engine
+                .stop()
+                .context("failed to stop local synthesis engine")
+        })
+        .await
+        .context("local engine shutdown task failed");
+        synthesis_result?;
+        stop_result??;
+    } else {
+        synthesis_result?;
+    }
+
+    Ok(PlanExecution {
+        used_daemon,
+        model_load_ms,
+    })
+}
+
+fn read_input_text(text: Option<&str>, from_stdin: bool) -> Result<SynthesisText> {
+    let raw = if from_stdin {
+        let mut text = String::new();
+        io::stdin()
+            .take(16_385)
+            .read_to_string(&mut text)
+            .context("failed to read input text from stdin")?;
+        text
+    } else {
+        text.ok_or_else(|| anyhow!("provide --text <TEXT> or --stdin"))?
+            .to_owned()
+    };
+    Ok(SynthesisText::new(raw)?)
+}
+
+async fn handle_annotate_command(args: AnnotateArgs) -> Result<()> {
+    let text = read_input_text(args.text.as_deref(), args.stdin)?;
+    let config = match args.director_config {
+        Some(path) => DirectorConfig::from_yaml_file(path).await?,
+        None => DirectorConfig::default(),
+    };
+    let director = Director::from_env(config)?;
+    let script = director.annotate(text.as_str(), args.poetry).await?;
+    writeln!(io::stdout(), "{script}")?;
+    Ok(())
+}
+
+fn build_synthesis_request(args: &SynthArgs) -> Result<SynthesisRequest> {
+    let text = read_input_text(args.text.as_deref(), args.stdin)?;
     let speaker = match (&args.voice, &args.ref_audio) {
         (Some(v), _) => {
             let path = PathBuf::from(v);
@@ -507,23 +617,14 @@ fn build_synthesis_request(args: &SynthArgs) -> Result<SynthesisRequest> {
 fn merge_chunks_into_result(
     chunks: Vec<AudioChunk>,
     sample_rate: u32,
-    interval_silence_ms: u32,
     wall_secs: f32,
 ) -> SynthesisResult {
     let segments_count = chunks.len();
-    let silence_samples = if interval_silence_ms > 0 && segments_count > 1 {
-        ((f64::from(sample_rate) * f64::from(interval_silence_ms)) / 1000.0) as usize
-    } else {
-        0
-    };
     let mut pcm_i16 = Vec::new();
     let mut total_mel_tokens = 0_usize;
     let mut timings = StageTimings::default();
 
-    for (idx, chunk) in chunks.into_iter().enumerate() {
-        if idx > 0 && silence_samples > 0 {
-            pcm_i16.resize(pcm_i16.len() + silence_samples, 0_i16);
-        }
+    for chunk in chunks {
         pcm_i16.extend_from_slice(&chunk.pcm_i16);
         total_mel_tokens += chunk.mel_tokens;
         timings.accumulate_segment(&chunk.timings);

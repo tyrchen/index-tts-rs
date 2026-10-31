@@ -549,7 +549,7 @@ pub fn resolve_model_dir(explicit_dir: Option<&Path>, repo_id: &str) -> Result<P
 
     Err(IndexTtsError::weight_load(
         effective_repo,
-        "could not locate valid local model snapshot in Hugging Face cache; run `index-tts models \
+        "could not locate valid local model snapshot in Hugging Face cache; run `itts models \
          pull` or pass `--model-dir`",
     ))
 }

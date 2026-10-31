@@ -11,7 +11,7 @@
 ### 1.1 双核产品形态
 - **形态一：可嵌入式 Rust 核心库（Crate: `index-tts-rs-core`）**
   供第三方 Rust 开发者通过 `cargo add` 集成，提供编译期类型安全、零 `unwrap`、支持异步流式（`Stream<Item = Result<AudioChunk>>`）与 Actor 并发调度的原生 API。
-- **形态二：面向 AI Agent 与开发者的全能命令行与服务套件（App: `index-tts` CLI & Server）**
+- **形态二：面向 AI Agent 与开发者的全能命令行与服务套件（App: `itts` CLI & Server）**
   提供单二进制 CLI，内置 **音色快照管理（`.itts_voice`）**、**自动驻留后台守护进程（Auto-Warm Daemon）**、**MCP Server (stdio)** 以及 **OpenAI 兼容 HTTP/WebSocket 语音接口**。
 
 ---
@@ -69,14 +69,14 @@
   - 由于底层 Metal/MLX 计算图执行具有设备上下文亲和性，Crate 内部采用专用的推理 Worker 线程/Actor 持有 MLX 模型状态，对外暴露可自由 `Clone + Send + Sync` 的轻量级 `IndexTtsEngine` 句柄（通过 `flume` 通道通信）。
 
 ### FR-5：面向 AI Agent 的 CLI、常驻 Daemon 与 MCP Server
-- **FR-5.1 CLI 子命令体系 (`index-tts`)**：
-  - `index-tts models pull / info`：自动从 Hugging Face 下载或校验模型权重。
-  - `index-tts voice add / list / inspect / rm`：管理本地 `.itts_voice` 音色库。
-  - `index-tts synth`：核心合成命令，支持 `--voice <name>` 或 `--ref <wav>`、`| index-tts synth --stdin`、`--play`、`--out <path>`、`--json` / `--jsonl`。
-  - `index-tts daemon start / stop / status`：管理后台常驻 Unix Domain Socket 守护进程（支持空闲超时自动退出，如 `--idle-timeout 10m`）。
-  - `index-tts mcp`：启动标准 MCP (Model Context Protocol) stdio Server，向 Agent 暴露 `speak`、`synthesize_to_file`、`register_voice`、`list_voices` 四个工具。
+- **FR-5.1 CLI 子命令体系 (`itts`)**：
+  - `itts models pull / info`：自动从 Hugging Face 下载或校验模型权重。
+  - `itts voice add / list / inspect / rm`：管理本地 `.itts_voice` 音色库。
+  - `itts synth`：核心合成命令，支持 `--voice <name>` 或 `--ref <wav>`、`| itts synth --stdin`、`--play`、`--out <path>`、`--json` / `--jsonl`。
+  - `itts daemon start / stop / status`：管理后台常驻 Unix Domain Socket 守护进程（支持空闲超时自动退出，如 `--idle-timeout 10m`）。
+  - `itts mcp`：启动标准 MCP (Model Context Protocol) stdio Server，向 Agent 暴露 `speak`、`synthesize_to_file`、`register_voice`、`list_voices` 四个工具。
 - **FR-5.2 自动守护进程透明加速（Auto-Daemon Fast Path）**：
-  - 当 Agent 执行 `index-tts synth` 时，若本地 Daemon 正在运行，CLI 自动通过 Unix Socket 将请求转发给 Daemon 执行，省去 100% 的模型加载时间（响应延迟降至毫秒级）。
+  - 当 Agent 执行 `itts synth` 时，若本地 Daemon 正在运行，CLI 自动通过 Unix Socket 将请求转发给 Daemon 执行，省去 100% 的模型加载时间（响应延迟降至毫秒级）。
 
 ---
 

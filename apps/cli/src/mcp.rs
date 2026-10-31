@@ -1,4 +1,4 @@
-//! Model Context Protocol (MCP) JSON-RPC 2.0 server over `stdin`/`stdout` (`index-tts mcp`).
+//! Model Context Protocol (MCP) JSON-RPC 2.0 server over `stdin`/`stdout` (`itts mcp`).
 //!
 //! Exposes 4 standard MCP tools for AI coding agents (Claude Code, Cursor, Antigravity):
 //! - `speak`: Synthesize speech and play directly through macOS `CoreAudio`.
@@ -161,7 +161,7 @@ pub async fn handle_mcp_jsonrpc_line(
                     "tools": {}
                 },
                 "serverInfo": {
-                    "name": "index-tts",
+                    "name": "itts",
                     "version": env!("CARGO_PKG_VERSION")
                 }
             })),

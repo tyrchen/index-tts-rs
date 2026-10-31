@@ -2,7 +2,7 @@
 
 本目录包含 `index-tts-rs` 的产品需求文档（PRD）、详细架构设计（Design Spec）、分步实施计划（Implementation Plan）与验证计划（Verification Plan），供研发与 AI Agent 生成及验证代码使用。
 
-## Core Specifications
+## Core Specifications (`itts` CLI & Server)
 
 - [IndexTTS-2.5 Rust 高性能语音合成系统产品需求文档 (`indextts-rust-prd`)](indextts-rust-prd.md) — 定义产品愿景、双核形态（Rust Library Crate + AI Agent CLI/Daemon/MCP）、功能需求（FR-1..FR-5）、非功能 SLA 指标与安全边界。
 - [IndexTTS-2.5 Rust 高性能推理引擎与 Agent CLI 详细架构设计 (`indextts-rust-engine-design`)](indextts-rust-engine-design.md) — 定义 Workspace 模块分层、两阶段音色快照（`.itts_voice`）架构、纯 Rust DSP/Frontend 算法规格、`mlx-rs` 算子映射与全 GPU 驻留优化、Actor 并发流式管线及验证策略。

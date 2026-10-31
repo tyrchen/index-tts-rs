@@ -1,0 +1,4 @@
+# Optional DeepSeek speech pacing annotation. API key: DEEPSEEK_API_KEY.
+model: deepseek-flash
+timeoutSecs: 30
+maxTokens: 4096
