@@ -1,8 +1,6 @@
 [package]
 name = "index-tts-rs-server"
-description = """
-
-"""
+description = "HTTP and OpenAI-compatible speech synthesis server for index-tts-rs"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -12,6 +10,8 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-index-tts-rs-core.workspace = true
 anyhow.workspace = true
+index-tts-rs-core.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
