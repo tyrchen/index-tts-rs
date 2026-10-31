@@ -12,7 +12,7 @@ itts doctor --output json
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "ready": true,
   "checks": [
     { "name": "platform", "status": "ok", "summary": "macOS on Apple Silicon (Metal)" },
@@ -125,8 +125,8 @@ stops the daemon job.
 For direct integrations, the socket speaks newline-delimited JSON (protocol version 2):
 
 ```text
-→ {"id":1,"method":"hello","clientVersion":"0.1.0","protocolVersion":2}
-← {"id":1,"event":"welcome","serverVersion":"0.1.0","protocolVersion":2}
+→ {"id":1,"method":"hello","clientVersion":"0.2.0","protocolVersion":2}
+← {"id":1,"event":"welcome","serverVersion":"0.2.0","protocolVersion":2}
 → {"id":2,"method":"synth","job":{"input":"你好","voice":"tyr","outputPath":"/abs/out.wav"},"includePcm":false}
 ← {"id":2,"event":"started",...}  {"id":2,"event":"chunk",...}  {"id":2,"event":"done",...}
 → {"id":3,"method":"cancel","target":2}

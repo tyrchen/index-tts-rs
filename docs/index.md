@@ -2,6 +2,9 @@
 
 ## Usage
 
+- [English README](../README.md) / [中文 README](../README.zh-CN.md) — Installation, product decisions, architecture, and historical benchmark context.
+- [Release guide](usage/releasing.md) — Source packaging, release gates, model verification, registry publication, and draft GitHub releases.
+
 - [itts Agent Integration Guide](usage/itts-agent-integration.md) — Output modes, stable error codes and exit codes, `itts doctor` / `itts schema`, warm daemon lifecycle, MCP tools, and the daemon wire protocol.
 - [itts Speech Controls and AI Pacing](usage/itts-speech-controls.md) — Inline controls, optional DeepSeek annotation, poem paragraph handling, and browser streaming.
 

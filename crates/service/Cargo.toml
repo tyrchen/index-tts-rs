@@ -4,8 +4,12 @@ description = "Transport-neutral speech job model, stable error codes, and execu
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+readme.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 
 [dependencies]
 base64.workspace = true

@@ -1,2 +1,7 @@
 /target
 .vscode
+.DS_Store
+/dist
+.env
+.env.*
+!.env.example

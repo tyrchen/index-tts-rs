@@ -6,8 +6,9 @@ resolver = "3"
 version = "0.2.0"
 authors = ["Tyr Chen <tyr.chen@gmail.com>"]
 edition = "2024"
+rust-version = "1.99"
 license = "MIT"
-documentation = "https://docs.rs/index-tts-rs-core"
+documentation = "https://github.com/tyrchen/index-tts-rs#development"
 repository = "https://github.com/tyrchen/index-tts-rs"
 homepage = "https://github.com/tyrchen/index-tts-rs"
 readme = "README.md"
@@ -54,6 +55,6 @@ validator = { version = "0.21.0", features = ["derive"] }
 winnow = "1.0.4"
 
 # workspace crates
-index-tts-rs-core = { path = "crates/core" }
-index-tts-rs-director = { path = "crates/director" }
-index-tts-rs-service = { path = "crates/service" }
+index-tts-rs-core = { version = "=0.2.0", path = "crates/core" }
+index-tts-rs-director = { version = "=0.2.0", path = "crates/director" }
+index-tts-rs-service = { version = "=0.2.0", path = "crates/service" }

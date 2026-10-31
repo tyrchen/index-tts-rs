@@ -1,7 +1,7 @@
 //! Dedicated OS-thread `MlxWorkerActor` and thread-safe [`IndexTtsEngine`] handle.
 //!
 //! Because Apple Silicon Metal command buffers and `mlx_rs::Array` operations are bound to thread
-//! stream contexts and do not implement `Send`/`Sync`, [`MlxWorkerActor`] owns all MLX model
+//! stream contexts and do not implement `Send`/`Sync`, the worker actor owns all MLX model
 //! weights on a dedicated worker thread and communicates with callers over bounded `flume`
 //! channels.
 

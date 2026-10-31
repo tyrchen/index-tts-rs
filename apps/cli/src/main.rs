@@ -63,7 +63,7 @@ struct Cli {
 enum Commands {
     /// Synthesize speech from text with a registered voice or reference audio.
     Synth(Box<SynthArgs>),
-    /// Add DeepSeek pacing and emotion controls without rewriting the text.
+    /// Add `DeepSeek` pacing and emotion controls without rewriting the text.
     Annotate(AnnotateArgs),
     /// Manage `.itts_voice` speaker snapshots.
     Voice {

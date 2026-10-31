@@ -1,5 +1,9 @@
 # IndexTTS-2.5-mlx Rust (`index-tts-rs`) 验证与性能基准对比报告
 
+> 历史测量说明：本报告保留早期开发阶段的数据，不代表当前版本已重新完成全部性能测量。
+> 原始记录未包含具体芯片 / 内存、macOS 构建号、多轮统计和实现 commit，私人参考录音也未分发。
+> 不应据此作跨硬件性能承诺。当前安装与测量注意事项见[中文 README](../../README.zh-CN.md)。
+
 ## 1. 测试背景与环境配置
 
 本报告记录了 `index-tts-rs`（Phase 1 至 Phase 6 全量实现 + 深度内存与算子融合优化）在 Apple Silicon Metal GPU 上的**数值精度对齐验证（Golden Checkpoints `CP-01`..`CP-14`）**、**流式死权重裁剪与顺序分阶段提取内存审计**，以及基于真实参考音频 `~/Downloads/voice.wav` 与原版 Python `uvx index-tts-2.5-mlx` 的**端到端运行效率对比**。
@@ -136,7 +140,7 @@ xychart-beta
 
 ## 5. 多句流式合成与首包延迟 (TTFA) 基准测试
 
-针对包含 4 个句子的长文本（共生成 **`15.62s` 音频、`344,494` 个采样点、`377` 个 Mel Token**）：
+针对生成 4 个音频分段的长文本（共生成 **`15.62s` 音频、`344,494` 个采样点、`377` 个 Mel Token**）：
 > `"第一句话用于测试首包流式延迟。第二句话继续生成后续语音片段，验证Actor流水线的低延迟特性。第三句话完成整段语音合成！"`
 
 | 分句序号 (`segmentIndex`) | 生成音频时长 (`durationSecs`) | Mel Token 数 | 优化前耗时 | **优化后分句耗时 (`totalMs`)** | 累计完成时间 | 播放缓冲状态 |
@@ -170,7 +174,7 @@ xychart-beta
 
 | 验证门禁 | 命令 | 结果 |
 | :--- | :--- | :--- |
-| **代码格式检查** | `make fmt` (`cargo +nightly fmt --all -- --check`) | **通过** |
+| **代码格式检查** | `cargo +nightly fmt --all -- --check` | **通过** |
 | **严格 Clippy 静态检查** | `make lint` (`cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic -W clippy::unwrap_used -W clippy::expect_used -W clippy::indexing_slicing -W clippy::panic`) | **通过（0 warnings，全仓 `#![forbid(unsafe_code)]`）** |
 | **核心库单元/黄金/属性测试** | `make test` (`cargo nextest run --all-features`) | **91 / 91 通过** |
 | **全仓文档测试 (Doctests)** | `cargo test --workspace --doc` | **92 / 92 通过** |
@@ -187,7 +191,7 @@ cargo build --release --workspace
 # 2. 从 ~/Downloads/voice.wav 预提取 .itts_voice 声纹快照（耗时 ~0.59s，峰值 RSS 1.78 GB，生成 1.60 MiB 快照）
 /usr/bin/time -l itts voice add demo_voice \
   --ref ~/Downloads/voice.wav \
-  --json
+  --output json
 
 # 3. 使用预提取声纹合成语音（跳过 2.86 GB Stage 0 编码器，总耗时 ~4.36s，纯合成 3.85s，RTF 0.385，峰值 RSS 2.50 GB）
 /usr/bin/time -l itts synth \
@@ -196,7 +200,7 @@ cargo build --release --workspace
   --greedy \
   --no-daemon \
   --out /tmp/rust_voice_out.wav \
-  --json
+  --output json
 
 # 4. 单次冷启动直接传入原始参考音频（顺序加载并即刻释放 Stage 0 编码器，总耗时 ~4.93s，峰值 RSS 3.94 GB）
 /usr/bin/time -l itts synth \
@@ -205,16 +209,16 @@ cargo build --release --workspace
   --greedy \
   --no-daemon \
   --out /tmp/rust_ref_out.wav \
-  --json
+  --output json
 
 # 5. 启动驻留热模型 Daemon 并执行零冷启动合成（总耗时 ~3.85s，RTF 0.384，Client RSS 14.5 MB）
-itts daemon start --idle-timeout-secs 600 &
+itts daemon start --idle-timeout-secs 600
 itts synth \
   --voice demo_voice \
   --text "你好，欢迎使用 IndexTTS Rust 原生语音合成引擎！今天天气真不错，我们一起来测试一下语音克隆的速度和音质表现。" \
   --greedy \
   --out /tmp/rust_daemon_out.wav \
-  --json
+  --output json
 
 # 6. 多句 JSONL 流式输出与首包延迟 (TTFA = 1.85s) 测试
 itts synth \
@@ -223,6 +227,6 @@ itts synth \
   --max-text-tokens 25 \
   --greedy \
   --out /tmp/rust_stream_out.wav \
-  --jsonl
-itts daemon stop --json
+  --output jsonl
+itts daemon stop --output json
 ```

@@ -164,7 +164,7 @@ impl EmoMatrix {
 
     /// Selects the speaker-matched emotion prototype for each of the 8 emotion categories by
     /// maximizing cosine similarity against `style` (`[192]`), and returns the weighted sum
-    /// $\sum_{c=0}^7 w_c \cdot \text{emo\_matrix}[c, r^*_c]$ (`[1280]`).
+    /// of the matched prototype rows, with shape `[1280]`.
     ///
     /// # Errors
     ///
@@ -186,7 +186,12 @@ impl EmoMatrix {
                 let mut best_row = row_start;
                 let mut best_cos = f32::NEG_INFINITY;
                 for row in row_start..(row_start + count) {
-                    let spk_slice = &self.spk_matrix[row * STYLE_DIM..(row + 1) * STYLE_DIM];
+                    let spk_slice = self
+                        .spk_matrix
+                        .get(row * STYLE_DIM..(row + 1) * STYLE_DIM)
+                        .ok_or_else(|| {
+                            IndexTtsError::validation("spk_matrix", "prototype row is out of range")
+                        })?;
                     let mut dot = 0.0_f32;
                     let mut row_norm_sq = 0.0_f32;
                     for (&s, &r) in style.iter().zip(spk_slice.iter()) {
@@ -199,7 +204,12 @@ impl EmoMatrix {
                         best_row = row;
                     }
                 }
-                let emo_slice = &self.emo_matrix[best_row * CONDS_DIM..(best_row + 1) * CONDS_DIM];
+                let emo_slice = self
+                    .emo_matrix
+                    .get(best_row * CONDS_DIM..(best_row + 1) * CONDS_DIM)
+                    .ok_or_else(|| {
+                        IndexTtsError::validation("emo_matrix", "prototype row is out of range")
+                    })?;
                 for (dst, &val) in combined.iter_mut().zip(emo_slice.iter()) {
                     *dst = weight.mul_add(val, *dst);
                 }
@@ -484,7 +494,7 @@ impl SpeakerContext {
 
     /// Dynamically synthesizes a new `[1, 3, 1280]` `conds` tensor for this speaker snapshot by
     /// recovering $\mathbf{s}_{\text{spk}} = \text{spk\_proj}(\text{style})$ and
-    /// $\mathbf{e}_{\text{base}} = (\text{conds}[0] - \mathbf{s}_{\text{spk}}) / \alpha_0$,
+    /// recovering the base emotion from the saved conditioning and its original emotion scale,
     /// blending `emo_vector` via [`EmoMatrix::blend_emovec`], and adding $\mathbf{s}_{\text{spk}}$.
     ///
     /// This runs in microseconds on CPU without loading any Stage 0 neural encoders.
@@ -506,8 +516,10 @@ impl SpeakerContext {
         let alpha_0 = self.metadata.emo_alpha.get();
         let mut base_emovec = vec![0.0_f32; CONDS_DIM];
         if alpha_0 >= 1e-4 {
-            for (i, dst) in base_emovec.iter_mut().enumerate() {
-                *dst = (self.conds[i] - spk_cond[i]) / alpha_0;
+            for ((dst, condition), speaker) in
+                base_emovec.iter_mut().zip(&self.conds).zip(&spk_cond)
+            {
+                *dst = (condition - speaker) / alpha_0;
             }
         }
         let blended = emo_matrix.blend_emovec(&self.style, &base_emovec, emo_vector, emo_alpha)?;

@@ -896,14 +896,11 @@ impl EmotionVector {
     /// # Ok::<(), index_tts_rs_core::error::IndexTtsError>(())
     /// ```
     pub fn new(weights: [f32; 8]) -> Result<Self> {
-        for (idx, &w) in weights.iter().enumerate() {
+        for (name, &w) in EMOTION_NAMES.iter().zip(&weights) {
             if !w.is_finite() || !(0.0..=1.0).contains(&w) {
                 return Err(IndexTtsError::validation(
                     "emo_vector",
-                    format!(
-                        "emotion `{}` weight must be finite and in 0.0..=1.0, got {w}",
-                        EMOTION_NAMES[idx]
-                    ),
+                    format!("emotion `{name}` weight must be finite and in 0.0..=1.0, got {w}"),
                 ));
             }
         }
@@ -995,9 +992,9 @@ impl EmotionVector {
     pub fn normalize(&self, apply_bias: bool, emo_alpha: EmoAlpha) -> [f32; 8] {
         let raw = self.as_array();
         let mut biased = [0.0_f32; 8];
-        for i in 0..8 {
-            let w = raw[i].max(0.0);
-            biased[i] = if apply_bias { w * EMOTION_BIAS[i] } else { w };
+        for ((dst, value), bias) in biased.iter_mut().zip(raw).zip(EMOTION_BIAS) {
+            let w = value.max(0.0);
+            *dst = if apply_bias { w * bias } else { w };
         }
         let total: f32 = biased.iter().sum();
         if total > 0.8 {
@@ -1069,14 +1066,14 @@ impl EmotionVector {
 
         if tokens.len() == 8 && tokens.iter().all(|t| !t.contains([':', '：', '='])) {
             let mut weights = [0.0_f32; 8];
-            for (idx, token) in tokens.iter().enumerate() {
+            for (idx, (dst, token)) in weights.iter_mut().zip(&tokens).enumerate() {
                 let value = token.parse::<f32>().map_err(|_| {
                     IndexTtsError::validation(
                         "emo_vector",
                         format!("invalid numeric weight `{token}` at index {idx}"),
                     )
                 })?;
-                weights[idx] = value;
+                *dst = value;
             }
             let vec = Self::new(weights)?;
             return Ok((!vec.is_zero()).then_some(vec));
@@ -1099,13 +1096,13 @@ impl EmotionVector {
             if !value.is_finite() || !(0.0..=1.0).contains(&value) {
                 return Err(IndexTtsError::validation(
                     "emo_vector",
-                    format!(
-                        "emotion `{}` weight must be finite and in 0.0..=1.0, got {value}",
-                        EMOTION_NAMES[idx]
-                    ),
+                    format!("emotion `{name}` weight must be finite and in 0.0..=1.0, got {value}"),
                 ));
             }
-            weights[idx] = value;
+            let dst = weights.get_mut(idx).ok_or_else(|| {
+                IndexTtsError::validation("emo_vector", "emotion index is out of range")
+            })?;
+            *dst = value;
         }
 
         let vec = Self::new(weights)?;
@@ -1127,11 +1124,11 @@ impl EmotionVector {
     #[must_use]
     pub fn format_compact(&self) -> String {
         let mut parts = Vec::new();
-        for (idx, &w) in self.as_array().iter().enumerate() {
+        for (name, w) in EMOTION_NAMES.iter().zip(self.as_array()) {
             if w > 0.005 {
                 let text = format!("{w:.2}");
                 let clean = text.trim_end_matches('0').trim_end_matches('.');
-                parts.push(format!("{}:{clean}", EMOTION_NAMES[idx]));
+                parts.push(format!("{name}:{clean}"));
             }
         }
         if parts.is_empty() {
@@ -1453,7 +1450,7 @@ impl EngineConfig {
     /// use std::path::Path;
     /// use index_tts_rs_core::config::EngineConfig;
     ///
-    /// let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/default.yaml");
+    /// let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config/default.yaml");
     /// let cfg = EngineConfig::from_yaml_file(&path)?;
     /// assert_eq!(cfg.sample_rate, 22050);
     /// # Ok::<(), index_tts_rs_core::error::IndexTtsError>(())
@@ -1698,7 +1695,7 @@ cfm:
 
     #[test]
     fn test_should_load_default_yaml_config() {
-        let yaml = include_str!("../../../config/default.yaml");
+        let yaml = include_str!("../config/default.yaml");
         let cfg = EngineConfig::from_yaml_str(yaml);
         assert!(cfg.is_ok());
     }
@@ -1739,6 +1736,17 @@ cfm:
     #[case("")]
     fn test_should_reject_invalid_emotion_spec(#[case] spec: &str) {
         assert!(EmotionVector::parse_spec(spec).is_err());
+    }
+
+    #[test]
+    fn test_should_preserve_canonical_order_in_numeric_emotion_spec() -> Result<()> {
+        let parsed = EmotionVector::parse_spec("0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8")?;
+        assert_eq!(
+            parsed.map(|emotion| emotion.as_array()),
+            Some([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]),
+        );
+        assert!(EmotionVector::parse_spec("0,0,0,0,0,0,0,0")?.is_none());
+        Ok(())
     }
 
     proptest! {

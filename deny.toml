@@ -70,7 +70,7 @@ feature-depth = 1
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
 ignore = [
-  # "RUSTSEC-2024-0436",
+  { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 is an unmaintained compile-time proc-macro required by mlx-rs 0.33.0; no patched upstream release is available. This exception covers only the maintenance advisory, not vulnerabilities. Revisit when mlx-rs removes paste." },
   #"RUSTSEC-0000-0000",
   #{ id = "RUSTSEC-0000-0000", reason = "you can specify a reason the advisory is ignored" },
   #"a-crate-that-is-yanked@0.1.1", # you can also ignore yanked crate versions if you wish

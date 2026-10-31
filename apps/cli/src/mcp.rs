@@ -5,7 +5,12 @@
 //! model, and `initialize` answers immediately. Tool results carry `structuredContent`; failures
 //! are `isError` results whose structured body is a [`ServiceError`] (`code`, `message`, `hint`).
 
-use std::{env, path::PathBuf, sync::Arc};
+use std::{
+    env,
+    future::{Future, ready},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result};
 use index_tts_rs_core::{
@@ -200,12 +205,12 @@ impl ServerHandler for IttsMcp {
             .with_instructions(INSTRUCTIONS)
     }
 
-    async fn list_tools(
+    fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(tools()))
+    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send {
+        ready(Ok(ListToolsResult::with_all_items(tools())))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {

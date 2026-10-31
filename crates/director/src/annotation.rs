@@ -454,10 +454,13 @@ mod tests {
         );
         let units = source_paragraphs(poem, true)?;
         assert_eq!(units.len(), 4);
-        assert!(!units[0].stanza_break_after);
-        assert!(units[1].stanza_break_after);
-        assert!(!units[2].stanza_break_after);
-        assert!(!units[3].stanza_break_after);
+        assert_eq!(
+            units
+                .iter()
+                .map(|unit| unit.stanza_break_after)
+                .collect::<Vec<_>>(),
+            [false, true, false, false],
+        );
 
         let json = r#"{
             "segments": [

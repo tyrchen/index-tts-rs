@@ -1,8 +1,12 @@
-PYTHON_BIN ?= /Users/tchen/.cache/uv/archive-v0/PihKeqevoTnFDUja/bin/python
+PYTHON_BIN ?= python3
+PACKAGE_TARGET_DIR ?= $(CURDIR)/target/package-check
+PACKAGE_ARGS ?=
+DIST_DIR ?= $(CURDIR)/dist
+RELEASE_VERSION = $(shell sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml)
 FIXTURE_DIR := crates/core/fixtures
 
 build:
-	@cargo build --workspace --all-targets
+	@cargo build --workspace --all-targets --locked
 
 install: install-skill
 	@cargo install --path apps/cli --locked --force
@@ -15,14 +19,18 @@ install-skill:
 	@cp -R .agents/skills/itts ~/.gemini/config/skills/itts
 
 serve:
-	@cargo run --release -p index-tts-rs-server -- $(SERVER_ARGS)
+	@cargo run --release --locked -p index-tts-rs-server -- $(SERVER_ARGS)
 
 test:
-	@cargo nextest run --all-features
+	@cargo test --workspace --all-features --locked
+
+test-nextest:
+	@cargo nextest run --workspace --all-features --locked
+	@cargo test --workspace --all-features --doc --locked
 
 lint:
 	@cargo +nightly fmt --all -- --check
-	@cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic \
+	@cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -W clippy::pedantic \
 		-W clippy::unwrap_used -W clippy::expect_used -W clippy::indexing_slicing -W clippy::panic
 
 fmt:
@@ -33,7 +41,7 @@ audit:
 	@cargo deny check
 
 bench:
-	@cargo bench -p index-tts-rs-core --bench core_benchmarks
+	@cargo bench -p index-tts-rs-core --bench core_benchmarks --locked
 
 generate-fixtures:
 	@mkdir -p $(FIXTURE_DIR)
@@ -150,14 +158,54 @@ check-agent-sync:
 		exit 1; \
 	}
 
-release:
-	@cargo release tag --execute
-	@git cliff -o CHANGELOG.md
-	@git commit -a -n -m "Update CHANGELOG.md" || true
-	@git push origin master
-	@cargo release push --execute
+doc:
+	@RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+
+smoke:
+	@cargo run --locked -p index-tts-rs-cli -- --version
+	@cargo run --locked -p index-tts-rs-cli -- schema speech-job
+	@cargo run --locked -p index-tts-rs-server -- --help
+
+# A release must not mistake silently skipped golden tests for model verification.
+verify-models:
+	@test -s "$(FIXTURE_DIR)/golden_ref.safetensors"
+	@test -s "$(FIXTURE_DIR)/golden_speaker.itts_voice"
+	@cargo run --locked -p index-tts-rs-cli -- models info --output json
+	@cargo test -p index-tts-rs-core --locked test_should_match_python_reference -- --include-ignored --test-threads=1
+	@cargo test --workspace --locked -- --ignored --test-threads=1
+
+check-release-tag:
+	@cargo metadata --no-deps --format-version 1 | python3 -c 'import json, os, sys; versions = {p["version"] for p in json.load(sys.stdin)["packages"]}; tag = os.environ.get("RELEASE_TAG", ""); sys.exit(0 if tag.startswith("v") and versions == {tag.removeprefix("v")} else f"Tag {tag!r} does not match package versions {versions}")'
+
+# PACKAGE_ARGS=--allow-dirty permits a local pre-commit check without uploading.
+package:
+	@cargo package --workspace --locked --target-dir "$(PACKAGE_TARGET_DIR)" $(PACKAGE_ARGS)
+
+release-check:
+	@$(MAKE) build
+	@$(MAKE) test
+	@$(MAKE) verify-models
+	@$(MAKE) lint
+	@$(MAKE) audit
+	@$(MAKE) check-agent-sync
+	@$(MAKE) doc
+	@$(MAKE) smoke
+	@$(MAKE) package
+
+# Source archives only: MLX Metal resources make a bare executable insufficient.
+release-artifacts: package
+	@mkdir -p "$(DIST_DIR)"
+	@cp "$(PACKAGE_TARGET_DIR)"/package/index-tts-rs-*-$(RELEASE_VERSION).crate "$(DIST_DIR)/"
+	@cd "$(DIST_DIR)" && shasum -a 256 index-tts-rs-*-$(RELEASE_VERSION).crate > SHA256SUMS
+
+# Explicit upload target; never run by release-check or CI.
+publish: release-check
+	@cargo publish --workspace --locked
+
+release: release-check
+	@echo "Release checks passed. See docs/usage/releasing.md for publishing and tagging."
 
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: build install install-skill serve test lint fmt audit bench generate-fixtures check-agent-sync release update-submodule
+.PHONY: build install install-skill serve test test-nextest lint fmt audit bench generate-fixtures check-agent-sync doc smoke verify-models check-release-tag package release-check release-artifacts publish release update-submodule
