@@ -13,7 +13,7 @@ homepage = "https://github.com/tyrchen/index-tts-rs"
 readme = "README.md"
 
 [workspace.dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
 approx = "0.5"
 arc-swap = "1.9.3"
@@ -23,14 +23,14 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 config = { version = "0.15.27", default-features = false, features = ["yaml"] }
 cpal = "0.18.2"
 criterion = "0.8.2"
-dashmap = "6.1"
+dashmap = "6.2"
 flume = "0.12.0"
 futures-util = "0.3.34"
 hf-hub = "1.0.0"
 hound = "3.5.1"
 memmap2 = "0.9"
 mlx-rs = { version = "0.33.0", features = ["metal", "safetensors"] }
-proptest = "1.6"
+proptest = "1.12"
 realfft = "3.5.1"
 regex = "1"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
@@ -39,13 +39,13 @@ rstest = "0.26"
 rustfft = "6.4.1"
 safetensors = "0.8.0"
 schemars = "1.2.3"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.142"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 secrecy = "0.10.3"
 symphonia = { version = "0.6.1", default-features = false, features = ["wav", "mp3", "flac", "pcm", "isomp4", "opt-simd"] }
 tempfile = "3"
-thiserror = "2.0.18"
-tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "macros", "fs", "sync", "time", "net", "io-util", "io-std", "signal", "process"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "macros", "fs", "sync", "time", "net", "io-util", "io-std", "signal", "process"] }
 tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
