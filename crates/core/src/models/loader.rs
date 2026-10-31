@@ -1448,6 +1448,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local IndexTTS model weights"]
     fn test_should_resolve_local_model_dir_and_load_spk_proj_npz() {
         let model_dir = resolve_model_dir(None, DEFAULT_MODEL_REPO);
         assert!(
