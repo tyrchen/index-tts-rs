@@ -4,8 +4,15 @@ FIXTURE_DIR := crates/core/fixtures
 build:
 	@cargo build --workspace --all-targets
 
-install:
+install: install-skill
 	@cargo install --path apps/cli --locked --force
+
+install-skill:
+	@mkdir -p ~/.agents/skills ~/.claude/skills ~/.gemini/config/skills
+	@rm -rf ~/.agents/skills/itts ~/.claude/skills/itts ~/.gemini/config/skills/itts
+	@cp -R .agents/skills/itts ~/.agents/skills/itts
+	@cp -R .claude/skills/itts ~/.claude/skills/itts
+	@cp -R .agents/skills/itts ~/.gemini/config/skills/itts
 
 serve:
 	@cargo run --release -p index-tts-rs-server -- $(SERVER_ARGS)
@@ -153,4 +160,4 @@ release:
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: build install serve test lint fmt audit bench generate-fixtures check-agent-sync release update-submodule
+.PHONY: build install install-skill serve test lint fmt audit bench generate-fixtures check-agent-sync release update-submodule
