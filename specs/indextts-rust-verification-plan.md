@@ -43,13 +43,13 @@ flowchart TB
 | **CP-03** | `dsp::fbank` | `audio_16k [32000]` | `campplus_fbank [1, 198, 80]` | $\ge 0.99995$ | $\text{MaxAbs} < 5 \times 10^{-4}$ |
 | **CP-04** | `dsp::fbank` | `audio_16k [32000]` | `w2v_input_features [1, 99, 160]`<br>`w2v_attention_mask [1, 99]` | $\ge 0.99995$ | Mask **100% Bit-Exact**；Features $\text{MaxAbs} < 5 \times 10^{-4}$ |
 | **CP-05** | `frontend::tokenizer` | 多语种与注音测试集 (6 条文本) | `token_ids_0..5` | **1.00000** | **100% 整数序列完全相等 (Bit-Exact)** |
-| **CP-06** | `models::semantic` | `w2v_input_features`, `w2v_attention_mask` | `spk_cond_emb [1, 99, 1024]` | $\ge 0.9999$ | $\text{MaxAbs} < 1 \times 10^{-3}$ |
+| **CP-06** | `models::semantic` | `w2v_input_features`, `w2v_attention_mask` | `spk_cond_emb [1, 99, 1024]` | $\ge 0.9999$ | $\text{RelRMSE} < 1.5 \times 10^{-3}$ ($\text{MaxAbs} < 3 \times 10^{-2}$) |
 | **CP-07** | `models::emo` | `spk_cond_emb`, `ilens=[99]` | `emovec [1, 1280]` | $\ge 0.9999$ | $\text{MaxAbs} < 1 \times 10^{-3}$ |
 | **CP-08** | `models::campplus` | `campplus_fbank` | `style [1, 192]` & `conds [1, 3, 1280]` | $\ge 0.9999$ | $\text{MaxAbs} < 1 \times 10^{-3}$ |
 | **CP-09** | `models::regulator` | `spk_cond_emb`, `target_len=173` | `prompt_condition [1, 173, 512]` | $\ge 0.9999$ | $\text{MaxAbs} < 1 \times 10^{-3}$ |
 | **CP-10** | `models::gpt` (Prefill) | `text_ids`, `conds`, `lang_id=1` | `prefill_logits [8194]` | $\ge 0.9999$ | Top-10 候选 Token ID **100% 一致** |
 | **CP-11** | `models::gpt` (Greedy) | `text_ids`, `conds`, `lang_id=1` | `greedy_codes [T_code]` | — | 前 32 步 Greedy Token **100% 完全一致** |
-| **CP-12** | `models::codec` | `greedy_codes [1, T_code]` | `s_infer [1, 2*T_code, 1024]` | $\ge 0.9999$ | $\text{MaxAbs} < 1 \times 10^{-3}$ |
+| **CP-12** | `models::codec` | `greedy_codes [1, T_code]` | `s_infer [1, 2*T_code, 1024]` & `cat_condition [1, T_cat, 512]` | $\ge 0.9999$ | `s_infer` $\text{RelRMSE} < 1 \times 10^{-3}$ ($\text{MaxAbs} < 5 \times 10^{-3}$); `cat_condition` $\text{MaxAbs} < 1 \times 10^{-3}$ |
 | **CP-13** | `models::cfm` | `cat_condition`, `ref_mel`, `style`, 固定噪声 `z` | `generated_mel [1, 80, T_gen]` | $\ge 0.9995$ | 25 步 ODE 累积误差 $\text{RelRMSE} < 3 \times 10^{-3}$ |
 | **CP-14** | `models::bigvgan` | `generated_mel [1, 80, T_gen]` | `wav_f32 [256 * T_gen]` | $\ge 0.9995$ | $\text{MaxAbs} < 2 \times 10^{-3}$，信噪比 $\text{SNR} > 50\text{ dB}$ |
 

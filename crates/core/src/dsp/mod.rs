@@ -13,7 +13,8 @@ pub use audio::{
     truncate_ref_audio, write_wav_i16_file,
 };
 pub use fbank::{
-    CampPlusFbank, KaldiFbank, W2vFeaturesOutput, campplus_fbank, kaldi_fbank, w2v_features,
+    CampPlusFbank, FBANK_SAMPLE_RATE, KaldiFbank, W2vFeaturesOutput, campplus_fbank, kaldi_fbank,
+    w2v_features,
 };
 pub use mel::{MelSpectrogram, mel_spectrogram, slaney_mel_basis};
 pub use resample::{resample_sinc_hann, resample_sinc_hann_with_params};

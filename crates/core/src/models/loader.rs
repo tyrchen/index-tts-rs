@@ -4,10 +4,15 @@
 use std::{
     collections::HashMap,
     env, fs,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
-use safetensors::{Dtype, SafeTensors, tensor::TensorView};
+use mlx_rs::Array;
+use safetensors::{
+    Dtype, SafeTensors,
+    tensor::{Metadata, TensorView},
+};
 
 use crate::{
     config::{DEFAULT_MODEL_REPO, validate_safe_file_path},
@@ -54,6 +59,17 @@ pub enum ModelWeightKind {
 }
 
 impl ModelWeightKind {
+    /// All 8 `SafeTensors` weight artifacts in `IndexTTS-2.5-mlx`.
+    pub const ALL: [Self; 8] = [
+        Self::GptInt8,
+        Self::CfmEstimator,
+        Self::SemanticModel,
+        Self::SemanticCodec,
+        Self::LengthRegulator,
+        Self::BigVgan,
+        Self::EmoVec,
+        Self::CampPlus,
+    ];
     /// Returns the relative path of this weight file inside the model snapshot directory.
     ///
     /// # Examples
@@ -83,7 +99,7 @@ impl ModelWeightKind {
 }
 
 /// Decoded tensor data ready for MLX or CPU consumption.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum TensorStorage {
     /// 32-bit floating-point elements (`F32`).
@@ -92,6 +108,24 @@ pub enum TensorStorage {
     U32(Vec<u32>),
     /// 32-bit signed integer elements (`I32`).
     I32(Vec<i32>),
+    /// Pre-materialized MLX unified-memory [`Array`] (avoids duplicate CPU heap copies).
+    Mlx(Array),
+}
+
+impl PartialEq for TensorStorage {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::F32(a), Self::F32(b)) => a == b,
+            (Self::U32(a), Self::U32(b)) => a == b,
+            (Self::I32(a), Self::I32(b)) => a == b,
+            (Self::Mlx(a), Self::Mlx(b)) => {
+                a.shape() == b.shape()
+                    && a.dtype() == b.dtype()
+                    && a.try_as_slice::<u8>().ok() == b.try_as_slice::<u8>().ok()
+            }
+            _ => false,
+        }
+    }
 }
 
 /// A single loaded and layout-normalized model tensor.
@@ -115,6 +149,12 @@ impl LoadedTensor {
     pub fn as_f32(&self) -> Result<&[f32]> {
         match &self.storage {
             TensorStorage::F32(v) => Ok(v),
+            TensorStorage::Mlx(arr) => arr.try_as_slice::<f32>().map_err(|err| {
+                IndexTtsError::weight_load(
+                    &self.name,
+                    format!("expected F32 MLX array slice: {err}"),
+                )
+            }),
             _ => Err(IndexTtsError::weight_load(
                 &self.name,
                 "expected F32 tensor storage",
@@ -130,10 +170,92 @@ impl LoadedTensor {
     pub fn as_u32(&self) -> Result<&[u32]> {
         match &self.storage {
             TensorStorage::U32(v) => Ok(v),
+            TensorStorage::Mlx(arr) => arr.try_as_slice::<u32>().map_err(|err| {
+                IndexTtsError::weight_load(
+                    &self.name,
+                    format!("expected U32 MLX array slice: {err}"),
+                )
+            }),
             _ => Err(IndexTtsError::weight_load(
                 &self.name,
                 "expected U32 tensor storage",
             )),
+        }
+    }
+
+    /// Converts this loaded tensor into an [`mlx_rs::Array`], validating element count and
+    /// dimension bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError::WeightLoad`] if any dimension exceeds `i32::MAX` or the element
+    /// count does not match the product of `self.shape`.
+    pub fn to_mlx_array(&self) -> Result<Array> {
+        let mut shape_i32 = Vec::with_capacity(self.shape.len());
+        let mut expected_len = 1_usize;
+        for &dim in &self.shape {
+            let dim_i32 = i32::try_from(dim).map_err(|_| {
+                IndexTtsError::weight_load(&self.name, format!("dimension {dim} exceeds i32::MAX"))
+            })?;
+            shape_i32.push(dim_i32);
+            expected_len = expected_len.checked_mul(dim).ok_or_else(|| {
+                IndexTtsError::weight_load(&self.name, "shape product overflowed usize")
+            })?;
+        }
+
+        match &self.storage {
+            TensorStorage::F32(v) => {
+                if v.len() != expected_len {
+                    return Err(IndexTtsError::weight_load(
+                        &self.name,
+                        format!(
+                            "F32 length {} does not match shape {:?} (expected {expected_len})",
+                            v.len(),
+                            self.shape
+                        ),
+                    ));
+                }
+                Ok(Array::from_slice(v, &shape_i32))
+            }
+            TensorStorage::U32(v) => {
+                if v.len() != expected_len {
+                    return Err(IndexTtsError::weight_load(
+                        &self.name,
+                        format!(
+                            "U32 length {} does not match shape {:?} (expected {expected_len})",
+                            v.len(),
+                            self.shape
+                        ),
+                    ));
+                }
+                Ok(Array::from_slice(v, &shape_i32))
+            }
+            TensorStorage::I32(v) => {
+                if v.len() != expected_len {
+                    return Err(IndexTtsError::weight_load(
+                        &self.name,
+                        format!(
+                            "I32 length {} does not match shape {:?} (expected {expected_len})",
+                            v.len(),
+                            self.shape
+                        ),
+                    ));
+                }
+                Ok(Array::from_slice(v, &shape_i32))
+            }
+            TensorStorage::Mlx(arr) => {
+                if arr.shape() != shape_i32 {
+                    return Err(IndexTtsError::weight_load(
+                        &self.name,
+                        format!(
+                            "MLX array shape {:?} does not match expected {:?}",
+                            arr.shape(),
+                            shape_i32
+                        ),
+                    ));
+                }
+                Ok(arr.clone())
+            }
         }
     }
 }
@@ -151,6 +273,58 @@ pub struct FilteredWeights {
     pub skipped_count: usize,
     /// Total bytes of dead weights avoided.
     pub skipped_bytes: usize,
+}
+
+impl FilteredWeights {
+    /// Looks up a parameter tensor by name and converts it into an [`mlx_rs::Array`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError::WeightLoad`] if the tensor is missing or invalid.
+    pub fn tensor_array(&self, name: &str) -> Result<Array> {
+        let tensor = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| IndexTtsError::weight_load(name, "missing required parameter tensor"))?;
+        tensor.to_mlx_array()
+    }
+
+    /// Looks up a parameter tensor by name, verifies its exact shape, and converts it into an
+    /// [`mlx_rs::Array`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError::WeightLoad`] if the tensor is missing, has a mismatched shape,
+    /// or fails conversion.
+    pub fn tensor_array_shaped(&self, name: &str, expected_shape: &[usize]) -> Result<Array> {
+        let tensor = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| IndexTtsError::weight_load(name, "missing required parameter tensor"))?;
+        if tensor.shape != expected_shape {
+            return Err(IndexTtsError::weight_load(
+                name,
+                format!(
+                    "expected shape {expected_shape:?}, found {:?}",
+                    tensor.shape
+                ),
+            ));
+        }
+        tensor.to_mlx_array()
+    }
+
+    /// Looks up an auxiliary buffer tensor by name and converts it into an [`mlx_rs::Array`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError::WeightLoad`] if the buffer is missing or invalid.
+    pub fn buffer_array(&self, name: &str) -> Result<Array> {
+        let tensor = self
+            .buffers
+            .get(name)
+            .ok_or_else(|| IndexTtsError::weight_load(name, "missing required buffer tensor"))?;
+        tensor.to_mlx_array()
+    }
 }
 
 /// Speaker projection layer weights loaded from `spk_proj.npz` (`[1280, 192]` weight + `[1280]`
@@ -525,22 +699,170 @@ impl SafeTensorsLoader {
         })
     }
 
-    /// Loads and transforms a `SafeTensors` file from disk according to `kind`.
+    /// Loads and transforms a `SafeTensors` file from disk according to `kind`, streaming only
+    /// active tensors directly into MLX unified memory without reading skipped dead weights or
+    /// allocating a full-file buffer.
     ///
     /// # Errors
     ///
     /// Returns [`IndexTtsError::Validation`] if the path is unsafe, [`IndexTtsError::Io`] on
     /// read failure, or [`IndexTtsError::WeightLoad`] if parsing fails.
-    #[allow(clippy::disallowed_methods)]
+    #[allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        clippy::too_many_lines
+    )]
     pub fn load_from_path(
         kind: ModelWeightKind,
         path: impl AsRef<Path>,
     ) -> Result<FilteredWeights> {
+        const MAX_SAFETENSORS_HEADER_BYTES: usize = 100_000_000;
+
         let path_ref = path.as_ref();
         validate_safe_file_path(path_ref, "weight_path")?;
-        let bytes = fs::read(path_ref).map_err(|err| IndexTtsError::io(path_ref, err))?;
-        Self::load_from_bytes(kind, &bytes)
+        let artifact = kind.relative_path();
+
+        let mut file = fs::File::open(path_ref).map_err(|err| IndexTtsError::io(path_ref, err))?;
+        let file_len = usize::try_from(
+            file.metadata()
+                .map_err(|err| IndexTtsError::io(path_ref, err))?
+                .len(),
+        )
+        .map_err(|_| IndexTtsError::weight_load(artifact, "file size exceeds usize::MAX"))?;
+
+        if file_len < 8 {
+            return Err(IndexTtsError::weight_load(
+                artifact,
+                "safetensors file smaller than 8-byte header prefix",
+            ));
+        }
+
+        let mut len_bytes = [0_u8; 8];
+        file.read_exact(&mut len_bytes)
+            .map_err(|err| IndexTtsError::io(path_ref, err))?;
+        let header_len = usize::try_from(u64::from_le_bytes(len_bytes)).map_err(|_| {
+            IndexTtsError::weight_load(artifact, "safetensors header length overflow")
+        })?;
+        if header_len == 0 || header_len > MAX_SAFETENSORS_HEADER_BYTES {
+            return Err(IndexTtsError::weight_load(
+                artifact,
+                format!("invalid safetensors header length {header_len}"),
+            ));
+        }
+        let data_base = 8_usize.checked_add(header_len).ok_or_else(|| {
+            IndexTtsError::weight_load(artifact, "safetensors header offset overflow")
+        })?;
+        if data_base > file_len {
+            return Err(IndexTtsError::weight_load(
+                artifact,
+                "safetensors header length exceeds file size",
+            ));
+        }
+
+        let mut header_buf = vec![0_u8; header_len];
+        file.read_exact(&mut header_buf)
+            .map_err(|err| IndexTtsError::io(path_ref, err))?;
+        let metadata: Metadata = serde_json::from_slice(&header_buf).map_err(|err| {
+            IndexTtsError::weight_load(artifact, format!("safetensors header parse failed: {err}"))
+        })?;
+        drop(header_buf);
+
+        if data_base.saturating_add(metadata.data_len()) != file_len {
+            return Err(IndexTtsError::weight_load(
+                artifact,
+                "safetensors data section length does not match file size",
+            ));
+        }
+
+        let mut tensors = HashMap::new();
+        let mut buffers = HashMap::new();
+        let mut skipped_count = 0_usize;
+        let mut skipped_bytes = 0_usize;
+        let mut extracted_bigvgan_filter = false;
+
+        for raw_key in metadata.offset_keys() {
+            let Some(info) = metadata.info(&raw_key) else {
+                continue;
+            };
+            let (start, end) = info.data_offsets;
+            let byte_len = end.saturating_sub(start);
+
+            if !Self::should_keep_tensor(kind, &raw_key) {
+                skipped_count = skipped_count.saturating_add(1);
+                skipped_bytes = skipped_bytes.saturating_add(byte_len);
+                continue;
+            }
+
+            if kind == ModelWeightKind::BigVgan
+                && (raw_key.ends_with(".upsample.filter") || raw_key.ends_with(".lowpass.filter"))
+            {
+                if extracted_bigvgan_filter {
+                    skipped_count = skipped_count.saturating_add(1);
+                    skipped_bytes = skipped_bytes.saturating_add(byte_len);
+                    continue;
+                }
+                let file_offset = (data_base + start) as u64;
+                file.seek(SeekFrom::Start(file_offset))
+                    .map_err(|err| IndexTtsError::io(path_ref, err))?;
+                let mut raw_bytes = vec![0_u8; byte_len];
+                file.read_exact(&mut raw_bytes)
+                    .map_err(|err| IndexTtsError::io(path_ref, err))?;
+                let view =
+                    TensorView::new(info.dtype, info.shape.clone(), &raw_bytes).map_err(|err| {
+                        IndexTtsError::weight_load(artifact, format!("invalid tensor view: {err}"))
+                    })?;
+                let vals = decode_f32_view(artifact, &raw_key, &view)?;
+                let len = vals.len();
+                buffers.insert(
+                    "_kaiser_sinc_filter".to_owned(),
+                    LoadedTensor {
+                        name: "_kaiser_sinc_filter".to_owned(),
+                        shape: vec![len],
+                        storage: TensorStorage::F32(vals),
+                    },
+                );
+                extracted_bigvgan_filter = true;
+                continue;
+            }
+
+            let file_offset = (data_base + start) as u64;
+            file.seek(SeekFrom::Start(file_offset))
+                .map_err(|err| IndexTtsError::io(path_ref, err))?;
+            let mut raw_bytes = vec![0_u8; byte_len];
+            file.read_exact(&mut raw_bytes)
+                .map_err(|err| IndexTtsError::io(path_ref, err))?;
+            let view =
+                TensorView::new(info.dtype, info.shape.clone(), &raw_bytes).map_err(|err| {
+                    IndexTtsError::weight_load(artifact, format!("invalid tensor view: {err}"))
+                })?;
+
+            let loaded = decode_and_transform_tensor(kind, &raw_key, &view)?;
+            drop(raw_bytes);
+
+            if (kind == ModelWeightKind::SemanticModel && (raw_key == "_mean" || raw_key == "_std"))
+                || (kind == ModelWeightKind::EmoVec && raw_key == "enc.embed.pos_enc.pe")
+            {
+                buffers.insert(loaded.name.clone(), loaded);
+            } else {
+                tensors.insert(loaded.name.clone(), loaded);
+            }
+        }
+
+        Ok(FilteredWeights {
+            tensors,
+            buffers,
+            skipped_count,
+            skipped_bytes,
+        })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransposeRule {
+    None,
+    Axes021,
+    Axes120,
+    Axes0231,
 }
 
 fn decode_and_transform_tensor(
@@ -553,29 +875,54 @@ fn decode_and_transform_tensor(
 
     match view.dtype() {
         Dtype::F32 => {
+            let (new_key, rule) = remap_key_and_transpose_rule(kind, raw_key, &shape);
+            if rule == TransposeRule::None {
+                let arr = Array::try_from(view.clone()).map_err(|err| {
+                    IndexTtsError::weight_load(
+                        artifact,
+                        format!("failed to convert F32 tensor `{raw_key}` to MLX Array: {err}"),
+                    )
+                })?;
+                return Ok(LoadedTensor {
+                    name: new_key,
+                    shape,
+                    storage: TensorStorage::Mlx(arr),
+                });
+            }
+
             let values = decode_f32_view(artifact, raw_key, view)?;
-            let (new_key, new_shape, new_values) =
-                remap_and_transpose_f32(kind, raw_key, &shape, values)?;
+            let (new_shape, transposed) = match rule {
+                TransposeRule::Axes021 => transpose_3d_021(&shape, &values)?,
+                TransposeRule::Axes120 => transpose_3d_120(&shape, &values)?,
+                TransposeRule::Axes0231 => transpose_4d_0231(&shape, &values)?,
+                TransposeRule::None => (shape, values),
+            };
+            let shape_i32: Vec<i32> = new_shape
+                .iter()
+                .map(|&d| {
+                    i32::try_from(d).map_err(|_| {
+                        IndexTtsError::weight_load(&new_key, format!("dim {d} exceeds i32::MAX"))
+                    })
+                })
+                .collect::<Result<Vec<i32>>>()?;
+            let arr = Array::from_slice(&transposed, &shape_i32);
             Ok(LoadedTensor {
                 name: new_key,
                 shape: new_shape,
-                storage: TensorStorage::F32(new_values),
+                storage: TensorStorage::Mlx(arr),
             })
         }
-        Dtype::U32 => {
-            let values = decode_u32_view(artifact, raw_key, view)?;
+        Dtype::U32 | Dtype::I32 => {
+            let arr = Array::try_from(view.clone()).map_err(|err| {
+                IndexTtsError::weight_load(
+                    artifact,
+                    format!("failed to convert integer tensor `{raw_key}` to MLX Array: {err}"),
+                )
+            })?;
             Ok(LoadedTensor {
                 name: raw_key.to_owned(),
                 shape,
-                storage: TensorStorage::U32(values),
-            })
-        }
-        Dtype::I32 => {
-            let values = decode_i32_view(artifact, raw_key, view)?;
-            Ok(LoadedTensor {
-                name: raw_key.to_owned(),
-                shape,
-                storage: TensorStorage::I32(values),
+                storage: TensorStorage::Mlx(arr),
             })
         }
         other => Err(IndexTtsError::weight_load(
@@ -585,23 +932,22 @@ fn decode_and_transform_tensor(
     }
 }
 
-fn remap_and_transpose_f32(
+fn remap_key_and_transpose_rule(
     kind: ModelWeightKind,
     raw_key: &str,
     shape: &[usize],
-    values: Vec<f32>,
-) -> Result<(String, Vec<usize>, Vec<f32>)> {
+) -> (String, TransposeRule) {
     match kind {
         ModelWeightKind::GptInt8 | ModelWeightKind::CfmEstimator => {
-            Ok((raw_key.to_owned(), shape.to_vec(), values))
+            (raw_key.to_owned(), TransposeRule::None)
         }
         ModelWeightKind::SemanticModel | ModelWeightKind::SemanticCodec => {
-            if shape.len() == 3 {
-                let (new_shape, transposed) = transpose_3d_021(shape, &values)?;
-                Ok((raw_key.to_owned(), new_shape, transposed))
+            let rule = if shape.len() == 3 {
+                TransposeRule::Axes021
             } else {
-                Ok((raw_key.to_owned(), shape.to_vec(), values))
-            }
+                TransposeRule::None
+            };
+            (raw_key.to_owned(), rule)
         }
         ModelWeightKind::LengthRegulator => {
             let parts: Vec<&str> = raw_key.split('.').collect();
@@ -612,13 +958,17 @@ fn remap_and_transpose_f32(
                 && let Some(param) = parts.get(2)
             {
                 let new_key = format!("model.layers.{pos}.{param}");
-                if matches!(pos, 0 | 3 | 6 | 9 | 12) && *param == "weight" && shape.len() == 3 {
-                    let (new_shape, transposed) = transpose_3d_021(shape, &values)?;
-                    return Ok((new_key, new_shape, transposed));
-                }
-                return Ok((new_key, shape.to_vec(), values));
+                let rule = if matches!(pos, 0 | 3 | 6 | 9 | 12)
+                    && *param == "weight"
+                    && shape.len() == 3
+                {
+                    TransposeRule::Axes021
+                } else {
+                    TransposeRule::None
+                };
+                return (new_key, rule);
             }
-            Ok((raw_key.to_owned(), shape.to_vec(), values))
+            (raw_key.to_owned(), TransposeRule::None)
         }
         ModelWeightKind::BigVgan => {
             if raw_key.starts_with("ups.") {
@@ -627,54 +977,53 @@ fn remap_and_transpose_f32(
                     && let (Some(idx), Some(param)) = (parts.get(1), parts.get(3))
                 {
                     let new_key = format!("ups.{idx}.{param}");
-                    if shape.len() == 3 {
-                        let (new_shape, transposed) = transpose_3d_120(shape, &values)?;
-                        return Ok((new_key, new_shape, transposed));
-                    }
-                    return Ok((new_key, shape.to_vec(), values));
+                    let rule = if shape.len() == 3 {
+                        TransposeRule::Axes120
+                    } else {
+                        TransposeRule::None
+                    };
+                    return (new_key, rule);
                 }
             }
-            if shape.len() == 3 {
-                let (new_shape, transposed) = transpose_3d_021(shape, &values)?;
-                return Ok((raw_key.to_owned(), new_shape, transposed));
-            }
-            Ok((raw_key.to_owned(), shape.to_vec(), values))
+            let rule = if shape.len() == 3 {
+                TransposeRule::Axes021
+            } else {
+                TransposeRule::None
+            };
+            (raw_key.to_owned(), rule)
         }
         ModelWeightKind::EmoVec => {
             if let Some(suffix) = raw_key.strip_prefix("enc.embed.conv.0.") {
                 let new_key = format!("enc.embed_conv.{suffix}");
-                if suffix == "weight" && shape.len() == 4 {
-                    let (new_shape, transposed) = transpose_4d_0231(shape, &values)?;
-                    return Ok((new_key, new_shape, transposed));
-                }
-                return Ok((new_key, shape.to_vec(), values));
+                let rule = if suffix == "weight" && shape.len() == 4 {
+                    TransposeRule::Axes0231
+                } else {
+                    TransposeRule::None
+                };
+                return (new_key, rule);
             }
             if let Some(suffix) = raw_key.strip_prefix("enc.embed.out.0.") {
-                let new_key = format!("enc.embed_out.{suffix}");
-                return Ok((new_key, shape.to_vec(), values));
+                return (format!("enc.embed_out.{suffix}"), TransposeRule::None);
             }
             if (raw_key.ends_with(".pointwise_conv1.weight")
                 || raw_key.ends_with(".depthwise_conv.weight")
                 || raw_key.ends_with(".pointwise_conv2.weight"))
                 && shape.len() == 3
             {
-                let (new_shape, transposed) = transpose_3d_021(shape, &values)?;
-                return Ok((raw_key.to_owned(), new_shape, transposed));
+                return (raw_key.to_owned(), TransposeRule::Axes021);
             }
-            Ok((raw_key.to_owned(), shape.to_vec(), values))
+            (raw_key.to_owned(), TransposeRule::None)
         }
         ModelWeightKind::CampPlus => {
             if raw_key.ends_with(".weight") {
                 if shape.len() == 4 {
-                    let (new_shape, transposed) = transpose_4d_0231(shape, &values)?;
-                    return Ok((raw_key.to_owned(), new_shape, transposed));
+                    return (raw_key.to_owned(), TransposeRule::Axes0231);
                 }
                 if shape.len() == 3 {
-                    let (new_shape, transposed) = transpose_3d_021(shape, &values)?;
-                    return Ok((raw_key.to_owned(), new_shape, transposed));
+                    return (raw_key.to_owned(), TransposeRule::Axes021);
                 }
             }
-            Ok((raw_key.to_owned(), shape.to_vec(), values))
+            (raw_key.to_owned(), TransposeRule::None)
         }
     }
 }
@@ -788,42 +1137,6 @@ fn decode_f32_view(artifact: &str, key: &str, view: &TensorView<'_>) -> Result<V
     let mut out = Vec::with_capacity(raw.len() / 4);
     for &bytes in raw.as_chunks::<4>().0 {
         out.push(f32::from_le_bytes(bytes));
-    }
-    Ok(out)
-}
-
-fn decode_u32_view(artifact: &str, key: &str, view: &TensorView<'_>) -> Result<Vec<u32>> {
-    let raw = view.data();
-    if raw.len() % 4 != 0 {
-        return Err(IndexTtsError::weight_load(
-            artifact,
-            format!(
-                "tensor `{key}` byte length {} is not a multiple of 4",
-                raw.len()
-            ),
-        ));
-    }
-    let mut out = Vec::with_capacity(raw.len() / 4);
-    for &bytes in raw.as_chunks::<4>().0 {
-        out.push(u32::from_le_bytes(bytes));
-    }
-    Ok(out)
-}
-
-fn decode_i32_view(artifact: &str, key: &str, view: &TensorView<'_>) -> Result<Vec<i32>> {
-    let raw = view.data();
-    if raw.len() % 4 != 0 {
-        return Err(IndexTtsError::weight_load(
-            artifact,
-            format!(
-                "tensor `{key}` byte length {} is not a multiple of 4",
-                raw.len()
-            ),
-        ));
-    }
-    let mut out = Vec::with_capacity(raw.len() / 4);
-    for &bytes in raw.as_chunks::<4>().0 {
-        out.push(i32::from_le_bytes(bytes));
     }
     Ok(out)
 }

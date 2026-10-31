@@ -1115,6 +1115,14 @@ pub struct SynthesisRequest {
     /// Inter-sentence silence in milliseconds.
     #[builder(default = DEFAULT_INTERVAL_SILENCE_MS)]
     pub interval_silence_ms: u32,
+    /// Optional separate emotion reference audio file when `speaker` is `ReferenceAudio`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub emo_audio_path: Option<PathBuf>,
+    /// Emotion blending multiplier (`0.0..=2.0`, default `1.0`) when `speaker` is
+    /// `ReferenceAudio`.
+    #[builder(default)]
+    pub emo_alpha: EmoAlpha,
 }
 
 /// Request to extract a [`crate::voice::SpeakerContext`] from reference audio.

@@ -1,8 +1,56 @@
 //! Neural network model loaders and operator implementations.
 
+pub mod bigvgan;
+pub mod campplus;
+pub mod cfm;
+pub mod codec;
+pub mod emo;
+pub mod gpt;
 pub mod loader;
+pub mod regulator;
+pub mod sampler;
+pub mod semantic;
 
+pub use bigvgan::{
+    BIGVGAN_FILTER_LEN, BIGVGAN_HOP_LENGTH, BIGVGAN_NUM_MELS, BIGVGAN_RES_DILATIONS,
+    BIGVGAN_RES_KERNELS, BIGVGAN_UP_INIT_CH, BIGVGAN_UP_KERNELS, BIGVGAN_UP_RATES, BigVgan,
+};
+pub use campplus::{
+    CAMP_BLOCK_DILATIONS, CAMP_BLOCK_KERNELS, CAMP_BLOCK_LAYERS, CAMP_BN_EPS, CAMP_BN_SIZE,
+    CAMP_EMB_DIM, CAMP_FCM_OUT_CHANNELS, CAMP_FEAT_DIM, CAMP_GROWTH_RATE, CAMP_INIT_CHANNELS,
+    CAMP_M_CHANNELS, CAMP_SEG_LEN, CampPlus, seg_pool_100,
+};
+pub use cfm::{
+    CFM_DIM, CFM_HEAD_DIM, CFM_IN_CHANNELS, CFM_INTERMEDIATE, CFM_MERGED_IN_DIM, CFM_NORM_EPS,
+    CFM_NUM_HEADS, CFM_NUM_LAYERS, CFM_ROPE_BASE, CFM_STYLE_DIM, CFM_WN_KERNEL, CFM_WN_LAYERS,
+    CfmDit, compute_rope_freqs,
+};
+pub use codec::{
+    CODEC_CODEBOOK_DIM, CODEC_CODEBOOK_SIZE, CODEC_HIDDEN, CODEC_INTERMEDIATE, CODEC_NORM_EPS,
+    CODEC_NUM_LAYERS, CODEC_UPSAMPLE_FACTOR, CODEC_VOCOS_DIM, SemanticCodec,
+};
+pub use emo::{
+    EMO_CONV_KERNEL, EMO_CONV_PADDING, EMO_ENC_BLOCKS, EMO_ENC_DIM, EMO_ENC_FF_UNITS,
+    EMO_ENC_HEAD_DIM, EMO_ENC_HEADS, EMO_ENC_IN_DIM, EMO_MODEL_DIM, EMO_NORM_EPS, EMO_PERC_DEPTH,
+    EMO_PERC_DIM, EMO_PERC_FF_INNER, EMO_PERC_HEAD_DIM, EMO_PERC_HEADS, EMO_PERC_INNER,
+    EMO_SUBSAMPLE_FLATTENED, EmoVec,
+};
+pub use gpt::{
+    DEFAULT_KV_MAX_SEQ, GPT_DIM, GPT_HEAD_DIM, GPT_INNER_DIM, GPT_LANG_VOCAB, GPT_MEL_POS_LEN,
+    GPT_MEL_VOCAB, GPT_NORM_EPS, GPT_NUM_HEADS, GPT_NUM_LAYERS, GPT_TEXT_POS_LEN, GPT_TEXT_VOCAB,
+    Gpt, KvCache, START_MEL_TOKEN, START_TEXT_TOKEN, STOP_MEL_TOKEN, STOP_TEXT_TOKEN,
+};
 pub use loader::{
-    FilteredWeights, LoadedTensor, ModelWeightKind, SafeTensorsLoader, SpkProjWeights,
-    resolve_model_dir,
+    FilteredWeights, LoadedTensor, ModelWeightKind, SEMANTIC_ACTIVE_LAYERS, SPK_PROJ_IN_DIM,
+    SPK_PROJ_OUT_DIM, SafeTensorsLoader, SpkProjWeights, resolve_model_dir,
+};
+pub use regulator::{
+    LR_CHANNELS, LR_IN_CHANNELS, LR_NORM_EPS, LR_NUM_BLOCKS, LengthRegulator,
+    nearest_expand_indices,
+};
+pub use sampler::{BITSET_WORDS, SamplerRng, SeenTokenBitSet, generate_codes, sample_next_token};
+pub use semantic::{
+    SEMANTIC_CONV_KERNEL, SEMANTIC_CONV_PAD_LEFT, SEMANTIC_DIM, SEMANTIC_DIST_TABLE_SIZE,
+    SEMANTIC_FEAT_DIM, SEMANTIC_HEAD_DIM, SEMANTIC_INTERMEDIATE, SEMANTIC_LEFT_POS,
+    SEMANTIC_NORM_EPS, SEMANTIC_NUM_HEADS, SEMANTIC_RIGHT_POS, SemanticModel,
 };

@@ -6,6 +6,7 @@
 
 use std::{io, path::PathBuf};
 
+use mlx_rs::error::{AsSliceError, ConversionError, Exception};
 use thiserror::Error;
 
 /// Convenience result alias using [`IndexTtsError`].
@@ -108,6 +109,13 @@ pub enum IndexTtsError {
         /// Reason for cancellation.
         reason: &'static str,
     },
+
+    /// Actor lifecycle or command execution error.
+    #[error("engine actor error: {message}")]
+    Actor {
+        /// Detailed reason for the actor error.
+        message: String,
+    },
 }
 
 impl IndexTtsError {
@@ -163,6 +171,55 @@ impl IndexTtsError {
         Self::WeightLoad {
             artifact: artifact.into(),
             message: message.into(),
+        }
+    }
+
+    /// Constructs an [`IndexTtsError::Mlx`] variant.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use index_tts_rs_core::error::IndexTtsError;
+    ///
+    /// let err = IndexTtsError::mlx("shape mismatch in conv1d");
+    /// assert!(err.to_string().contains("shape mismatch"));
+    /// ```
+    #[must_use]
+    pub fn mlx(message: impl Into<String>) -> Self {
+        Self::Mlx {
+            message: message.into(),
+        }
+    }
+
+    /// Constructs an [`IndexTtsError::Actor`] variant.
+    #[must_use]
+    pub fn actor(message: impl Into<String>) -> Self {
+        Self::Actor {
+            message: message.into(),
+        }
+    }
+}
+
+impl From<Exception> for IndexTtsError {
+    fn from(err: Exception) -> Self {
+        Self::Mlx {
+            message: err.to_string(),
+        }
+    }
+}
+
+impl From<AsSliceError> for IndexTtsError {
+    fn from(err: AsSliceError) -> Self {
+        Self::Mlx {
+            message: err.to_string(),
+        }
+    }
+}
+
+impl From<ConversionError> for IndexTtsError {
+    fn from(err: ConversionError) -> Self {
+        Self::Mlx {
+            message: err.to_string(),
         }
     }
 }

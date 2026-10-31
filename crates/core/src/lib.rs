@@ -21,6 +21,7 @@
 
 pub mod config;
 pub mod dsp;
+pub mod engine;
 pub mod error;
 pub mod frontend;
 pub mod models;
@@ -31,6 +32,13 @@ pub use config::{
     SamplingParams, SpeakerSource, SynthesisRequest, SynthesisText, Temperature, TopK, TopP,
     VoiceExtractRequest, VoiceId,
 };
+pub use engine::{
+    AudioChunk, IndexTtsEngine, StageTimings, SynthesisOutput, SynthesisResult, SynthesisStream,
+};
 pub use error::{IndexTtsError, Result};
 pub use frontend::Frontend;
-pub use voice::{SpeakerContext, VoiceMetadata};
+pub use models::{
+    BigVgan, CampPlus, CfmDit, EmoVec, Gpt, KvCache, LengthRegulator, SamplerRng, SeenTokenBitSet,
+    SemanticCodec, SemanticModel, generate_codes, nearest_expand_indices, sample_next_token,
+};
+pub use voice::{SpeakerContext, VoiceEntry, VoiceExtractor, VoiceMetadata, VoiceStore};

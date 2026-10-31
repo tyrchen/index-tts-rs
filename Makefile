@@ -19,6 +19,9 @@ audit:
 	@cargo audit
 	@cargo deny check
 
+bench:
+	@cargo bench -p index-tts-rs-core --bench core_benchmarks
+
 generate-fixtures:
 	@mkdir -p $(FIXTURE_DIR)
 	@$(PYTHON_BIN) -c '\
@@ -144,4 +147,4 @@ release:
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: build test lint fmt audit generate-fixtures check-agent-sync release update-submodule
+.PHONY: build test lint fmt audit bench generate-fixtures check-agent-sync release update-submodule
