@@ -24,6 +24,7 @@ IMPORTANT: Never enter plan mode automatically!!! Never enter plan mode automati
 ### Development Workflow
 
 - **Latest Dependencies**: Always search the web for the latest dependencies or helm charts or resources and their current usage patterns. If doing a deep research, put the research doc under ./docs/research. You shall look into that directory before doing researches.
+- **Commit Attribution**: Never add `Co-Authored-By` trailers (or any other AI attribution trailers) to commit messages.
 - **Automation via Makefile**:
   - Explore existing Makefile targets and use them accordingly
   - For new automation tasks, always add a Makefile target instead of creating shell scripts
