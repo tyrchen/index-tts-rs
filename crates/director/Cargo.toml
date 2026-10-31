@@ -1,0 +1,22 @@
+[package]
+name = "index-tts-rs-director"
+description = "Validated speech controls and optional DeepSeek pacing annotation for itts"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+config.workspace = true
+index-tts-rs-core.workspace = true
+reqwest.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+winnow.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true

@@ -58,11 +58,11 @@
 
 ### 3.2 Stage 0 顺序流式提取与 `.itts_voice` 预计算声纹快照
 
-1. **`.itts_voice` 快照 (`1.60 MiB`)**：将 Stage 0 提取出的 4 个条件张量（`conds [1, 3, 1280]`、`prompt_condition [1, 701, 512]`、`ref_mel [1, 80, 701]`、`style [1, 192]`）持久化为 `.itts_voice` SafeTensors 快照。使用 `index-tts synth --voice <id>` 时**完全跳过 `2.86 GB` Stage 0 编码器**，声纹加载耗时从 `3,280 ms` 降至 **`0.45 ms`**（Daemon 模式下仅 **`1.1 µs`**）。
+1. **`.itts_voice` 快照 (`1.60 MiB`)**：将 Stage 0 提取出的 4 个条件张量（`conds [1, 3, 1280]`、`prompt_condition [1, 701, 512]`、`ref_mel [1, 80, 701]`、`style [1, 192]`）持久化为 `.itts_voice` SafeTensors 快照。使用 `itts synth --voice <id>` 时**完全跳过 `2.86 GB` Stage 0 编码器**，声纹加载耗时从 `3,280 ms` 降至 **`0.45 ms`**（Daemon 模式下仅 **`1.1 µs`**）。
 2. **Stage 0 顺序按需加载即释放 (`VoiceExtractor::extract_from_model_dir`)**：当执行 `voice add` 或单次 `synth --ref` 时，按顺序逐个加载并立即释放 `SemanticModel` (`859 MB`) -> `EmoVec` (`621 MB`) -> `CampPlus` (`28 MB`)，每个子模型执行完毕后立即调用 `mlx_rs::memory::clear_cache()` 回收 Metal 缓存池：
-   - `index-tts voice add` 峰值 RSS 降至 **`1.78 GB` (`1.66 GiB`)**，提取耗时仅 **`591.9 ms`**。
-   - `index-tts synth --ref` 峰值 RSS 从优化前的 `8.39 GB` 降至 **`3.94 GB` (`3.67 GiB`, -53.0%)**，比原版 Python (`5.38 GB`) 低 **26.8%**！
-   - `index-tts synth --voice` 峰值 RSS 从优化前的 `3.85 GB` 降至 **`2.50 GB` (`2.33 GiB`, -35.1%)**，比原版 Python (`5.38 GB`) 低 **53.5%**！
+   - `itts voice add` 峰值 RSS 降至 **`1.78 GB` (`1.66 GiB`)**，提取耗时仅 **`591.9 ms`**。
+   - `itts synth --ref` 峰值 RSS 从优化前的 `8.39 GB` 降至 **`3.94 GB` (`3.67 GiB`, -53.0%)**，比原版 Python (`5.38 GB`) 低 **26.8%**！
+   - `itts synth --voice` 峰值 RSS 从优化前的 `3.85 GB` 降至 **`2.50 GB` (`2.33 GiB`, -35.1%)**，比原版 Python (`5.38 GB`) 低 **53.5%**！
 
 ### 3.3 Stage 1..3 GPU 算子级融合与零拷贝优化
 
@@ -86,9 +86,9 @@
 | 输出文件 | 生成方式 | 采样率 / 声道 / 位深 | 采样点数 (`packets`) | 音频时长 (`duration`) | PCM 数据字节数 | Mel Token 数 |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: |
 | `/tmp/py_voice_out.wav` | `uvx index-tts-2.5-mlx synth --ref` | `22050 Hz, 1 ch, Int16` | `220,928` | `10.019410 s` | `441,856 B` | `251` |
-| `/tmp/rust_ref_out.wav` | `index-tts synth --ref` | `22050 Hz, 1 ch, Int16` | `220,928` | `10.019410 s` | `441,856 B` | `251` |
-| `/tmp/rust_voice_out.wav` | `index-tts synth --voice demo_voice` | `22050 Hz, 1 ch, Int16` | `220,928` | `10.019410 s` | `441,856 B` | `251` |
-| `/tmp/rust_daemon_out.wav` | `index-tts synth --voice` (Daemon) | `22050 Hz, 1 ch, Int16` | `220,928` | `10.019410 s` | `441,856 B` | `251` |
+| `/tmp/rust_ref_out.wav` | `itts synth --ref` | `22050 Hz, 1 ch, Int16` | `220,928` | `10.019410 s` | `441,856 B` | `251` |
+| `/tmp/rust_voice_out.wav` | `itts synth --voice demo_voice` | `22050 Hz, 1 ch, Int16` | `220,928` | `10.019410 s` | `441,856 B` | `251` |
+| `/tmp/rust_daemon_out.wav` | `itts synth --voice` (Daemon) | `22050 Hz, 1 ch, Int16` | `220,928` | `10.019410 s` | `441,856 B` | `251` |
 
 ### 4.2 端到端耗时、实时率 (RTF) 与内存占用对比 (`/usr/bin/time -l`)
 
@@ -185,12 +185,12 @@ xychart-beta
 cargo build --release --workspace
 
 # 2. 从 ~/Downloads/voice.wav 预提取 .itts_voice 声纹快照（耗时 ~0.59s，峰值 RSS 1.78 GB，生成 1.60 MiB 快照）
-/usr/bin/time -l index-tts voice add demo_voice \
+/usr/bin/time -l itts voice add demo_voice \
   --ref ~/Downloads/voice.wav \
   --json
 
 # 3. 使用预提取声纹合成语音（跳过 2.86 GB Stage 0 编码器，总耗时 ~4.36s，纯合成 3.85s，RTF 0.385，峰值 RSS 2.50 GB）
-/usr/bin/time -l index-tts synth \
+/usr/bin/time -l itts synth \
   --voice demo_voice \
   --text "你好，欢迎使用 IndexTTS Rust 原生语音合成引擎！今天天气真不错，我们一起来测试一下语音克隆的速度和音质表现。" \
   --greedy \
@@ -199,7 +199,7 @@ cargo build --release --workspace
   --json
 
 # 4. 单次冷启动直接传入原始参考音频（顺序加载并即刻释放 Stage 0 编码器，总耗时 ~4.93s，峰值 RSS 3.94 GB）
-/usr/bin/time -l index-tts synth \
+/usr/bin/time -l itts synth \
   --ref ~/Downloads/voice.wav \
   --text "你好，欢迎使用 IndexTTS Rust 原生语音合成引擎！今天天气真不错，我们一起来测试一下语音克隆的速度和音质表现。" \
   --greedy \
@@ -208,8 +208,8 @@ cargo build --release --workspace
   --json
 
 # 5. 启动驻留热模型 Daemon 并执行零冷启动合成（总耗时 ~3.85s，RTF 0.384，Client RSS 14.5 MB）
-index-tts daemon start --idle-timeout-secs 600 &
-index-tts synth \
+itts daemon start --idle-timeout-secs 600 &
+itts synth \
   --voice demo_voice \
   --text "你好，欢迎使用 IndexTTS Rust 原生语音合成引擎！今天天气真不错，我们一起来测试一下语音克隆的速度和音质表现。" \
   --greedy \
@@ -217,12 +217,12 @@ index-tts synth \
   --json
 
 # 6. 多句 JSONL 流式输出与首包延迟 (TTFA = 1.85s) 测试
-index-tts synth \
+itts synth \
   --voice demo_voice \
   --text "第一句话用于测试首包流式延迟。第二句话继续生成后续语音片段，验证Actor流水线的低延迟特性。第三句话完成整段语音合成！" \
   --max-text-tokens 25 \
   --greedy \
   --out /tmp/rust_stream_out.wav \
   --jsonl
-index-tts daemon stop --json
+itts daemon stop --json
 ```

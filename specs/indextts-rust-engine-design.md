@@ -53,14 +53,14 @@ index-tts-rs/
 │               ├── actor.rs    # MLX 专属推理线程 Actor (支持优雅启动/停止/重启与 AtomicBool 信号)
 │               └── stream.rs   # 句子级流式 AudioChunk 生成器与句间静音/交叉淡入淡出
 └── apps/
-    ├── cli/                    # (index-tts) 面向 AI Agent 与开发者的全功能 CLI
+    ├── cli/                    # (itts) 面向 AI Agent 与开发者的全功能 CLI
     │   └── src/
     │       ├── main.rs         # clap 命令行入口
     │       ├── commands/       # synth, voice, models, daemon, mcp 子命令实现
     │       ├── daemon.rs       # Unix Domain Socket 常驻守护进程与客户端自动转发
     │       ├── mcp.rs          # 基于 `rmcp` 的 Model Context Protocol (stdio) Server
     │       └── player.rs       # 基于 `cpal` 的 macOS CoreAudio 流式播放器
-    └── server/                 # (index-tts-server) HTTP / WebSocket / OpenAI 兼容语音服务
+    └── server/                 # (index-tts-rs-server) HTTP / WebSocket / OpenAI 兼容语音服务
 ```
 
 ---
@@ -339,26 +339,26 @@ pub struct SynthesisResult {
 
 ```bash
 # 1. 模型管理：自动下载或校验本地 HF 缓存中的 yunfengwang/IndexTTS-2.5-mlx
-index-tts models pull [--model-dir <path>]
-index-tts models inspect
+itts models pull [--model-dir <path>]
+itts models inspect
 
 # 2. 音色包管理：预提取参考音频特征并保存为 ~1.5MB 的 .itts_voice 快照
-index-tts voice add <voice_id> --ref <voice.wav> [--emo-ref <emo.wav>] [--emo-alpha 1.0]
-index-tts voice list [--json]
-index-tts voice remove <voice_id>
+itts voice add <voice_id> --ref <voice.wav> [--emo-ref <emo.wav>] [--emo-alpha 1.0]
+itts voice list [--json]
+itts voice remove <voice_id>
 
 # 3. 语音合成（支持已注册音色 --voice 或临时参考音频 --ref，自动走 Daemon 加速）
-index-tts synth --voice <voice_id> --text "大家好，我是 Rust 原生语音引擎。" --out out.wav
-index-tts synth --ref voice.wav --text "支持直接播放" --play --json
-echo "流式读取标准输入，边生成边播放" | index-tts synth --voice <voice_id> --stdin --play --jsonl
+itts synth --voice <voice_id> --text "大家好，我是 Rust 原生语音引擎。" --out out.wav
+itts synth --ref voice.wav --text "支持直接播放" --play --json
+echo "流式读取标准输入，边生成边播放" | itts synth --voice <voice_id> --stdin --play --jsonl
 
 # 4. 常驻守护进程（Daemon）：消除多次调用的模型加载开销
-index-tts daemon start [--idle-timeout-secs 600] [--socket ~/.cache/index-tts-rs/daemon.sock]
-index-tts daemon status [--json]
-index-tts daemon stop
+itts daemon start [--idle-timeout-secs 600] [--socket ~/.cache/index-tts-rs/daemon.sock]
+itts daemon status [--json]
+itts daemon stop
 
 # 5. AI Agent 原生 MCP Server (Model Context Protocol over stdio)
-index-tts mcp
+itts mcp
 ```
 
 ### 7.2 Unix Domain Socket 守护进程协议 (`apps/cli/src/daemon.rs`)

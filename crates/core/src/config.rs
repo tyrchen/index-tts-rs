@@ -806,6 +806,403 @@ impl<'de> Deserialize<'de> for EmoAlpha {
     }
 }
 
+/// Canonical 8-class emotion names in upstream `IndexTTS-2.5` order.
+pub const EMOTION_NAMES: [&str; 8] = [
+    "happy",
+    "angry",
+    "sad",
+    "afraid",
+    "disgusted",
+    "melancholic",
+    "surprised",
+    "calm",
+];
+
+/// Upstream empirical bias weights suppressing dominant emotion prototypes
+/// (`indextts/infer_v2_5.py`).
+pub const EMOTION_BIAS: [f32; 8] = [
+    0.9375, // happy (15/16)
+    0.8750, // angry (7/8)
+    1.0000, // sad (1)
+    1.0000, // afraid (1)
+    0.9375, // disgusted (15/16)
+    0.9375, // melancholic (15/16)
+    0.6875, // surprised (11/16)
+    0.5625, // calm (9/16)
+];
+
+/// Maximum allowed byte length for an emotion specification string.
+const MAX_EMOTION_SPEC_BYTES: usize = 256;
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+struct RawEmotionVector {
+    happy: f32,
+    angry: f32,
+    sad: f32,
+    afraid: f32,
+    disgusted: f32,
+    melancholic: f32,
+    surprised: f32,
+    calm: f32,
+}
+
+/// Validated 8-class emotion intensity vector (`happy`, `angry`, `sad`, `afraid`,
+/// `disgusted`, `melancholic`, `surprised`, `calm`), with each weight in `0.0..=1.0`.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", try_from = "RawEmotionVector")]
+pub struct EmotionVector {
+    /// Happy / joyful (`高兴`, index `0`).
+    #[serde(default)]
+    pub happy: f32,
+    /// Angry (`愤怒`, index `1`).
+    #[serde(default)]
+    pub angry: f32,
+    /// Sad (`悲伤`, index `2`).
+    #[serde(default)]
+    pub sad: f32,
+    /// Afraid / fearful (`恐惧`, index `3`).
+    #[serde(default)]
+    pub afraid: f32,
+    /// Disgusted (`反感`, index `4`).
+    #[serde(default)]
+    pub disgusted: f32,
+    /// Melancholic / low / wistful (`低落`, index `5`).
+    #[serde(default)]
+    pub melancholic: f32,
+    /// Surprised (`惊讶`, index `6`).
+    #[serde(default)]
+    pub surprised: f32,
+    /// Calm / neutral / serene (`平静`, index `7`).
+    #[serde(default)]
+    pub calm: f32,
+}
+
+impl EmotionVector {
+    /// Validates and constructs an [`EmotionVector`] from an 8-element array in canonical order:
+    /// `[happy, angry, sad, afraid, disgusted, melancholic, surprised, calm]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError::Validation`] if any weight is non-finite or outside `0.0..=1.0`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use index_tts_rs_core::config::EmotionVector;
+    ///
+    /// let emo = EmotionVector::new([0.0, 0.0, 0.2, 0.0, 0.0, 0.45, 0.0, 0.25])?;
+    /// assert!((emo.melancholic - 0.45).abs() < f32::EPSILON);
+    /// # Ok::<(), index_tts_rs_core::error::IndexTtsError>(())
+    /// ```
+    pub fn new(weights: [f32; 8]) -> Result<Self> {
+        for (idx, &w) in weights.iter().enumerate() {
+            if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+                return Err(IndexTtsError::validation(
+                    "emo_vector",
+                    format!(
+                        "emotion `{}` weight must be finite and in 0.0..=1.0, got {w}",
+                        EMOTION_NAMES[idx]
+                    ),
+                ));
+            }
+        }
+        Ok(Self {
+            happy: weights[0],
+            angry: weights[1],
+            sad: weights[2],
+            afraid: weights[3],
+            disgusted: weights[4],
+            melancholic: weights[5],
+            surprised: weights[6],
+            calm: weights[7],
+        })
+    }
+
+    /// Validates all 8 weights in `self`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError::Validation`] if any component is non-finite or outside `0.0..=1.0`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use index_tts_rs_core::config::EmotionVector;
+    ///
+    /// let emo = EmotionVector::default();
+    /// assert!(emo.validate_weights().is_ok());
+    /// ```
+    pub fn validate_weights(&self) -> Result<()> {
+        Self::new(self.as_array()).map(|_| ())
+    }
+
+    /// Returns the 8 emotion weights in canonical order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use index_tts_rs_core::config::EmotionVector;
+    ///
+    /// let emo = EmotionVector::default();
+    /// assert_eq!(emo.as_array(), [0.0; 8]);
+    /// ```
+    #[must_use]
+    pub const fn as_array(&self) -> [f32; 8] {
+        [
+            self.happy,
+            self.angry,
+            self.sad,
+            self.afraid,
+            self.disgusted,
+            self.melancholic,
+            self.surprised,
+            self.calm,
+        ]
+    }
+
+    /// Returns `true` if all 8 emotion weights are effectively zero (`<= 1e-4`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use index_tts_rs_core::config::EmotionVector;
+    ///
+    /// assert!(EmotionVector::default().is_zero());
+    /// ```
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        self.as_array().iter().all(|&w| w <= 1e-4)
+    }
+
+    /// Normalizes the emotion vector following upstream `IndexTTS-2.5` `normalize_emo_vec`:
+    /// 1. Multiplies each component by [`EMOTION_BIAS`] when `apply_bias` is `true`.
+    /// 2. Caps the total sum to `0.8` so the speaker identity is preserved.
+    /// 3. Scales by `emo_alpha` clamped to `0.0..=1.0`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use index_tts_rs_core::config::{EmoAlpha, EmotionVector};
+    ///
+    /// let emo: EmotionVector = "melancholic:0.6,calm:0.6".parse()?;
+    /// let norm = emo.normalize(true, EmoAlpha::default());
+    /// let sum: f32 = norm.iter().sum();
+    /// assert!((sum - 0.8).abs() < 1e-5);
+    /// # Ok::<(), index_tts_rs_core::error::IndexTtsError>(())
+    /// ```
+    #[must_use]
+    pub fn normalize(&self, apply_bias: bool, emo_alpha: EmoAlpha) -> [f32; 8] {
+        let raw = self.as_array();
+        let mut biased = [0.0_f32; 8];
+        for i in 0..8 {
+            let w = raw[i].max(0.0);
+            biased[i] = if apply_bias { w * EMOTION_BIAS[i] } else { w };
+        }
+        let total: f32 = biased.iter().sum();
+        if total > 0.8 {
+            let scale = 0.8 / total;
+            for item in &mut biased {
+                *item *= scale;
+            }
+        }
+        let alpha = emo_alpha.get().clamp(0.0, 1.0);
+        if (alpha - 1.0).abs() > f32::EPSILON {
+            for item in &mut biased {
+                *item *= alpha;
+            }
+        }
+        biased
+    }
+
+    /// Parses an emotion specification string such as `"melancholic:0.45,calm:0.25"`,
+    /// `"低落:0.45,平静:0.25"`, `"calm"` (default weight `0.6`), or `"none"` (returns `Ok(None)`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError::Validation`] if the string is malformed, references an unknown
+    /// emotion category, or specifies a weight outside `0.0..=1.0`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use index_tts_rs_core::config::EmotionVector;
+    ///
+    /// let parsed = EmotionVector::parse_spec("低落:0.45,平静:0.25")?.unwrap();
+    /// assert!((parsed.melancholic - 0.45).abs() < 1e-6);
+    /// assert!((parsed.calm - 0.25).abs() < 1e-6);
+    /// assert!(EmotionVector::parse_spec("none")?.is_none());
+    /// # Ok::<(), index_tts_rs_core::error::IndexTtsError>(())
+    /// ```
+    pub fn parse_spec(spec: &str) -> Result<Option<Self>> {
+        if spec.len() > MAX_EMOTION_SPEC_BYTES {
+            return Err(IndexTtsError::validation(
+                "emo_vector",
+                "emotion specification exceeds 256 bytes",
+            ));
+        }
+        let trimmed = spec.trim();
+        if trimmed.is_empty() {
+            return Err(IndexTtsError::validation(
+                "emo_vector",
+                "emotion specification must not be empty",
+            ));
+        }
+        if matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "none" | "default" | "reset" | "无" | "默认"
+        ) {
+            return Ok(None);
+        }
+
+        let tokens: Vec<&str> = trimmed
+            .split([',', '，', '、', ';', '；'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if tokens.is_empty() {
+            return Err(IndexTtsError::validation(
+                "emo_vector",
+                "emotion specification must contain at least one emotion",
+            ));
+        }
+
+        if tokens.len() == 8 && tokens.iter().all(|t| !t.contains([':', '：', '='])) {
+            let mut weights = [0.0_f32; 8];
+            for (idx, token) in tokens.iter().enumerate() {
+                let value = token.parse::<f32>().map_err(|_| {
+                    IndexTtsError::validation(
+                        "emo_vector",
+                        format!("invalid numeric weight `{token}` at index {idx}"),
+                    )
+                })?;
+                weights[idx] = value;
+            }
+            let vec = Self::new(weights)?;
+            return Ok((!vec.is_zero()).then_some(vec));
+        }
+
+        let mut weights = [0.0_f32; 8];
+        for token in tokens {
+            let (name, value) = if let Some((k, v)) = token.split_once([':', '：', '=']) {
+                let parsed = v.trim().parse::<f32>().map_err(|_| {
+                    IndexTtsError::validation(
+                        "emo_vector",
+                        format!("invalid weight `{}` for emotion `{}`", v.trim(), k.trim()),
+                    )
+                })?;
+                (k.trim(), parsed)
+            } else {
+                (token, 0.6_f32)
+            };
+            let idx = resolve_emotion_index(name)?;
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(IndexTtsError::validation(
+                    "emo_vector",
+                    format!(
+                        "emotion `{}` weight must be finite and in 0.0..=1.0, got {value}",
+                        EMOTION_NAMES[idx]
+                    ),
+                ));
+            }
+            weights[idx] = value;
+        }
+
+        let vec = Self::new(weights)?;
+        Ok((!vec.is_zero()).then_some(vec))
+    }
+
+    /// Formats the emotion vector into a compact `name:weight` string (e.g.
+    /// `"melancholic:0.45,calm:0.25"`), or `"none"` when all weights are zero.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use index_tts_rs_core::config::EmotionVector;
+    ///
+    /// let emo: EmotionVector = "melancholic:0.45,calm:0.25".parse()?;
+    /// assert_eq!(emo.format_compact(), "melancholic:0.45,calm:0.25");
+    /// # Ok::<(), index_tts_rs_core::error::IndexTtsError>(())
+    /// ```
+    #[must_use]
+    pub fn format_compact(&self) -> String {
+        let mut parts = Vec::new();
+        for (idx, &w) in self.as_array().iter().enumerate() {
+            if w > 0.005 {
+                let text = format!("{w:.2}");
+                let clean = text.trim_end_matches('0').trim_end_matches('.');
+                parts.push(format!("{}:{clean}", EMOTION_NAMES[idx]));
+            }
+        }
+        if parts.is_empty() {
+            "none".to_owned()
+        } else {
+            parts.join(",")
+        }
+    }
+}
+
+fn resolve_emotion_index(name: &str) -> Result<usize> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "happy" | "joy" | "高兴" | "快乐" | "喜悦" | "欢快" => Ok(0),
+        "angry" | "anger" | "愤怒" | "生气" | "恼怒" | "激愤" => Ok(1),
+        "sad" | "sadness" | "悲伤" | "伤心" | "哀伤" | "悲痛" => Ok(2),
+        "afraid" | "fear" | "scared" | "恐惧" | "害怕" | "惊恐" | "畏惧" => Ok(3),
+        "disgusted" | "disgust" | "反感" | "厌恶" | "嫌弃" => Ok(4),
+        "melancholic" | "melancholy" | "depressed" | "low" | "wistful" | "低落" | "忧郁"
+        | "惆怅" | "感伤" | "眷恋" | "伤感" => Ok(5),
+        "surprised" | "surprise" | "惊讶" | "惊奇" | "诧异" | "惊叹" => Ok(6),
+        "calm" | "neutral" | "peaceful" | "serene" | "gentle" | "平静" | "自然" | "温和"
+        | "宁静" | "轻柔" | "舒缓" => Ok(7),
+        other => Err(IndexTtsError::validation(
+            "emo_vector",
+            format!(
+                "unknown emotion `{other}` (expected happy/高兴, angry/愤怒, sad/悲伤, \
+                 afraid/恐惧, disgusted/反感, melancholic/低落, surprised/惊讶, calm/平静)"
+            ),
+        )),
+    }
+}
+
+impl fmt::Display for EmotionVector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.format_compact())
+    }
+}
+
+impl FromStr for EmotionVector {
+    type Err = IndexTtsError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(Self::parse_spec(s)?.unwrap_or_default())
+    }
+}
+
+impl TryFrom<&str> for EmotionVector {
+    type Error = IndexTtsError;
+
+    fn try_from(value: &str) -> Result<Self> {
+        Self::from_str(value)
+    }
+}
+
+impl TryFrom<RawEmotionVector> for EmotionVector {
+    type Error = IndexTtsError;
+
+    fn try_from(raw: RawEmotionVector) -> Result<Self> {
+        Self::new([
+            raw.happy,
+            raw.angry,
+            raw.sad,
+            raw.afraid,
+            raw.disgusted,
+            raw.melancholic,
+            raw.surprised,
+            raw.calm,
+        ])
+    }
+}
+
 /// Autoregressive GPT sampling parameters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TypedBuilder, Validate)]
 #[serde(rename_all = "snake_case", default)]
@@ -898,6 +1295,10 @@ pub struct EngineConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub voices_dir: Option<PathBuf>,
+    /// Registered voice used when a request names no voice, voice file, or reference audio.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub default_voice: Option<VoiceId>,
     /// Default synthesis language.
     #[builder(default)]
     pub default_language: Language,
@@ -941,6 +1342,7 @@ impl Default for EngineConfig {
             model_repo: DEFAULT_MODEL_REPO.to_owned(),
             glossary_path: None,
             voices_dir: None,
+            default_voice: None,
             default_language: Language::Zh,
             text_pos_capacity: DEFAULT_TEXT_POS_CAPACITY,
             max_text_tokens_per_segment: DEFAULT_MAX_TEXT_TOKENS_PER_SEGMENT,
@@ -1120,9 +1522,14 @@ pub struct SynthesisRequest {
     #[builder(default)]
     pub emo_audio_path: Option<PathBuf>,
     /// Emotion blending multiplier (`0.0..=2.0`, default `1.0`) when `speaker` is
-    /// `ReferenceAudio`.
+    /// `ReferenceAudio` or when `emo_vector` is provided.
     #[builder(default)]
     pub emo_alpha: EmoAlpha,
+    /// Optional 8-class emotion intensity vector override (`happy`, `angry`, `sad`, `afraid`,
+    /// `disgusted`, `melancholic`, `surprised`, `calm`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub emo_vector: Option<EmotionVector>,
 }
 
 /// Request to extract a [`crate::voice::SpeakerContext`] from reference audio.
@@ -1141,6 +1548,10 @@ pub struct VoiceExtractRequest {
     /// Emotion blending multiplier (`0.0..=2.0`, default `1.0`).
     #[builder(default)]
     pub emo_alpha: EmoAlpha,
+    /// Optional 8-class emotion intensity vector to bake into the voice snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub emo_vector: Option<EmotionVector>,
 }
 
 /// Validates that a file path does not contain NUL bytes, excessive length, or
@@ -1292,6 +1703,44 @@ cfm:
         assert!(cfg.is_ok());
     }
 
+    #[test]
+    fn test_should_parse_and_normalize_emotion_vector() {
+        let parsed = EmotionVector::parse_spec("低落:0.45, 平静:0.25")
+            .ok()
+            .flatten();
+        assert!(parsed.is_some());
+        let emo = parsed.unwrap_or_default();
+        assert!((emo.melancholic - 0.45).abs() < 1e-6);
+        assert!((emo.calm - 0.25).abs() < 1e-6);
+        assert_eq!(emo.format_compact(), "melancholic:0.45,calm:0.25");
+
+        let single = EmotionVector::parse_spec("calm")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        assert!((single.calm - 0.6).abs() < 1e-6);
+
+        let cleared = EmotionVector::parse_spec("none").ok().flatten();
+        assert!(cleared.is_none());
+
+        let high = EmotionVector::parse_spec("happy:0.9,sad:0.9")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let norm = high.normalize(true, EmoAlpha::default());
+        let sum: f32 = norm.iter().sum();
+        assert!((sum - 0.8).abs() < 1e-5);
+    }
+
+    #[rstest]
+    #[case("unknown:0.5")]
+    #[case("happy:1.5")]
+    #[case("sad:-0.2")]
+    #[case("")]
+    fn test_should_reject_invalid_emotion_spec(#[case] spec: &str) {
+        assert!(EmotionVector::parse_spec(spec).is_err());
+    }
+
     proptest! {
         #[test]
         fn proptest_voice_id_never_panics(s in "\\PC*") {
@@ -1301,6 +1750,11 @@ cfm:
         #[test]
         fn proptest_synthesis_text_never_panics(s in "\\PC*") {
             let _ = SynthesisText::new(s);
+        }
+
+        #[test]
+        fn proptest_emotion_spec_never_panics(s in "\\PC*") {
+            let _ = EmotionVector::parse_spec(&s);
         }
     }
 }

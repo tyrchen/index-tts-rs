@@ -325,6 +325,7 @@ mod tests {
     });
 
     #[test]
+    #[ignore = "requires local IndexTTS model weights"]
     fn test_should_match_python_reference_cp05_bit_exact_tokenizer_ids() {
         assert!(
             SHARED_FRONTEND.is_some(),

@@ -6,6 +6,7 @@
 //! channels.
 
 use std::{
+    borrow::Cow,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -26,16 +27,19 @@ use tracing::{debug, info};
 use crate::{
     config::{EmoAlpha, EngineConfig, SpeakerSource, SynthesisRequest, VoiceExtractRequest},
     dsp::f32_to_pcm_i16,
-    engine::stream::{AudioChunk, StageTimings, SynthesisResult, SynthesisStream},
+    engine::{
+        stream::{AudioChunk, StageTimings, SynthesisResult, SynthesisStream},
+        telemetry::{EngineTelemetry, StartupEvent, StartupObserver, TelemetrySnapshot},
+    },
     error::{IndexTtsError, Result},
     frontend::Frontend,
     models::{
         BigVgan, CFM_IN_CHANNELS, CfmDit, DEFAULT_KV_MAX_SEQ, Gpt, KvCache, LengthRegulator,
-        SamplerRng, SemanticCodec, generate_codes, resolve_model_dir,
+        SamplerRng, SemanticCodec, SpkProjWeights, generate_codes, resolve_model_dir,
     },
     voice::{
-        CONDS_DIM, CONDS_FRAMES, PROMPT_CONDITION_DIM, REF_MEL_BINS, STYLE_DIM, SpeakerContext,
-        VoiceEntry, VoiceExtractor, VoiceStore, default_voices_dir,
+        CONDS_DIM, CONDS_FRAMES, EmoMatrix, PROMPT_CONDITION_DIM, REF_MEL_BINS, STYLE_DIM,
+        SpeakerContext, VoiceEntry, VoiceExtractor, VoiceStore, default_voices_dir,
     },
 };
 
@@ -82,9 +86,29 @@ struct MlxWorkerState {
     regulator: LengthRegulator,
     cfm: CfmDit,
     bigvgan: BigVgan,
+    spk_proj: SpkProjWeights,
+    emo_matrix: EmoMatrix,
     voice_extractor: Option<VoiceExtractor>,
     last_ref_cache: Option<CachedRefAudio>,
     shutdown_flag: Arc<AtomicBool>,
+    telemetry: Arc<EngineTelemetry>,
+}
+
+/// Loads one component, reporting its load time to the startup observer.
+fn load_component<T>(
+    observer: &dyn Fn(&StartupEvent),
+    component: &'static str,
+    load: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let started = Instant::now();
+    let loaded = load()?;
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    debug!(component, elapsed_ms, "Loaded synthesis component");
+    observer(&StartupEvent::ComponentLoaded {
+        component,
+        elapsed_ms,
+    });
+    Ok(loaded)
 }
 
 impl MlxWorkerState {
@@ -93,30 +117,51 @@ impl MlxWorkerState {
         model_dir: PathBuf,
         voice_store: VoiceStore,
         shutdown_flag: Arc<AtomicBool>,
+        telemetry: Arc<EngineTelemetry>,
+        observer: &dyn Fn(&StartupEvent),
     ) -> Result<Self> {
         let t0 = Instant::now();
         let _ = mlx_rs::memory::set_cache_limit(128 * 1024 * 1024);
-        let frontend = Frontend::from_model_dir(
-            &model_dir,
-            config.text_pos_capacity,
-            config.use_normalization,
-            config.glossary_path.as_deref(),
-        )?;
-        let gpt = Gpt::load_from_path(model_dir.join("gpt_int8.safetensors"))?;
+        let frontend = load_component(observer, "frontend", || {
+            Frontend::from_model_dir(
+                &model_dir,
+                config.text_pos_capacity,
+                config.use_normalization,
+                config.glossary_path.as_deref(),
+            )
+        })?;
+        let gpt = load_component(observer, "gpt", || {
+            Gpt::load_from_path(model_dir.join("gpt_int8.safetensors"))
+        })?;
         let kv_cache = KvCache::new(DEFAULT_KV_MAX_SEQ)?;
-        let codec =
-            SemanticCodec::load_from_path(model_dir.join("raw/semantic_codec.safetensors"))?;
-        let regulator =
-            LengthRegulator::load_from_path(model_dir.join("raw/length_regulator.safetensors"))?;
-        let cfm = CfmDit::load_from_path(model_dir.join("cfm_estimator.safetensors"))?;
-        let bigvgan = BigVgan::load_from_path(model_dir.join("raw/bigvgan.safetensors"))?;
+        let codec = load_component(observer, "semantic_codec", || {
+            SemanticCodec::load_from_path(model_dir.join("raw/semantic_codec.safetensors"))
+        })?;
+        let regulator = load_component(observer, "length_regulator", || {
+            LengthRegulator::load_from_path(model_dir.join("raw/length_regulator.safetensors"))
+        })?;
+        let cfm = load_component(observer, "cfm", || {
+            CfmDit::load_from_path(model_dir.join("cfm_estimator.safetensors"))
+        })?;
+        let bigvgan = load_component(observer, "bigvgan", || {
+            BigVgan::load_from_path(model_dir.join("raw/bigvgan.safetensors"))
+        })?;
+        let (spk_proj, emo_matrix) = load_component(observer, "emotion_projection", || {
+            Ok((
+                SpkProjWeights::load_from_path(model_dir.join("spk_proj.npz"))?,
+                EmoMatrix::load_or_embedded(Some(&model_dir))?,
+            ))
+        })?;
         let _ = mlx_rs::memory::clear_cache();
+        telemetry.publish_memory();
 
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         info!(
-            elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0,
+            elapsed_ms,
             model_dir = %model_dir.display(),
             "Initialized IndexTTS-2.5 Stage 1..3 synthesis models on Metal GPU"
         );
+        observer(&StartupEvent::EngineReady { elapsed_ms });
 
         Ok(Self {
             config,
@@ -129,9 +174,12 @@ impl MlxWorkerState {
             regulator,
             cfm,
             bigvgan,
+            spk_proj,
+            emo_matrix,
             voice_extractor: None,
             last_ref_cache: None,
             shutdown_flag,
+            telemetry,
         })
     }
 
@@ -144,6 +192,7 @@ impl MlxWorkerState {
                 "Lazily loaded Stage 0 VoiceExtractor encoders"
             );
             self.voice_extractor = Some(extractor);
+            self.telemetry.set_voice_extractor_loaded(true);
         }
         self.voice_extractor
             .as_ref()
@@ -206,12 +255,22 @@ impl MlxWorkerState {
         let Some(extractor) = self.voice_extractor.as_ref() else {
             return Err(IndexTtsError::actor("VoiceExtractor unavailable"));
         };
-        let ctx = extractor.extract_from_path(
+        let mut ctx = extractor.extract_from_path(
             &req.ref_audio_path,
             req.emo_audio_path.as_deref(),
             req.emo_alpha,
             &self.regulator,
         )?;
+        if let Some(ref emo_vec) = req.emo_vector
+            && !emo_vec.is_zero()
+        {
+            ctx.conds = ctx.resolve_conds_with_emotion(
+                &self.spk_proj,
+                &self.emo_matrix,
+                emo_vec,
+                req.emo_alpha,
+            )?;
+        }
         let _ = self.voice_store.register(req.voice_id.clone(), ctx)?;
         self.voice_store.inspect(&req.voice_id)
     }
@@ -246,8 +305,25 @@ impl MlxWorkerState {
             return;
         }
 
+        let resolved_conds = match req.emo_vector.as_ref() {
+            Some(emo_vec) if !emo_vec.is_zero() => match spk.resolve_conds_with_emotion(
+                &self.spk_proj,
+                &self.emo_matrix,
+                emo_vec,
+                req.emo_alpha,
+            ) {
+                Ok(c) => Cow::Owned(c),
+                Err(err) => {
+                    let _ = chunk_tx.send(Err(err));
+                    return;
+                }
+            },
+            _ => Cow::Borrowed(spk.conds.as_slice()),
+        };
+
         let p_i32 = spk.prompt_frames.get() as i32;
-        let conds_arr = Array::from_slice(&spk.conds, &[1, CONDS_FRAMES as i32, CONDS_DIM as i32]);
+        let conds_arr =
+            Array::from_slice(&resolved_conds, &[1, CONDS_FRAMES as i32, CONDS_DIM as i32]);
         let prompt_cond_arr = Array::from_slice(
             &spk.prompt_condition,
             &[1, p_i32, PROMPT_CONDITION_DIM as i32],
@@ -418,23 +494,34 @@ impl MlxWorkerState {
 
 fn run_actor_loop(mut state: MlxWorkerState, cmd_rx: &Receiver<EngineCommand>) {
     while let Ok(cmd) = cmd_rx.recv() {
+        let shutdown = matches!(cmd, EngineCommand::Shutdown { .. });
+        state.handle_command(cmd);
+        if shutdown {
+            break;
+        }
+        state.telemetry.publish_memory();
+    }
+}
+
+impl MlxWorkerState {
+    fn handle_command(&mut self, cmd: EngineCommand) {
         match cmd {
             EngineCommand::SynthesizeStream { req, chunk_tx } => {
-                state.handle_synthesize_stream(&req, &chunk_tx);
+                self.handle_synthesize_stream(&req, &chunk_tx);
             }
             EngineCommand::ExtractVoice { req, reply_tx } => {
-                let res = state.handle_extract_voice(&req);
+                let res = self.handle_extract_voice(&req);
                 let _ = reply_tx.send(res);
             }
             EngineCommand::EvictVoiceExtractor { reply_tx } => {
-                let had_extractor = state.voice_extractor.take().is_some();
+                let had_extractor = self.voice_extractor.take().is_some();
+                self.telemetry.set_voice_extractor_loaded(false);
                 let _ = mlx_rs::memory::clear_cache();
                 let _ = reply_tx.send(Ok(had_extractor));
             }
             EngineCommand::Shutdown { reply_tx } => {
-                state.shutdown_flag.store(true, Ordering::Relaxed);
+                self.shutdown_flag.store(true, Ordering::Relaxed);
                 let _ = reply_tx.send(());
-                break;
             }
         }
     }
@@ -453,6 +540,7 @@ pub struct IndexTtsEngine {
     voice_store: VoiceStore,
     cmd_tx: Sender<EngineCommand>,
     shutdown_flag: Arc<AtomicBool>,
+    telemetry: Arc<EngineTelemetry>,
     worker_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -481,12 +569,47 @@ impl IndexTtsEngine {
     /// # Ok::<(), index_tts_rs_core::error::IndexTtsError>(())
     /// ```
     pub fn start(config: EngineConfig) -> Result<Self> {
+        Self::start_with_observer(config, Box::new(|_| {}))
+    }
+
+    /// Starts the engine like [`IndexTtsEngine::start`], reporting per-component load progress
+    /// to `observer` from the worker thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError`] if configuration validation, model resolution, or weight
+    /// loading fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use index_tts_rs_core::{config::EngineConfig, engine::IndexTtsEngine, models::resolve_model_dir};
+    ///
+    /// if resolve_model_dir(None, "yunfengwang/IndexTTS-2.5-mlx").is_ok() {
+    ///     let engine = IndexTtsEngine::start_with_observer(
+    ///         EngineConfig::default(),
+    ///         Box::new(|event| eprintln!("{event:?}")),
+    ///     )?;
+    ///     engine.stop()?;
+    /// }
+    /// # Ok::<(), index_tts_rs_core::error::IndexTtsError>(())
+    /// ```
+    pub fn start_with_observer(config: EngineConfig, observer: StartupObserver) -> Result<Self> {
         config.validate_config()?;
         let model_dir = resolve_model_dir(config.model_dir.as_deref(), &config.model_repo)?;
+        observer(&StartupEvent::ModelResolved {
+            model_dir: model_dir.clone(),
+        });
         let voices_dir = config.voices_dir.clone().unwrap_or_else(default_voices_dir);
         let voice_store = VoiceStore::new(voices_dir)?;
-        let (cmd_tx, shutdown_flag, handle) =
-            spawn_worker_thread(config.clone(), model_dir.clone(), voice_store.clone())?;
+        let telemetry = Arc::new(EngineTelemetry::default());
+        let (cmd_tx, shutdown_flag, handle) = spawn_worker_thread(
+            config.clone(),
+            model_dir.clone(),
+            voice_store.clone(),
+            Arc::clone(&telemetry),
+            observer,
+        )?;
 
         Ok(Self {
             config,
@@ -494,8 +617,15 @@ impl IndexTtsEngine {
             voice_store,
             cmd_tx,
             shutdown_flag,
+            telemetry,
             worker_handle: Arc::new(Mutex::new(Some(handle))),
         })
+    }
+
+    /// Returns a lock-free snapshot of worker runtime state (memory, resident encoders).
+    #[must_use]
+    pub fn telemetry(&self) -> TelemetrySnapshot {
+        self.telemetry.snapshot()
     }
 
     /// Alias for [`IndexTtsEngine::start`].
@@ -704,6 +834,8 @@ impl IndexTtsEngine {
             self.config.clone(),
             self.model_dir.clone(),
             self.voice_store.clone(),
+            Arc::clone(&self.telemetry),
+            Box::new(|_| {}),
         )?;
         self.cmd_tx = cmd_tx;
         self.shutdown_flag = shutdown_flag;
@@ -727,6 +859,8 @@ fn spawn_worker_thread(
     config: EngineConfig,
     model_dir: PathBuf,
     voice_store: VoiceStore,
+    telemetry: Arc<EngineTelemetry>,
+    observer: StartupObserver,
 ) -> Result<(Sender<EngineCommand>, Arc<AtomicBool>, JoinHandle<()>)> {
     let (cmd_tx, cmd_rx) = flume::bounded(ENGINE_CHANNEL_CAPACITY);
     let (init_tx, init_rx) = flume::bounded::<Result<()>>(1);
@@ -736,7 +870,14 @@ fn spawn_worker_thread(
     let handle = thread::Builder::new()
         .name("index-tts-mlx-worker".to_owned())
         .spawn(move || {
-            match MlxWorkerState::initialize(config, model_dir, voice_store, flag_clone) {
+            match MlxWorkerState::initialize(
+                config,
+                model_dir,
+                voice_store,
+                flag_clone,
+                telemetry,
+                observer.as_ref(),
+            ) {
                 Ok(state) => {
                     let _ = init_tx.send(Ok(()));
                     run_actor_loop(state, &cmd_rx);

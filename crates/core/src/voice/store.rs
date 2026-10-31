@@ -11,6 +11,7 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
+    time::SystemTime,
 };
 
 use dashmap::DashMap;
@@ -396,11 +397,41 @@ impl VoiceExtractor {
     }
 }
 
+/// On-disk identity of a cached `.itts_voice` file, used to detect external replacement or
+/// removal by another process (for example `itts voice add` while the daemon is running).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+impl FileStamp {
+    /// `VoiceStore` is a synchronous API used from the MLX worker thread; one `stat` per lookup.
+    #[allow(clippy::disallowed_methods)]
+    fn of(path: &Path) -> Option<Self> {
+        let meta = fs::metadata(path).ok()?;
+        meta.is_file().then(|| Self {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct CachedVoice {
+    context: Arc<SpeakerContext>,
+    stamp: FileStamp,
+}
+
 /// Concurrent in-memory (`DashMap`) and on-disk (`.itts_voice`) voice snapshot store.
+///
+/// The disk is the source of truth: every lookup re-validates the cached snapshot against the
+/// file's modification time and size, so voices added, replaced, or removed by other processes
+/// are observed without restarting long-lived hosts such as the daemon.
 #[derive(Debug, Clone)]
 pub struct VoiceStore {
     voices_dir: PathBuf,
-    cache: Arc<DashMap<VoiceId, Arc<SpeakerContext>>>,
+    cache: Arc<DashMap<VoiceId, CachedVoice>>,
 }
 
 impl VoiceStore {
@@ -486,19 +517,27 @@ impl VoiceStore {
     /// # Ok::<(), index_tts_rs_core::error::IndexTtsError>(())
     /// ```
     pub fn get(&self, voice_id: &VoiceId) -> Result<Arc<SpeakerContext>> {
-        if let Some(entry) = self.cache.get(voice_id) {
-            return Ok(Arc::clone(entry.value()));
-        }
-
         let path = self.voice_path(voice_id);
-        if !path.is_file() {
+        let Some(stamp) = FileStamp::of(&path) else {
+            self.cache.remove(voice_id);
             return Err(IndexTtsError::VoiceNotFound {
                 voice_id: voice_id.as_str().to_owned(),
             });
+        };
+        if let Some(entry) = self.cache.get(voice_id)
+            && entry.stamp == stamp
+        {
+            return Ok(Arc::clone(&entry.context));
         }
 
         let ctx = Arc::new(SpeakerContext::load_from_path(&path)?);
-        self.cache.insert(voice_id.clone(), Arc::clone(&ctx));
+        self.cache.insert(
+            voice_id.clone(),
+            CachedVoice {
+                context: Arc::clone(&ctx),
+                stamp,
+            },
+        );
         Ok(ctx)
     }
 
@@ -511,7 +550,20 @@ impl VoiceStore {
     pub fn register(&self, voice_id: VoiceId, context: SpeakerContext) -> Result<PathBuf> {
         let path = self.voice_path(&voice_id);
         context.save_to_path(&path)?;
-        self.cache.insert(voice_id, Arc::new(context));
+        match FileStamp::of(&path) {
+            Some(stamp) => {
+                self.cache.insert(
+                    voice_id,
+                    CachedVoice {
+                        context: Arc::new(context),
+                        stamp,
+                    },
+                );
+            }
+            None => {
+                self.cache.remove(&voice_id);
+            }
+        }
         Ok(path)
     }
 
@@ -732,6 +784,39 @@ mod tests {
             store.get(&id),
             Err(IndexTtsError::VoiceNotFound { .. })
         ));
+    }
+
+    fn test_context(prompt_frames: usize) -> Result<SpeakerContext> {
+        let p = NonZeroUsize::new(prompt_frames).unwrap_or(NonZeroUsize::MIN);
+        SpeakerContext::new(
+            vec![0.1; 3 * 1280],
+            vec![0.2; prompt_frames * 512],
+            vec![-3.5; 80 * prompt_frames],
+            vec![0.05; 192],
+            p,
+            VoiceMetadata::default(),
+        )
+    }
+
+    #[test]
+    fn test_should_observe_voices_replaced_or_removed_by_another_store() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|err| IndexTtsError::io("tempdir", err))?;
+        let daemon_store = VoiceStore::new(temp.path())?;
+        let cli_store = VoiceStore::new(temp.path())?;
+        let id = VoiceId::new("narrator")?;
+
+        cli_store.register(id.clone(), test_context(4)?)?;
+        assert_eq!(daemon_store.get(&id)?.prompt_frames.get(), 4);
+
+        cli_store.register(id.clone(), test_context(9)?)?;
+        assert_eq!(daemon_store.get(&id)?.prompt_frames.get(), 9);
+
+        assert!(cli_store.remove(&id)?);
+        assert!(matches!(
+            daemon_store.get(&id),
+            Err(IndexTtsError::VoiceNotFound { .. })
+        ));
+        Ok(())
     }
 
     fn extract_f32(st: &SafeTensors<'_>, name: &str) -> (Vec<usize>, Vec<f32>) {

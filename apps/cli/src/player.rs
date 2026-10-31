@@ -9,16 +9,20 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    thread,
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
 use cpal::{
-    FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig,
+    Device, FromSample, OutputCallbackInfo, Sample, SampleFormat, SizedSample, Stream,
+    StreamConfig, default_host,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
+use flume::Sender;
 use index_tts_rs_core::dsp::resample_sinc_hann;
+use index_tts_rs_service::{ErrorCode, ServiceError};
+use tracing::warn;
 
 /// Streaming audio player backed by the system default output audio device (`CoreAudio` on macOS).
 pub struct AudioPlayer {
@@ -46,7 +50,7 @@ impl AudioPlayer {
     /// Returns an error if no default audio output device is available or if building/starting
     /// the output stream fails.
     pub fn try_new() -> Result<Self> {
-        let host = cpal::default_host();
+        let host = default_host();
         let device = host
             .default_output_device()
             .ok_or_else(|| anyhow!("no default audio output device found"))?;
@@ -142,7 +146,7 @@ impl AudioPlayer {
 }
 
 fn build_output_stream<T>(
-    device: &cpal::Device,
+    device: &Device,
     config: &StreamConfig,
     queue: Arc<Mutex<VecDeque<f32>>>,
 ) -> Result<Stream>
@@ -150,12 +154,12 @@ where
     T: SizedSample + Sample + FromSample<f32> + Send + 'static,
 {
     let err_fn = |err| {
-        tracing::warn!(error = %err, "Audio output stream error");
+        warn!(error = %err, "Audio output stream error");
     };
     let stream = device
         .build_output_stream(
             *config,
-            move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            move |data: &mut [T], _: &OutputCallbackInfo| {
                 if let Ok(mut guard) = queue.lock() {
                     for slot in data.iter_mut() {
                         let val = guard.pop_front().unwrap_or(0.0_f32);
@@ -172,4 +176,88 @@ where
         )
         .context("failed to build CoreAudio output stream")?;
     Ok(stream)
+}
+
+/// `Send` handle that plays PCM on a dedicated thread owning the non-`Send` `CoreAudio` stream,
+/// so async tasks (MCP tool calls, daemon clients) can feed audio across `.await` points.
+#[derive(Debug)]
+pub struct Playback {
+    tx: Sender<(Vec<i16>, u32)>,
+    handle: JoinHandle<Result<()>>,
+}
+
+impl Playback {
+    /// Opens the default output device on a playback thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::AudioOutputUnavailable`] if no output device can be opened.
+    pub fn start() -> Result<Self, ServiceError> {
+        let (tx, rx) = flume::unbounded::<(Vec<i16>, u32)>();
+        let (ready_tx, ready_rx) = flume::bounded::<Result<(), String>>(1);
+        let handle = thread::Builder::new()
+            .name("itts-playback".to_owned())
+            .spawn(move || {
+                let player = match AudioPlayer::try_new() {
+                    Ok(player) => {
+                        let _ = ready_tx.send(Ok(()));
+                        player
+                    }
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(format!("{err:#}")));
+                        return Err(err);
+                    }
+                };
+                for (pcm, sample_rate) in rx {
+                    player.enqueue_pcm_i16(&pcm, sample_rate)?;
+                }
+                player.drain();
+                Ok(())
+            })
+            .map_err(|err| unavailable(&err.to_string()))?;
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self { tx, handle }),
+            Ok(Err(message)) => Err(unavailable(&message)),
+            Err(_) => Err(unavailable("playback thread exited during startup")),
+        }
+    }
+
+    /// Queues mono PCM for playback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::AudioOutputUnavailable`] if the playback thread has stopped.
+    pub fn enqueue(&self, pcm: Vec<i16>, sample_rate: u32) -> Result<(), ServiceError> {
+        self.tx
+            .send((pcm, sample_rate))
+            .map_err(|_| unavailable("audio playback stopped unexpectedly"))
+    }
+
+    /// Blocks until every queued sample has been played.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::AudioOutputUnavailable`] if playback failed.
+    pub fn finish(self) -> Result<(), ServiceError> {
+        drop(self.tx);
+        self.handle
+            .join()
+            .map_err(|_| unavailable("audio playback thread panicked"))?
+            .map_err(|err| unavailable(&format!("{err:#}")))
+    }
+}
+
+/// Name of the default output device, if any.
+pub fn default_output_device_name() -> Option<String> {
+    default_host()
+        .default_output_device()
+        .and_then(|device| device.description().ok().map(|d| d.name().to_owned()))
+}
+
+fn unavailable(message: &str) -> ServiceError {
+    ServiceError::new(
+        ErrorCode::AudioOutputUnavailable,
+        format!("audio output unavailable: {message}"),
+    )
+    .with_hint("connect an output device, or write to a file with --out <file.wav>")
 }

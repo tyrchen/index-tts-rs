@@ -1,6 +1,8 @@
 # Default runtime configuration for index-tts-rs
 model_repo: "yunfengwang/IndexTTS-2.5-mlx"
 default_language: "zh"
+# Registered voice used when a request omits voice / voiceFile / refAudio.
+# default_voice: "narrator"
 text_pos_capacity: 602
 max_text_tokens_per_segment: 120
 use_normalization: true

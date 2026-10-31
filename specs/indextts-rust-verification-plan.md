@@ -95,7 +95,7 @@ flowchart TB
   2. `test_should_synthesize_speech_from_cached_voice_without_loading_encoders`：仅加载 Stage 1~3 合成引擎，从 `.itts_voice` 合成中文、英文、中英混合语音，验证输出音频有效时长、非全零、无削波失真（Clipping）。
   3. `test_should_stream_audio_chunks_and_support_early_cancellation`：输入包含 4 个句子的文本，通过 `synthesize_stream` 读取第 1 个 `AudioChunk` 后立即 `drop(stream)`，验证后台 Actor 立即中止剩余 3 个句子的推理。
   4. `test_should_auto_forward_cli_synth_to_running_daemon`：启动临时 Unix Socket Daemon，连续执行两次 CLI 合成请求，验证第二次请求的模型加载耗时为 `0.0 ms`。
-  5. `test_should_handle_mcp_tools_over_stdio`：向 `index-tts mcp` 发送 `tools/list` 与 `tools/call (list_voices / synthesize_to_file)` JSON-RPC 请求，验证返回符合 MCP 规范的 JSON 响应。
+  5. `test_should_handle_mcp_tools_over_stdio`：向 `itts mcp` 发送 `tools/list` 与 `tools/call (list_voices / synthesize_to_file)` JSON-RPC 请求，验证返回符合 MCP 规范的 JSON 响应。
 
 ---
 
@@ -112,7 +112,7 @@ cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic \
 ```
 
 ### 5.2 性能与内存验收剖析 (`make bench`)
-在 Phase 6 完成后，使用 `criterion` 与 macOS `/usr/bin/time -l`（测量 Peak Resident Set Size / Metal Footprint）对比原版 Python `index-tts-2.5-mlx` 与 Rust `index-tts`：
+在 Phase 6 完成后，使用 `criterion` 与 macOS `/usr/bin/time -l`（测量 Peak Resident Set Size / Metal Footprint）对比原版 Python `index-tts-2.5-mlx` 与 Rust `itts`：
 
 1. **微基准测试 (`benches/`)**：
    - `bench_dsp_mel_and_fbank`: 15 秒音频的 DSP 特征提取耗时（目标 **< 5 ms**）。
