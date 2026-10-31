@@ -23,9 +23,10 @@ High-performance, 100% pure-Rust inference engine, CLI, warm-model daemon, and M
 index-tts-rs/
 ├── crates/
 │   ├── core/          # index-tts-rs-core: DSP, Frontend, Stage 0..3 MLX models, VoiceStore, Actor Engine
-│   └── director/      # Validated speech controls and optional DeepSeek pacing annotation
+│   ├── director/      # Validated speech controls and optional DeepSeek pacing annotation
+│   └── service/       # SpeechJob request model, stable error codes, job execution shared by all frontends
 ├── apps/
-│   ├── cli/           # itts: CLI (`synth`, `voice`, `models`, `daemon`, `mcp`)
+│   ├── cli/           # itts: CLI (`synth`, `voice`, `models`, `daemon`, `doctor`, `schema`, `mcp`)
 │   └── server/        # index-tts-rs-server: HTTP /v1/audio/speech server
 ├── specs/             # PRD, Architecture Design, Implementation Plan, Verification Plan
 └── docs/              # Deep-dive research & benchmark verification reports
@@ -45,9 +46,12 @@ make install
 itts --help
 ```
 
-### 2. Pull or Inspect Local Model Weights
+### 2. Check the Environment, Pull or Inspect Model Weights
 
 ```bash
+# Platform, model, voices, daemon, DeepSeek key, and audio output — each with a fix hint
+itts doctor
+
 # Inspect local Hugging Face cache snapshot & dead-weight stripping stats
 itts models info
 
@@ -78,11 +82,25 @@ itts synth \
   --play \
   --out output_en.wav
 
-# Start the warm-model daemon in the background
-itts daemon start &
+# Keep models warm: `start` detaches, reports each loaded component, and returns once ready
+itts daemon start
 itts synth --voice narrator --text "秒级热启动推理测试。" --out warm.wav
+itts daemon status
 itts daemon stop
 ```
+
+### 5. Use from Agents
+
+```bash
+itts doctor --output json                    # environment report
+itts synth --voice narrator --text "你好" --out hi.wav --output json
+itts schema controls                          # control tags, emotions, ranges, error codes
+```
+
+Every command accepts `--output text|json|jsonl` (or `ITTS_OUTPUT`). In JSON modes failures are
+`{"status":"error","error":{"code","message","hint"}}` with a stable exit code per error code.
+`itts mcp` exposes the same capabilities as MCP tools and shares the warm daemon. See the
+[agent integration guide](docs/usage/itts-agent-integration.md).
 
 ---
 
@@ -130,7 +148,9 @@ The HTTP server also exposes:
 | `POST /api/speech/stream` | Streaming PCM chunks and completion statistics as JSON Lines |
 | `POST /v1/audio/speech` | WAV audio from `{"input":"你好。","voice":"tyr","lang":"zh","speed":1.0}` |
 
-The HTTP speech endpoint accepts registered voice IDs; use `itts synth --ref` for synthesis
+Request bodies use the same `SpeechJob` fields as the CLI and MCP (`itts schema speech-job`), and
+errors carry a stable `code`. The HTTP endpoints accept registered voice IDs only; file fields
+(`voiceFile`, `refAudio`, `outputPath`) are rejected, so use `itts synth --ref` for synthesis
 directly from reference audio. Text is limited to 16,384 UTF-8 bytes. `speed` ranges from 0.25
 to 4.0 (larger values speak faster); the page offers 0.5–2.0. Requests have a 32 KiB body limit,
 a 120-second timeout, and an eight-request concurrency limit with a busy response when full.

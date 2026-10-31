@@ -9,3 +9,7 @@
 - [IndexTTS-2.5 Rust 高性能推理引擎与 Agent CLI 分步实施计划 (`indextts-rust-impl-plan`)](indextts-rust-impl-plan.md) — 将系统开发拆解为 6 个可独立交付与验证的阶段（Phase 1 基建与 Fixture -> Phase 2 纯 Rust DSP/Frontend -> Phase 3 S2M/BigVGAN -> Phase 4 GPT Int8 -> Phase 5 Stage 0 音色提取 -> Phase 6 Actor/CLI/Daemon/MCP），明确每阶段文件清单与准出标准。
 - [IndexTTS-2.5 Rust 高性能推理引擎与 Agent CLI 验证计划 (`indextts-rust-verification-plan`)](indextts-rust-verification-plan.md) — 定义 14 个黄金检查点张量（CP-01..CP-14）的余弦相似度与误差阈值、`rstest`/`proptest` 测试矩阵、端到端集成测试以及性能/安全门禁。
 - [IndexTTS-2.5 情绪向量推理与细粒度朗读导演架构设计 (`indextts-emotion-director-design`)](indextts-emotion-director-design.md) — 定义上游 8 类情绪原型矩阵（`spk_matrix` / `emo_matrix`）与零 Stage-0 开销的 `.itts_voice` 动态 `conds` 混合算法、`[[emo=...]]` 与 `[[temp=...]]` 控制标签、以及基于诗句联（Couplet）切分的 DeepSeek 细粒度情绪与韵律标注架构。
+
+## Agent Usability & Service Layer
+
+- [`itts` Agent-First 可用性与服务化能力设计 (`itts-agent-usability-design`)](itts-agent-usability-design.md) — 审计并修复 CLI / Daemon / MCP / HTTP 的可观测性缺口与一致性 Bug（daemon 无就绪输出、相对路径、voice 缓存失效、MCP 不解析内联标签等）；定义统一 `SpeechJob` 请求模型与 `index-tts-rs-service` crate、14 个稳定错误码与退出码、daemon 后台化 / 单例锁 / 协议 v2（握手、多路复用、取消、BUSY）、`itts doctor` / `itts schema`，以及基于 `rmcp` 且复用 daemon 的 MCP 服务。早期规范中关于 `--json`、`synthesize_to_file` 等 CLI/MCP 接口的描述以本文档为准。

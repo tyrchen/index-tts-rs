@@ -1295,6 +1295,10 @@ pub struct EngineConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub voices_dir: Option<PathBuf>,
+    /// Registered voice used when a request names no voice, voice file, or reference audio.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub default_voice: Option<VoiceId>,
     /// Default synthesis language.
     #[builder(default)]
     pub default_language: Language,
@@ -1338,6 +1342,7 @@ impl Default for EngineConfig {
             model_repo: DEFAULT_MODEL_REPO.to_owned(),
             glossary_path: None,
             voices_dir: None,
+            default_voice: None,
             default_language: Language::Zh,
             text_pos_capacity: DEFAULT_TEXT_POS_CAPACITY,
             max_text_tokens_per_segment: DEFAULT_MAX_TEXT_TOKENS_PER_SEGMENT,

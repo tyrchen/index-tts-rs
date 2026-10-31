@@ -1,6 +1,7 @@
 # itts Speech Controls and AI Pacing
 
-`itts` and the browser studio compile speech controls before calling IndexTTS. Plain text
+`itts` (CLI, daemon, and MCP server) and the browser studio compile speech controls with the
+same request model before calling IndexTTS. Plain text
 continues to work. No language-model request is made by ordinary synthesis.
 
 ## Manual controls

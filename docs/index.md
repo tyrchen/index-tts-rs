@@ -2,6 +2,7 @@
 
 ## Usage
 
+- [itts Agent Integration Guide](usage/itts-agent-integration.md) — Output modes, stable error codes and exit codes, `itts doctor` / `itts schema`, warm daemon lifecycle, MCP tools, and the daemon wire protocol.
 - [itts Speech Controls and AI Pacing](usage/itts-speech-controls.md) — Inline controls, optional DeepSeek annotation, poem paragraph handling, and browser streaming.
 
 ## Research

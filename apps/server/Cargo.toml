@@ -17,6 +17,7 @@ clap.workspace = true
 futures-util.workspace = true
 index-tts-rs-core.workspace = true
 index-tts-rs-director.workspace = true
+index-tts-rs-service.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
