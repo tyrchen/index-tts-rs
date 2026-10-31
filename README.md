@@ -90,18 +90,22 @@ itts daemon stop
 
 ```bash
 itts synth --voice tyr \
-  --text '[[speed=0.9]]轻轻的我走了，[[pause=600]]正如我轻轻的来。' \
+  --text '[[emo=低落:0.35,平静:0.35]][[temp=0.72]][[speed=0.88]]轻轻的我走了，[[pause=600]]正如我轻轻的来。' \
   --out poem.wav --play
 
-# Optional: uses DEEPSEEK_API_KEY to annotate pacing, without rewriting the words
+# Optional: uses DEEPSEEK_API_KEY to annotate couplet-level emotion, tone temperature, speed, and pauses
 itts annotate --stdin --poetry < poem.txt > poem.itts.txt
 itts synth --voice tyr --stdin --out poem.wav --play < poem.itts.txt
 ```
 
-Controls include `pause`, `speed`, `voice`, `lang`, and `reset`, along with existing
-`<word|pronunciation>` overrides. Blank lines preserve paragraphs and poem stanzas. See the
+Controls include `emo` (8-class emotion vector mixing: `happy`/`高兴`, `angry`/`愤怒`, `sad`/`悲伤`,
+`afraid`/`恐惧`, `disgusted`/`反感`, `melancholic`/`低落`, `surprised`/`惊讶`, `calm`/`平静`),
+`temp` (GPT sampling temperature `0.05..=2.0`), `pause`, `speed`, `voice`, `lang`, and `reset`,
+along with existing `<word|pronunciation>` overrides. Blank lines preserve paragraphs and poem
+stanzas, while `--poetry` annotation further splits stanzas at couplet boundaries (`；`, `。`, `！`, `？`)
+for fine-grained emotional transitions. See the
 [speech control guide](docs/usage/itts-speech-controls.md) for syntax, provider settings, and
-limits. Emotion and pitch tags are rejected because the current pipeline cannot execute them.
+limits.
 
 ## Browser Speech Studio
 

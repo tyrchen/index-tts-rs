@@ -17,8 +17,8 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::stream::unfold;
 use index_tts_rs_core::{
     config::{
-        DurationFactor, EngineConfig, Language, SpeakerSource, SynthesisRequest, SynthesisText,
-        VoiceId,
+        DurationFactor, EmotionVector, EngineConfig, Language, SpeakerSource, SynthesisRequest,
+        SynthesisText, VoiceId,
     },
     dsp::encode_wav_i16_bytes,
     engine::{AudioChunk, IndexTtsEngine, SynthesisStream},
@@ -61,6 +61,8 @@ struct SpeechPayload {
     duration_factor: DurationFactor,
     #[serde(default)]
     paragraph_pause_ms: ParagraphPause,
+    #[serde(default)]
+    emo: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -184,6 +186,10 @@ impl SpeechPayload {
     fn into_request(self, config: &EngineConfig) -> Result<SynthesisRequest, ApiError> {
         let mut cfm = config.cfm.clone();
         cfm.duration_factor = self.duration_factor;
+        let emo_vector = match self.emo.as_deref() {
+            Some(spec) => EmotionVector::parse_spec(spec)?,
+            None => None,
+        };
         let token_limit = NonZeroU32::new(
             u32::try_from(config.max_text_tokens_per_segment).map_err(ApiError::internal)?,
         )
@@ -196,6 +202,7 @@ impl SpeechPayload {
             .cfm(cfm)
             .max_text_tokens_per_segment(token_limit)
             .interval_silence_ms(config.interval_silence_ms)
+            .emo_vector(emo_vector)
             .build())
     }
 }

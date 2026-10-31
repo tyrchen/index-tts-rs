@@ -245,7 +245,8 @@ form.addEventListener('submit', async (event) => {
     const shownVoice = payload.input.includes('[[voice=') ? '音色按标签' : payload.voice;
     const shownLanguage = payload.input.includes('[[lang=') ? '语言按标签' : selectedLanguage;
     const shownSpeed = payload.input.includes('[[speed=') ? '语速按标签' : `${payload.speed.toFixed(1)}×`;
-    element('result-meta').textContent = `${shownVoice} · ${shownLanguage} · ${shownSpeed} · 首段 ${firstAudio.toFixed(1)} 秒 · 全部生成 ${summary.wallSecs.toFixed(1)} 秒 · 音频 ${summary.durationSecs.toFixed(1)} 秒`;
+    const shownEmo = payload.input.includes('[[emo=') ? ' · 情绪按标签' : '';
+    element('result-meta').textContent = `${shownVoice} · ${shownLanguage} · ${shownSpeed}${shownEmo} · 首段 ${firstAudio.toFixed(1)} 秒 · 全部生成 ${summary.wallSecs.toFixed(1)} 秒 · 音频 ${summary.durationSecs.toFixed(1)} 秒`;
     status.textContent = '生成完成。下载文件包含完整语音和段落停顿。';
   } catch (error) {
     controller.abort();
@@ -279,7 +280,7 @@ annotateButton.addEventListener('click', async () => {
     originalText = source;
     input.value = result.script;
     undoAnnotation.hidden = false;
-    status.textContent = '已添加语速与停顿标签。可以编辑，再生成试听。';
+    status.textContent = '已添加情绪、语调、语速与停顿标签。可以编辑，再生成试听。';
   } catch (error) {
     controller.abort();
     status.textContent = '标注未完成，原文已保留。';

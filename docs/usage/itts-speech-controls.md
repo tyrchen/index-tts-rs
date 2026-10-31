@@ -7,22 +7,30 @@ continues to work. No language-model request is made by ordinary synthesis.
 
 ```bash
 itts synth --voice tyr \
-  --text '[[speed=0.9]]轻轻的我走了，[[pause=600ms]]正如我轻轻的来。' \
+  --text '[[emo=低落:0.35,平静:0.35]][[temp=0.72]][[speed=0.88]]轻轻的我走了，[[pause=600ms]]正如我轻轻的来。' \
   --out poem.wav --play
+
+# Or apply a default 8-class emotion mix across the entire synthesis request:
+itts synth --voice tyr --emo "melancholic:0.45,calm:0.25" --text "沉默是今晚的康桥！" --play
 ```
 
 | Control | Behavior |
 | --- | --- |
+| `[[emo=melancholic:0.45,calm:0.25]]` or `[[emo=低落:0.45,平静:0.25]]` | Blend up to 8 IndexTTS-2.5 emotion prototypes (`happy`/`高兴`, `angry`/`愤怒`, `sad`/`悲伤`, `afraid`/`恐惧`, `disgusted`/`反感`, `melancholic`/`低落`, `surprised`/`惊讶`, `calm`/`平静`); `[[emo=none]]` restores the speaker's base emotion |
+| `[[temp=0.75]]` or `[[temperature=0.75]]` | Set GPT sampling temperature (`0.05..=2.0`, default `0.8`); lower (`0.68..0.76`) yields restrained/gentle inflection, higher (`0.84..0.95`) yields stronger prosodic expressiveness |
 | `[[pause=600]]` or `[[pause=600ms]]` | Insert 600 ms of silence before the following speech; range 0–5000 ms |
 | `[[speed=0.9]]` | Change speaking speed until the next speed control or reset; range 0.25–4.0, larger is faster |
 | `[[voice=tyr]]` | Switch to a registered voice ID |
 | `[[lang=zh]]` | Switch synthesis language |
-| `[[reset]]` | Restore the voice, language, and speed supplied to the synthesis command |
+| `[[reset]]` | Restore the voice, language, emotion, temperature, and speed supplied to the synthesis command |
 | `<荇|xing4>` | Existing model pronunciation override, passed through unchanged |
 
 Controls apply to subsequent speech. A nonzero pause must be followed by text. Unknown controls
-are rejected; `emotion`, `pitch`, and `emphasis` are not implemented acoustic controls. Rate and
-voice changes start new inference units, so prefer complete phrases over individual words.
+are rejected. Emotion vectors are matched against the speaker's `CAMPPlus` style embedding via
+cosine similarity across the 73 upstream `IndexTTS-2.5` emotion prototypes (`emo_matrix.safetensors`),
+normalized with upstream bias weights, and capped at a total weight sum of `0.8` so the speaker's
+timbre is preserved. Rate, emotion, temperature, and voice changes start new inference units, so
+prefer complete phrases or couplets over individual words.
 All audible pauses, including playback and raw PCM output, are also present in the saved WAV.
 CLI JSON Lines identify control-plan units with `utteranceIndex` / `totalUtterances`;
 `segmentIndex` / `totalSegments` identify token-budget segments within that unit.
@@ -57,8 +65,10 @@ timeout, and output-token budget. Without a file, the same defaults apply: `deep
 `deepseek-flash` currently serves DeepSeek V4.1 Flash; see the
 [official model documentation](https://api-docs.deepseek.com/quick_start/pricing/).
 
-The model receives indexed source paragraphs and returns only paragraph indices, speeds
-(0.8–1.2), and pauses (0–2000 ms). Each paragraph must appear exactly once, in order. The local
+The model receives indexed source units (paragraphs in prose mode, or fine-grained couplets split
+at `;` / `；` / `。` / `！` / `？` line endings in `--poetry` mode) and returns only unit indices,
+8-class `emotions` weights (`0.0..=1.0`), `temperature` (`0.65..=0.95`), `speed` (`0.8..=1.2`),
+and `pauseAfterMs` (`0..=2000` ms). Each unit must appear exactly once, in order. The local
 renderer supplies all spoken text and validates the entire result before using it. No model
 output is permitted to add, remove, or rewrite words. Empty, incomplete, excessive, or invalid
 responses fail explicitly and leave the source intact. Requests use HTTPS with the Rustls

@@ -3,7 +3,8 @@
 use std::{iter::repeat_n, str::FromStr};
 
 use index_tts_rs_core::config::{
-    DurationFactor, Language, SpeakerSource, SynthesisRequest, SynthesisText, VoiceId,
+    DurationFactor, EmotionVector, Language, SpeakerSource, SynthesisRequest, SynthesisText,
+    Temperature, VoiceId,
 };
 use winnow::{Parser, error::ContextError, token::take_until};
 
@@ -21,7 +22,8 @@ pub struct PlannedUtterance {
     pub pause_before_ms: u32,
 }
 
-/// Compile `[[pause=600]]`, `[[speed=0.9]]`, `[[voice=tyr]]`, `[[lang=zh]]`, and `[[reset]]`.
+/// Compile `[[pause=600]]`, `[[speed=0.9]]`, `[[emo=melancholic:0.45,calm:0.25]]`,
+/// `[[temp=0.75]]`, `[[voice=tyr]]`, `[[lang=zh]]`, and `[[reset]]`.
 ///
 /// Controls apply until changed or reset. Existing `<行|hang2>` pronunciation annotations are
 /// preserved. Blank lines create separate utterances; line-ending semicolons retain a strong
@@ -35,8 +37,11 @@ pub struct PlannedUtterance {
 /// use index_tts_rs_core::config::{SpeakerSource, SynthesisRequest, SynthesisText, VoiceId};
 /// use index_tts_rs_director::plan_utterances;
 /// let request = SynthesisRequest::builder()
-///     .text(SynthesisText::new("你好。[[pause=600]][[speed=0.9]]欢迎。")?)
-///     .speaker(SpeakerSource::VoiceId(VoiceId::new("tyr")?)).build();
+///     .text(SynthesisText::new(
+///         "你好。[[pause=600]][[emo=melancholic:0.4,calm:0.3]][[temp=0.75]][[speed=0.9]]欢迎。",
+///     )?)
+///     .speaker(SpeakerSource::VoiceId(VoiceId::new("tyr")?))
+///     .build();
 /// let plan = plan_utterances(&request, 600)?;
 /// assert_eq!(plan.len(), 2);
 /// assert_eq!(plan.get(1).map(|part| part.pause_before_ms), Some(600));
@@ -163,9 +168,17 @@ fn apply_control(
         }
         "voice" => state.speaker = SpeakerSource::VoiceId(VoiceId::new(value)?),
         "lang" => state.language = Language::from_str(value)?,
+        "emo" => state.emo_vector = EmotionVector::parse_spec(value)?,
+        "temp" | "temperature" => {
+            let temp = value
+                .parse::<f32>()
+                .map_err(|_| invalid("temperature must be a number"))?;
+            state.sampling.temperature = Temperature::new(temp)?;
+        }
         _ => {
             return Err(invalid(
-                "unsupported control; supported controls: pause, speed, voice, lang, reset",
+                "unsupported control; supported controls: pause, speed, emo, temp, voice, lang, \
+                 reset",
             ));
         }
     }
@@ -222,7 +235,10 @@ mod tests {
     #[test]
     fn test_should_execute_controls_without_speaking_them() -> Result<()> {
         let plan = plan_utterances(
-            &base("一。[[pause=700ms]][[speed=0.9]][[lang=en]][[voice=other]]Two.[[reset]]三。")?,
+            &base(
+                "一。[[pause=700ms]][[emo=低落:0.45,平静:0.25]][[temp=0.72]][[speed=0.\
+                 9]][[lang=en]][[voice=other]]Two.[[reset]]三。",
+            )?,
             600,
         )?;
         assert_eq!(plan.len(), 3);
@@ -233,15 +249,28 @@ mod tests {
         assert_eq!(middle.request.text.as_str(), "Two.");
         assert_eq!(middle.request.language, Language::En);
         assert!((middle.request.cfm.duration_factor.get() - 1.0 / 0.9).abs() < f32::EPSILON);
-        assert_eq!(
-            plan.get(2).map(|part| part.request.language),
-            Some(Language::Zh)
-        );
+        assert!((middle.request.sampling.temperature.get() - 0.72).abs() < 1e-6);
+        let emo = middle
+            .request
+            .emo_vector
+            .ok_or_else(|| super::invalid("missing emotion vector"))?;
+        assert!((emo.melancholic - 0.45).abs() < 1e-6);
+        assert!((emo.calm - 0.25).abs() < 1e-6);
+        let last = plan
+            .get(2)
+            .ok_or_else(|| super::invalid("missing third test utterance"))?;
+        assert_eq!(last.request.language, Language::Zh);
+        assert!(last.request.emo_vector.is_none());
+        assert!((last.request.sampling.temperature.get() - 0.8).abs() < 1e-6);
         Ok(())
     }
 
     #[rstest]
     #[case("你好[[emotion=sad]]世界")]
+    #[case("你好[[emo=unknown:0.5]]世界")]
+    #[case("你好[[emo=sad:1.5]]世界")]
+    #[case("你好[[temp=0.01]]世界")]
+    #[case("你好[[temp=2.5]]世界")]
     #[case("你好[[pause=5001]]世界")]
     #[case("你好[[speed=NaN]]世界")]
     #[case("你好[[voice=../x]]世界")]

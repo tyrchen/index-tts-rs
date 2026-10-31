@@ -23,9 +23,9 @@ use hf_hub::{HFClient, split_id};
 use index_tts_rs_core::{
     config::{
         CfgRate, CfmParams, DEFAULT_INTERVAL_SILENCE_MS, DEFAULT_MAX_TEXT_TOKENS_PER_SEGMENT,
-        DEFAULT_MODEL_REPO, DurationFactor, EmoAlpha, EngineConfig, Language, RepetitionPenalty,
-        SamplingParams, SpeakerSource, SynthesisRequest, SynthesisText, Temperature, TopK, TopP,
-        VoiceId,
+        DEFAULT_MODEL_REPO, DurationFactor, EmoAlpha, EmotionVector, EngineConfig, Language,
+        RepetitionPenalty, SamplingParams, SpeakerSource, SynthesisRequest, SynthesisText,
+        Temperature, TopK, TopP, VoiceId,
     },
     dsp::write_wav_i16_file,
     engine::{AudioChunk, IndexTtsEngine, StageTimings, SynthesisResult},
@@ -134,6 +134,11 @@ struct SynthArgs {
     /// Emotion blending multiplier (`0.0..=2.0`, default `1.0`).
     #[arg(long, default_value_t = 1.0)]
     emo_alpha: f32,
+
+    /// Optional 8-class emotion intensity vector (e.g. `melancholic:0.45,calm:0.25` or
+    /// `低落:0.45,平静:0.25`).
+    #[arg(long)]
+    emo: Option<String>,
 
     /// Input text to synthesize (omit when `--stdin` is passed).
     #[arg(long, short = 't')]
@@ -251,6 +256,9 @@ enum VoiceSubcommand {
         /// Emotion blending multiplier (`0.0..=2.0`, default `1.0`).
         #[arg(long, default_value_t = 1.0)]
         emo_alpha: f32,
+        /// Optional 8-class emotion intensity vector to bake into the voice snapshot.
+        #[arg(long)]
+        emo: Option<String>,
         /// Emit structured JSON output.
         #[arg(long)]
         json: bool,
@@ -599,6 +607,10 @@ fn build_synthesis_request(args: &SynthArgs) -> Result<SynthesisRequest> {
         .build();
     let max_text_tokens = NonZeroU32::new(args.max_text_tokens)
         .ok_or_else(|| anyhow!("--max-text-tokens must be >= 1"))?;
+    let emo_vector = match args.emo.as_deref() {
+        Some(spec) => EmotionVector::parse_spec(spec)?,
+        None => None,
+    };
 
     Ok(SynthesisRequest::builder()
         .text(text)
@@ -610,6 +622,7 @@ fn build_synthesis_request(args: &SynthArgs) -> Result<SynthesisRequest> {
         .interval_silence_ms(args.interval_silence)
         .emo_audio_path(args.emo_ref.clone())
         .emo_alpha(EmoAlpha::new(args.emo_alpha)?)
+        .emo_vector(emo_vector)
         .build())
 }
 
@@ -726,24 +739,32 @@ fn handle_voice_command(config: &EngineConfig, action: VoiceSubcommand) -> Resul
             ref_audio,
             emo_ref,
             emo_alpha,
+            emo,
             json,
         } => {
             let t0 = Instant::now();
             let id = VoiceId::new(voice_id)?;
             let alpha = EmoAlpha::new(emo_alpha)?;
+            let emo_vector = match emo.as_deref() {
+                Some(spec) => EmotionVector::parse_spec(spec)?,
+                None => None,
+            };
             let model_dir = resolve_model_dir(config.model_dir.as_deref(), &config.model_repo)?;
 
             // Sequentially load & drop each Stage 0 encoder so peak RSS stays minimal
             let regulator = LengthRegulator::load_from_path(
                 model_dir.join("raw/length_regulator.safetensors"),
             )?;
-            let ctx = VoiceExtractor::extract_from_model_dir(
+            let mut ctx = VoiceExtractor::extract_from_model_dir(
                 &model_dir,
                 &ref_audio,
                 emo_ref.as_deref(),
                 alpha,
                 &regulator,
             )?;
+            if let Some(ref emo_vec) = emo_vector {
+                ctx.apply_emotion_from_model_dir(&model_dir, emo_vec, alpha)?;
+            }
             let _ = store.register(id.clone(), ctx)?;
             let entry = store.inspect(&id)?;
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;

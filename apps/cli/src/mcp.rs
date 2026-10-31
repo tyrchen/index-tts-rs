@@ -11,7 +11,7 @@ use std::{path::PathBuf, str::FromStr};
 use anyhow::{Context, Result};
 use index_tts_rs_core::{
     config::{
-        CfmParams, DurationFactor, EmoAlpha, EngineConfig, Language, SpeakerSource,
+        CfmParams, DurationFactor, EmoAlpha, EmotionVector, EngineConfig, Language, SpeakerSource,
         SynthesisRequest, SynthesisText, VoiceExtractRequest, VoiceId,
     },
     engine::IndexTtsEngine,
@@ -93,6 +93,8 @@ struct SpeakArgs {
     lang: Option<String>,
     #[serde(default)]
     speed: Option<f32>,
+    #[serde(default)]
+    emo: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +111,8 @@ struct SynthesizeToFileArgs {
     lang: Option<String>,
     #[serde(default)]
     speed: Option<f32>,
+    #[serde(default)]
+    emo: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,6 +126,8 @@ struct RegisterVoiceArgs {
     emo_audio_path: Option<PathBuf>,
     #[serde(default, alias = "emo_alpha")]
     emo_alpha: Option<f32>,
+    #[serde(default)]
+    emo: Option<String>,
 }
 
 /// Processes a single JSON-RPC 2.0 request line and returns an optional [`JsonRpcResponse`]
@@ -245,6 +251,7 @@ async fn dispatch_tool_call(
                 parsed.ref_audio_path,
                 parsed.lang.as_deref(),
                 parsed.speed,
+                parsed.emo.as_deref(),
             )?;
             let res = engine.synthesize(synth_req).await?;
             let played = if let Ok(player) = AudioPlayer::try_new() {
@@ -273,6 +280,7 @@ async fn dispatch_tool_call(
                 parsed.ref_audio_path,
                 parsed.lang.as_deref(),
                 parsed.speed,
+                parsed.emo.as_deref(),
             )?;
             let res = engine.synthesize(synth_req).await?;
             res.save_wav(&parsed.output_path)?;
@@ -291,11 +299,16 @@ async fn dispatch_tool_call(
                 serde_json::from_value(args).context("invalid arguments for `register_voice`")?;
             let voice_id = VoiceId::new(parsed.voice_id)?;
             let emo_alpha = EmoAlpha::new(parsed.emo_alpha.unwrap_or(1.0))?;
+            let emo_vector = match parsed.emo.as_deref() {
+                Some(spec) => EmotionVector::parse_spec(spec)?,
+                None => None,
+            };
             let req = VoiceExtractRequest::builder()
                 .voice_id(voice_id)
                 .ref_audio_path(parsed.ref_audio_path)
                 .emo_audio_path(parsed.emo_audio_path)
                 .emo_alpha(emo_alpha)
+                .emo_vector(emo_vector)
                 .build();
             let entry = engine.extract_voice(req).await?;
             let _ = engine.evict_voice_extractor().await;
@@ -317,6 +330,7 @@ fn build_mcp_synthesis_request(
     ref_audio_path: Option<PathBuf>,
     lang: Option<&str>,
     speed: Option<f32>,
+    emo: Option<&str>,
 ) -> Result<SynthesisRequest> {
     let text = SynthesisText::new(raw_text)?;
     let speaker = match (voice, ref_audio_path) {
@@ -346,12 +360,17 @@ fn build_mcp_synthesis_request(
     let cfm = CfmParams::builder()
         .duration_factor(duration_factor)
         .build();
+    let emo_vector = match emo {
+        Some(spec) => EmotionVector::parse_spec(spec)?,
+        None => None,
+    };
 
     Ok(SynthesisRequest::builder()
         .text(text)
         .speaker(speaker)
         .language(language)
         .cfm(cfm)
+        .emo_vector(emo_vector)
         .build())
 }
 
@@ -368,7 +387,8 @@ fn mcp_tools_schema() -> Value {
                         "voice": { "type": "string", "description": "Registered voice ID or .itts_voice path" },
                         "refAudioPath": { "type": "string", "description": "Optional reference audio file path (.wav/.mp3)" },
                         "lang": { "type": "string", "description": "Language code (zh, en, ja, yue, es, ar, zh/en)" },
-                        "speed": { "type": "number", "description": "Speaking speed multiplier (default 1.0)" }
+                        "speed": { "type": "number", "description": "Speaking speed multiplier (default 1.0)" },
+                        "emo": { "type": "string", "description": "Optional 8-class emotion intensity vector (e.g. 'melancholic:0.45,calm:0.25' or '低落:0.45,平静:0.25')" }
                     },
                     "required": ["text"]
                 }
@@ -384,7 +404,8 @@ fn mcp_tools_schema() -> Value {
                         "refAudioPath": { "type": "string", "description": "Optional reference audio file path (.wav/.mp3)" },
                         "outputPath": { "type": "string", "description": "Output WAV file path" },
                         "lang": { "type": "string", "description": "Language code (zh, en, ja, yue, es, ar, zh/en)" },
-                        "speed": { "type": "number", "description": "Speaking speed multiplier (default 1.0)" }
+                        "speed": { "type": "number", "description": "Speaking speed multiplier (default 1.0)" },
+                        "emo": { "type": "string", "description": "Optional 8-class emotion intensity vector (e.g. 'melancholic:0.45,calm:0.25' or '低落:0.45,平静:0.25')" }
                     },
                     "required": ["text", "outputPath"]
                 }
@@ -398,7 +419,8 @@ fn mcp_tools_schema() -> Value {
                         "voiceId": { "type": "string", "description": "Voice identifier (^[a-zA-Z0-9_-]{1,64}$)" },
                         "refAudioPath": { "type": "string", "description": "Reference audio file path (3s..15s)" },
                         "emoAudioPath": { "type": "string", "description": "Optional separate emotion reference audio file" },
-                        "emoAlpha": { "type": "number", "description": "Emotion blending weight in 0.0..=2.0 (default 1.0)" }
+                        "emoAlpha": { "type": "number", "description": "Emotion blending weight in 0.0..=2.0 (default 1.0)" },
+                        "emo": { "type": "string", "description": "Optional 8-class emotion intensity vector to bake into the snapshot" }
                     },
                     "required": ["voiceId", "refAudioPath"]
                 }

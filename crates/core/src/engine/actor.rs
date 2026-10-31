@@ -6,6 +6,7 @@
 //! channels.
 
 use std::{
+    borrow::Cow,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -31,11 +32,11 @@ use crate::{
     frontend::Frontend,
     models::{
         BigVgan, CFM_IN_CHANNELS, CfmDit, DEFAULT_KV_MAX_SEQ, Gpt, KvCache, LengthRegulator,
-        SamplerRng, SemanticCodec, generate_codes, resolve_model_dir,
+        SamplerRng, SemanticCodec, SpkProjWeights, generate_codes, resolve_model_dir,
     },
     voice::{
-        CONDS_DIM, CONDS_FRAMES, PROMPT_CONDITION_DIM, REF_MEL_BINS, STYLE_DIM, SpeakerContext,
-        VoiceEntry, VoiceExtractor, VoiceStore, default_voices_dir,
+        CONDS_DIM, CONDS_FRAMES, EmoMatrix, PROMPT_CONDITION_DIM, REF_MEL_BINS, STYLE_DIM,
+        SpeakerContext, VoiceEntry, VoiceExtractor, VoiceStore, default_voices_dir,
     },
 };
 
@@ -82,6 +83,8 @@ struct MlxWorkerState {
     regulator: LengthRegulator,
     cfm: CfmDit,
     bigvgan: BigVgan,
+    spk_proj: SpkProjWeights,
+    emo_matrix: EmoMatrix,
     voice_extractor: Option<VoiceExtractor>,
     last_ref_cache: Option<CachedRefAudio>,
     shutdown_flag: Arc<AtomicBool>,
@@ -110,6 +113,8 @@ impl MlxWorkerState {
             LengthRegulator::load_from_path(model_dir.join("raw/length_regulator.safetensors"))?;
         let cfm = CfmDit::load_from_path(model_dir.join("cfm_estimator.safetensors"))?;
         let bigvgan = BigVgan::load_from_path(model_dir.join("raw/bigvgan.safetensors"))?;
+        let spk_proj = SpkProjWeights::load_from_path(model_dir.join("spk_proj.npz"))?;
+        let emo_matrix = EmoMatrix::load_or_embedded(Some(&model_dir))?;
         let _ = mlx_rs::memory::clear_cache();
 
         info!(
@@ -129,6 +134,8 @@ impl MlxWorkerState {
             regulator,
             cfm,
             bigvgan,
+            spk_proj,
+            emo_matrix,
             voice_extractor: None,
             last_ref_cache: None,
             shutdown_flag,
@@ -206,12 +213,22 @@ impl MlxWorkerState {
         let Some(extractor) = self.voice_extractor.as_ref() else {
             return Err(IndexTtsError::actor("VoiceExtractor unavailable"));
         };
-        let ctx = extractor.extract_from_path(
+        let mut ctx = extractor.extract_from_path(
             &req.ref_audio_path,
             req.emo_audio_path.as_deref(),
             req.emo_alpha,
             &self.regulator,
         )?;
+        if let Some(ref emo_vec) = req.emo_vector
+            && !emo_vec.is_zero()
+        {
+            ctx.conds = ctx.resolve_conds_with_emotion(
+                &self.spk_proj,
+                &self.emo_matrix,
+                emo_vec,
+                req.emo_alpha,
+            )?;
+        }
         let _ = self.voice_store.register(req.voice_id.clone(), ctx)?;
         self.voice_store.inspect(&req.voice_id)
     }
@@ -246,8 +263,25 @@ impl MlxWorkerState {
             return;
         }
 
+        let resolved_conds = match req.emo_vector.as_ref() {
+            Some(emo_vec) if !emo_vec.is_zero() => match spk.resolve_conds_with_emotion(
+                &self.spk_proj,
+                &self.emo_matrix,
+                emo_vec,
+                req.emo_alpha,
+            ) {
+                Ok(c) => Cow::Owned(c),
+                Err(err) => {
+                    let _ = chunk_tx.send(Err(err));
+                    return;
+                }
+            },
+            _ => Cow::Borrowed(spk.conds.as_slice()),
+        };
+
         let p_i32 = spk.prompt_frames.get() as i32;
-        let conds_arr = Array::from_slice(&spk.conds, &[1, CONDS_FRAMES as i32, CONDS_DIM as i32]);
+        let conds_arr =
+            Array::from_slice(&resolved_conds, &[1, CONDS_FRAMES as i32, CONDS_DIM as i32]);
         let prompt_cond_arr = Array::from_slice(
             &spk.prompt_condition,
             &[1, p_i32, PROMPT_CONDITION_DIM as i32],
