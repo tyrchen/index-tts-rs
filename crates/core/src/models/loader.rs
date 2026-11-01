@@ -26,6 +26,15 @@ pub const SPK_PROJ_IN_DIM: usize = 192;
 /// Number of active `w2v-bert-2.0` Conformer layers (`0..17`).
 pub const SEMANTIC_ACTIVE_LAYERS: usize = 17;
 
+/// Hugging Face repository holding the `safetensors` conversion of the `LavaSR` v2 extender
+/// (Apache-2.0, `YatharthS/LavaSR`; tensors verified bit-identical to the official checkpoint).
+pub const HIFI_MODEL_REPO: &str = "AEmotionStudio/lavasr-models";
+/// Pinned revision of [`HIFI_MODEL_REPO`].
+pub const HIFI_MODEL_REVISION: &str = "291b7810dcd42e111b114fcc6cf07d0d021b9bea";
+/// BLAKE3 digest of `enhancer_v2/model.safetensors` at [`HIFI_MODEL_REVISION`].
+pub const HIFI_WEIGHTS_BLAKE3: &str =
+    "e104610625b3a16b05f88dad36a26b7c47e7554c15011da64331988bba1007e2";
+
 const REQUIRED_MODEL_FILES: [&str; 4] = [
     "gpt_int8.safetensors",
     "cfm_estimator.safetensors",
@@ -56,6 +65,9 @@ pub enum ModelWeightKind {
     EmoVec,
     /// `raw/campplus.safetensors` (skips `*.num_batches_tracked`, transposes Conv1d/2d).
     CampPlus,
+    /// `enhancer_v2/model.safetensors` from [`HIFI_MODEL_REPO`], the optional 48 kHz
+    /// bandwidth extender (transposes Conv1d). Not part of [`Self::ALL`].
+    BandwidthExtender,
 }
 
 impl ModelWeightKind {
@@ -94,6 +106,7 @@ impl ModelWeightKind {
             Self::BigVgan => "raw/bigvgan.safetensors",
             Self::EmoVec => "raw/emo.safetensors",
             Self::CampPlus => "raw/campplus.safetensors",
+            Self::BandwidthExtender => "enhancer_v2/model.safetensors",
         }
     }
 }
@@ -608,7 +621,8 @@ impl SafeTensorsLoader {
             ModelWeightKind::BigVgan
             | ModelWeightKind::EmoVec
             | ModelWeightKind::GptInt8
-            | ModelWeightKind::CfmEstimator => true,
+            | ModelWeightKind::CfmEstimator
+            | ModelWeightKind::BandwidthExtender => true,
         }
     }
 
@@ -941,7 +955,9 @@ fn remap_key_and_transpose_rule(
         ModelWeightKind::GptInt8 | ModelWeightKind::CfmEstimator => {
             (raw_key.to_owned(), TransposeRule::None)
         }
-        ModelWeightKind::SemanticModel | ModelWeightKind::SemanticCodec => {
+        ModelWeightKind::SemanticModel
+        | ModelWeightKind::SemanticCodec
+        | ModelWeightKind::BandwidthExtender => {
             let rule = if shape.len() == 3 {
                 TransposeRule::Axes021
             } else {
@@ -1394,6 +1410,43 @@ fn candidate_hf_hub_roots() -> Vec<PathBuf> {
         );
     }
     roots
+}
+
+/// Locates the pinned bandwidth-extender weights in the Hugging Face cache and verifies their
+/// digest, so a corrupted or substituted file is never loaded.
+///
+/// # Errors
+///
+/// Returns [`IndexTtsError::WeightLoad`] if the file is absent (fetch it with `itts models pull`)
+/// or its BLAKE3 digest differs from [`HIFI_WEIGHTS_BLAKE3`].
+#[allow(clippy::disallowed_methods, reason = "one bounded read at load time")]
+pub fn resolve_hifi_weights() -> Result<PathBuf> {
+    let folder = format!("models--{}", HIFI_MODEL_REPO.replace('/', "--"));
+    let relative = ModelWeightKind::BandwidthExtender.relative_path();
+    let path = candidate_hf_hub_roots()
+        .into_iter()
+        .map(|root| {
+            root.join(&folder)
+                .join("snapshots")
+                .join(HIFI_MODEL_REVISION)
+                .join(relative)
+        })
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            IndexTtsError::weight_load(
+                relative,
+                format!("48 kHz output needs `{HIFI_MODEL_REPO}` weights; run `itts models pull`"),
+            )
+        })?;
+    let bytes = fs::read(&path).map_err(|err| IndexTtsError::io(&path, err))?;
+    let digest = blake3::hash(&bytes).to_hex();
+    if digest.as_str() != HIFI_WEIGHTS_BLAKE3 {
+        return Err(IndexTtsError::weight_load(
+            path.display().to_string(),
+            format!("BLAKE3 digest {digest} does not match the pinned {HIFI_WEIGHTS_BLAKE3}"),
+        ));
+    }
+    Ok(path)
 }
 
 fn verify_model_snapshot_dir(dir: &Path) -> Result<()> {

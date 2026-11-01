@@ -1,6 +1,6 @@
 //! Bounded inline controls compiled into executable synthesis requests.
 
-use std::{iter::repeat_n, str::FromStr};
+use std::{iter::repeat_n, ops::Range, str::FromStr};
 
 use index_tts_rs_core::config::{
     DurationFactor, EmotionVector, Language, SpeakerSource, SynthesisRequest, SynthesisText,
@@ -20,12 +20,26 @@ pub struct PlannedUtterance {
     pub request: SynthesisRequest,
     /// Silence to insert before this utterance, in milliseconds (`0..=5000`).
     pub pause_before_ms: u32,
+    /// Byte range of the script this utterance's text was read from.
+    pub source: Range<usize>,
+}
+
+/// A compiled script: utterances in reading order plus the byte ranges of every `[[...]]`
+/// control, which are executed rather than spoken.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ReadingPlan {
+    /// Utterances to synthesize in order.
+    pub utterances: Vec<PlannedUtterance>,
+    /// Byte ranges of control tags in the script, ascending.
+    pub controls: Vec<Range<usize>>,
 }
 
 /// Compile `[[pause=600]]`, `[[speed=0.9]]`, `[[emo=melancholic:0.45,calm:0.25]]`,
 /// `[[temp=0.75]]`, `[[voice=tyr]]`, `[[lang=zh]]`, and `[[reset]]`.
 ///
-/// Controls apply until changed or reset. Existing `<行|hang2>` pronunciation annotations are
+/// Controls apply until changed or reset; `[[speed=X]]` multiplies the request's own speed.
+/// Existing `<行|hang2>` pronunciation annotations are
 /// preserved. Blank lines create separate utterances; line-ending semicolons retain a strong
 /// punctuation cue. Unknown controls, empty scripts, and more than 128 utterances are rejected.
 ///
@@ -43,28 +57,36 @@ pub struct PlannedUtterance {
 ///     .speaker(SpeakerSource::VoiceId(VoiceId::new("tyr")?))
 ///     .build();
 /// let plan = plan_utterances(&request, 600)?;
-/// assert_eq!(plan.len(), 2);
-/// assert_eq!(plan.get(1).map(|part| part.pause_before_ms), Some(600));
+/// assert_eq!(plan.utterances.len(), 2);
+/// assert_eq!(plan.utterances.get(1).map(|part| part.pause_before_ms), Some(600));
+/// assert_eq!(plan.controls.len(), 4);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub fn plan_utterances(
-    base: &SynthesisRequest,
-    paragraph_pause_ms: u32,
-) -> Result<Vec<PlannedUtterance>> {
+pub fn plan_utterances(base: &SynthesisRequest, paragraph_pause_ms: u32) -> Result<ReadingPlan> {
     if paragraph_pause_ms > 5000 {
         return Err(invalid("paragraph pause must be between 0 and 5000 ms"));
     }
+    let script = base.text.as_str();
     let mut plan = Vec::new();
+    let mut controls = Vec::new();
     let mut state = base.clone();
     let mut pause = 0;
     let mut explicit_pause = false;
-    let mut input = base.text.as_str();
+    let mut input = script;
     while let Some(position) = input.find("[[") {
+        let offset = script.len() - input.len();
         let before = input
             .get(..position)
             .ok_or_else(|| invalid("invalid control boundary"))?;
         let previous_len = plan.len();
-        push_text(before, &state, paragraph_pause_ms, &mut pause, &mut plan)?;
+        push_text(
+            before,
+            offset,
+            &state,
+            paragraph_pause_ms,
+            &mut pause,
+            &mut plan,
+        )?;
         if plan.len() > previous_len {
             explicit_pause = false;
         }
@@ -77,13 +99,22 @@ pub fn plan_utterances(
         input = input
             .strip_prefix("]]")
             .ok_or_else(|| invalid("unterminated control"))?;
+        controls.push(offset + position..script.len() - input.len());
         apply_control(command, base, &mut state, &mut pause)?;
         if command.starts_with("pause=") {
             explicit_pause = true;
         }
     }
     let previous_len = plan.len();
-    push_text(input, &state, paragraph_pause_ms, &mut pause, &mut plan)?;
+    let offset = script.len() - input.len();
+    push_text(
+        input,
+        offset,
+        &state,
+        paragraph_pause_ms,
+        &mut pause,
+        &mut plan,
+    )?;
     if plan.len() > previous_len {
         explicit_pause = false;
     }
@@ -93,17 +124,21 @@ pub fn plan_utterances(
     if explicit_pause && pause != 0 {
         return Err(invalid("a pause must be followed by spoken text"));
     }
-    Ok(plan)
+    Ok(ReadingPlan {
+        utterances: plan,
+        controls,
+    })
 }
 
 fn push_text(
     text: &str,
+    offset: usize,
     state: &SynthesisRequest,
     paragraph_pause: u32,
     pause: &mut u32,
     plan: &mut Vec<PlannedUtterance>,
 ) -> Result<()> {
-    for (index, paragraph) in reading_units(text)?.into_iter().enumerate() {
+    for (index, unit) in reading_units(text)?.into_iter().enumerate() {
         if index > 0 {
             *pause = paragraph_pause;
         }
@@ -111,10 +146,11 @@ fn push_text(
             return Err(invalid("at most 128 utterances are supported"));
         }
         let mut request = state.clone();
-        request.text = SynthesisText::new(paragraph)?;
+        request.text = SynthesisText::new(unit.text)?;
         plan.push(PlannedUtterance {
             request,
             pause_before_ms: *pause,
+            source: offset + unit.source.start..offset + unit.source.end,
         });
     }
     if !text.trim().is_empty() {
@@ -164,7 +200,10 @@ fn apply_control(
             if !speed.is_finite() || !(0.25..=4.0).contains(&speed) {
                 return Err(invalid("speed must be between 0.25 and 4.0"));
             }
-            state.cfm.duration_factor = DurationFactor::new(speed.recip())?;
+            // Relative to the request's own speed, so a job-wide pace setting still applies to
+            // annotated scripts (`--speed 1.1` with `[[speed=0.9]]` speaks at 0.99).
+            let duration = base.cfm.duration_factor.get() / speed;
+            state.cfm.duration_factor = DurationFactor::new(duration.clamp(0.25, 4.0))?;
         }
         "voice" => state.speaker = SpeakerSource::VoiceId(VoiceId::new(value)?),
         "lang" => state.language = Language::from_str(value)?,
@@ -218,7 +257,7 @@ fn invalid(message: &str) -> DirectorError {
 #[cfg(test)]
 mod tests {
     use index_tts_rs_core::config::{
-        Language, SpeakerSource, SynthesisRequest, SynthesisText, VoiceId,
+        DurationFactor, Language, SpeakerSource, SynthesisRequest, SynthesisText, VoiceId,
     };
     use rstest::rstest;
 
@@ -234,13 +273,22 @@ mod tests {
 
     #[test]
     fn test_should_execute_controls_without_speaking_them() -> Result<()> {
-        let plan = plan_utterances(
-            &base(
-                "一。[[pause=700ms]][[emo=低落:0.45,平静:0.25]][[temp=0.72]][[speed=0.\
-                 9]][[lang=en]][[voice=other]]Two.[[reset]]三。",
-            )?,
-            600,
-        )?;
+        let script = "一。[[pause=700ms]][[emo=低落:0.45,平静:0.25]][[temp=0.72]][[speed=0.\
+                      9]][[lang=en]][[voice=other]]Two.[[reset]]三。";
+        let reading = plan_utterances(&base(script)?, 600)?;
+        assert_eq!(reading.controls.len(), 7);
+        assert!(reading.controls.iter().all(|range| {
+            script
+                .get(range.clone())
+                .is_some_and(|tag| tag.starts_with("[[") && tag.ends_with("]]"))
+        }));
+        let sources: Vec<&str> = reading
+            .utterances
+            .iter()
+            .filter_map(|part| script.get(part.source.clone()))
+            .collect();
+        assert_eq!(sources, ["一。", "Two.", "三。"]);
+        let plan = reading.utterances;
         assert_eq!(plan.len(), 3);
         let middle = plan
             .get(1)
@@ -248,7 +296,9 @@ mod tests {
         assert_eq!(middle.pause_before_ms, 700);
         assert_eq!(middle.request.text.as_str(), "Two.");
         assert_eq!(middle.request.language, Language::En);
-        assert!((middle.request.cfm.duration_factor.get() - 1.0 / 0.9).abs() < f32::EPSILON);
+        let base_duration = base(script)?.cfm.duration_factor.get();
+        let duration = middle.request.cfm.duration_factor.get();
+        assert!((duration - base_duration / 0.9).abs() < 1e-6, "{duration}");
         assert!((middle.request.sampling.temperature.get() - 0.72).abs() < 1e-6);
         let emo = middle
             .request
@@ -262,6 +312,19 @@ mod tests {
         assert_eq!(last.request.language, Language::Zh);
         assert!(last.request.emo_vector.is_none());
         assert!((last.request.sampling.temperature.get() - 0.8).abs() < 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_scale_inline_speed_by_the_request_speed() -> Result<()> {
+        let mut request = base("一。[[speed=0.9]]二。")?;
+        request.cfm.duration_factor = DurationFactor::new(1.0 / 1.1)?;
+        let plan = plan_utterances(&request, 600)?.utterances;
+        let second = plan
+            .get(1)
+            .ok_or_else(|| super::invalid("missing utterance"))?;
+        let speed = 1.0 / second.request.cfm.duration_factor.get();
+        assert!((speed - 0.99).abs() < 1e-4, "{speed}");
         Ok(())
     }
 
@@ -283,7 +346,7 @@ mod tests {
 
     #[test]
     fn test_should_preserve_pronunciation_and_paragraph_boundaries() -> Result<()> {
-        let plan = plan_utterances(&base("<行|hang2>业。\n\n第二段。")?, 800)?;
+        let plan = plan_utterances(&base("<行|hang2>业。\n\n第二段。")?, 800)?.utterances;
         assert_eq!(
             plan.first().map(|part| part.request.text.as_str()),
             Some("<行|hang2>业。")

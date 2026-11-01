@@ -8,7 +8,7 @@
 //!   `gelu_approximate`).
 //! - `final_norm` (`LayerNorm(1280, eps=1e-5)`) + quantized `mel_head` (`1280 -> 8194`).
 
-use std::{iter::once, path::Path};
+use std::{iter::once, ops::Range, path::Path};
 
 use mlx_rs::{
     Array,
@@ -17,12 +17,13 @@ use mlx_rs::{
     ops::{
         concatenate,
         indexing::{TryIndexMutOp, TryIndexOp},
-        quantized_matmul, split_equal, zeros,
+        matmul, quantized_matmul, softmax_axis, split_equal, stack, tri, zeros,
     },
     transforms::eval,
 };
 
 use crate::{
+    align::{ALIGNMENT_HEADS, ALIGNMENT_LAYERS},
     error::{IndexTtsError, Result},
     models::{FilteredWeights, ModelWeightKind, SafeTensorsLoader},
 };
@@ -65,6 +66,10 @@ const QUANT_GROUP_SIZE: i32 = 64;
 const QUANT_BITS: i32 = 8;
 const ATTN_SCALE: f32 = 0.125; // 64^(-0.5)
 const KV_ALLOC_STEP: usize = 256;
+/// Number of conditioning frames preceding the text span (`3`).
+const CONDS_PREFIX: usize = 3;
+/// Additive mask value for keys a query must not see.
+const MASK_FILL: f32 = 1e9;
 
 /// Preallocated in-place Key/Value cache across all 24 GPT-2 attention layers.
 #[derive(Debug, Clone)]
@@ -379,6 +384,44 @@ impl Gpt2Block {
     }
 }
 
+impl Gpt2Block {
+    /// Causal softmax attention of head `head` for the queries at `query_start..T`, sliced to the
+    /// key columns `keys` (`[T - query_start, keys.len()]`), from the block input `x`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn head_attention(
+        &self,
+        x: &Array,
+        head: usize,
+        query_start: i32,
+        keys: Range<i32>,
+    ) -> Result<Array> {
+        let time = x.dim(1);
+        let rows = time - query_start;
+        let n1 = layer_norm(
+            x,
+            Some(&self.ln1_weight),
+            Some(&self.ln1_bias),
+            GPT_NORM_EPS,
+        )?;
+        let qkv = self.c_attn.forward(&n1)?;
+        let lo = (head * GPT_HEAD_DIM) as i32;
+        let hi = lo + GPT_HEAD_DIM as i32;
+        let dim = GPT_DIM as i32;
+        let q = qkv.try_index((0, query_start.., lo..hi))?;
+        let k = qkv.try_index((0, .., dim + lo..dim + hi))?;
+        let scores =
+            matmul(&q, k.transpose_axes(&[1, 0])?)?.multiply(Array::from_f32(ATTN_SCALE))?;
+        // Every query sees the whole prefix and the Mel positions up to itself.
+        let visible = tri::<f32>(rows, None, None)?;
+        let mel_mask = visible
+            .subtract(Array::from_f32(1.0))?
+            .multiply(Array::from_f32(MASK_FILL))?;
+        let mask = concatenate(&[&zeros::<f32>(&[rows, query_start])?, &mel_mask], 1)?;
+        let probs = softmax_axis(&scores.add(&mask)?, -1, true)?;
+        Ok(probs.try_index((.., keys))?)
+    }
+}
+
 /// Stage 1 Int8-quantized GPT-2 `UnifiedVoice` autoregressive decoder (`gpt_int8.safetensors`).
 #[derive(Debug, Clone)]
 pub struct Gpt {
@@ -476,21 +519,9 @@ impl Gpt {
         self.blocks.len()
     }
 
-    /// Prefills the KV cache with `[conds (3), <BOS>, text_tokens..., <EOS>, <START_MEL>]` and
-    /// returns the `[8194]` next-token logits as a CPU `Vec<f32>`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`IndexTtsError::Validation`] if `text_tokens` is empty or exceeds positional
-    /// limits, or [`IndexTtsError::Mlx`] if GPU execution fails.
+    /// Embeds `[conds (3), <BOS>, text_tokens..., <EOS>, <START_MEL>]` as `[1, T, 1280]`.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    pub fn prefill(
-        &self,
-        text_tokens: &[i32],
-        conds: &Array,
-        lang_id: i32,
-        cache: &mut KvCache,
-    ) -> Result<Vec<f32>> {
+    fn prefix_embedding(&self, text_tokens: &[i32], conds: &Array, lang_id: i32) -> Result<Array> {
         if text_tokens.is_empty() {
             return Err(IndexTtsError::validation(
                 "text_tokens",
@@ -516,8 +547,6 @@ impl Gpt {
                 format!("lang_id {lang_id} out of range 0..{GPT_LANG_VOCAB}"),
             ));
         }
-
-        cache.reset();
 
         // Build full text sequence: [0, text_tokens..., 1]
         let mut full_text = Vec::with_capacity(full_text_len);
@@ -549,7 +578,79 @@ impl Gpt {
             .try_index(&start_mel_arr)?
             .add(&self.mel_pos_embedding.try_index(&start_pos_arr)?)?;
 
-        let emb = concatenate(&[conds, &t_emb, &m_start], 1)?;
+        Ok(concatenate(&[conds, &t_emb, &m_start], 1)?)
+    }
+
+    /// Embeds the prefix followed by `mel_codes` at Mel positions `2..` (the decode-step
+    /// convention of [`Self::step`]).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn sequence_embedding(
+        &self,
+        text_tokens: &[i32],
+        conds: &Array,
+        lang_id: i32,
+        mel_codes: &[i32],
+    ) -> Result<Array> {
+        if mel_codes.len() + 3 > GPT_MEL_POS_LEN {
+            return Err(IndexTtsError::validation(
+                "codes",
+                format!(
+                    "{} codes exceed the Mel positional capacity",
+                    mel_codes.len()
+                ),
+            ));
+        }
+        let prefix = self.prefix_embedding(text_tokens, conds, lang_id)?;
+        if mel_codes.is_empty() {
+            return Ok(prefix);
+        }
+        let n = mel_codes.len() as i32;
+        let tok_arr = Array::from_slice(mel_codes, &[1, n]);
+        let pos: Vec<i32> = (2..n + 2).collect();
+        let pos_arr = Array::from_slice(&pos, &[1, n]);
+        let mel = self
+            .mel_embedding
+            .try_index(&tok_arr)?
+            .add(&self.mel_pos_embedding.try_index(&pos_arr)?)?;
+        Ok(concatenate(&[&prefix, &mel], 1)?)
+    }
+
+    /// Prefills the KV cache with `[conds (3), <BOS>, text_tokens..., <EOS>, <START_MEL>]` and
+    /// returns the `[8194]` next-token logits as a CPU `Vec<f32>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError::Validation`] if `text_tokens` is empty or exceeds positional
+    /// limits, or [`IndexTtsError::Mlx`] if GPU execution fails.
+    pub fn prefill(
+        &self,
+        text_tokens: &[i32],
+        conds: &Array,
+        lang_id: i32,
+        cache: &mut KvCache,
+    ) -> Result<Vec<f32>> {
+        self.prefill_after(text_tokens, conds, lang_id, &[], cache)
+    }
+
+    /// Like [`Self::prefill`], but continues after `prior_codes`: Mel codes already spoken for
+    /// the beginning of `text_tokens`. The next decode step's position index is
+    /// `prior_codes.len() + 2`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError::Validation`] for empty or oversized inputs, or
+    /// [`IndexTtsError::Mlx`] if GPU execution fails.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    pub fn prefill_after(
+        &self,
+        text_tokens: &[i32],
+        conds: &Array,
+        lang_id: i32,
+        prior_codes: &[i32],
+        cache: &mut KvCache,
+    ) -> Result<Vec<f32>> {
+        let emb = self.sequence_embedding(text_tokens, conds, lang_id, prior_codes)?;
+        cache.reset();
         let seq_len = usize::try_from(emb.dim(1)).unwrap_or(0);
 
         let mut h = emb;
@@ -639,6 +740,60 @@ impl Gpt {
         cache.eval_with_logits(&logits)?;
 
         Ok(logits.try_as_slice::<f32>()?.to_vec())
+    }
+
+    /// Replays generated `codes` (after `prior_codes`, as in [`Self::prefill_after`]) with
+    /// teacher forcing and returns the text attention averaged over [`ALIGNMENT_HEADS`]:
+    /// row-major `[codes.len(), text_tokens.len() + 2]`, where row `i` is the query that
+    /// predicted `codes[i]` and columns cover `<BOS>, text..., <EOS>`.
+    ///
+    /// Only the first [`ALIGNMENT_LAYERS`] layers run. `cache` is used as scratch and reset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError::Validation`] for empty or oversized inputs, or
+    /// [`IndexTtsError::Mlx`] if GPU execution fails.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    pub fn alignment_attention(
+        &self,
+        text_tokens: &[i32],
+        conds: &Array,
+        lang_id: i32,
+        prior_codes: &[i32],
+        codes: &[i32],
+        cache: &mut KvCache,
+    ) -> Result<Vec<f32>> {
+        let Some((_, new_fed)) = codes.split_last() else {
+            return Err(IndexTtsError::validation(
+                "codes",
+                "codes must not be empty",
+            ));
+        };
+        let fed: Vec<i32> = prior_codes.iter().chain(new_fed).copied().collect();
+        let emb = self.sequence_embedding(text_tokens, conds, lang_id, &fed)?;
+        let seq_len = usize::try_from(emb.dim(1)).unwrap_or(0);
+        let text_lo = CONDS_PREFIX as i32;
+        let text_hi = text_lo + text_tokens.len() as i32 + 2;
+        let query_start = text_hi + prior_codes.len() as i32;
+
+        cache.reset();
+        let mut h = emb;
+        let mut maps = Vec::with_capacity(ALIGNMENT_HEADS.len());
+        for (layer_idx, block) in self.blocks.iter().take(ALIGNMENT_LAYERS).enumerate() {
+            for &(_, head) in ALIGNMENT_HEADS
+                .iter()
+                .filter(|(layer, _)| *layer == layer_idx)
+            {
+                maps.push(block.head_attention(&h, head, query_start, text_lo..text_hi)?);
+            }
+            if layer_idx + 1 < ALIGNMENT_LAYERS {
+                h = block.forward(&h, layer_idx, cache, seq_len, true)?;
+            }
+        }
+        cache.reset();
+        let mean = stack(&maps, 0)?.mean_axis(0, None)?;
+        mean.eval()?;
+        Ok(mean.try_as_slice::<f32>()?.to_vec())
     }
 }
 

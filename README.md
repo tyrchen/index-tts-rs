@@ -51,7 +51,7 @@ The default README is English; the [Chinese README](README.zh-CN.md) covers the 
 Use a clean, single-speaker recording, ideally 3–15 seconds, with permission from the speaker. WAV, MP3, FLAC, and M4A containers are accepted; decoding depends on the contained codec. WAV PCM is the simplest reference format.
 
 ```bash
-# Download yunfengwang/IndexTTS-2.5-mlx into the Hugging Face cache.
+# Download yunfengwang/IndexTTS-2.5-mlx (and the 56 MB 48 kHz extender) into the Hugging Face cache.
 itts models pull
 itts models info
 itts doctor
@@ -84,7 +84,7 @@ itts synth --voice-file /path/to/narrator.itts_voice \
   --text "Portable speaker conditioning." --lang en --out snapshot.wav
 ```
 
-WAV output is **22,050 Hz, mono, signed 16-bit PCM**. `--out -` writes headerless little-endian PCM to stdout and sends the summary to stderr. Text input is capped at **16,384 UTF-8 bytes** per job. Split longer documents into jobs.
+WAV output is **22,050 Hz, mono, signed 16-bit PCM** by default. The model's audio stops at 11 kHz; `--sample-rate 48000` keeps that band and synthesizes 10–24 kHz with the [LavaSR v2](https://huggingface.co/YatharthS/LavaSR) bandwidth extender (Apache-2.0, about 35 ms per 8 s of speech; see the [evaluation](docs/research/speech-bandwidth-extension-research.md)). Timings and durations are identical at both rates. `--out -` writes headerless little-endian PCM to stdout and sends the summary to stderr. Text input is capped at **16,384 UTF-8 bytes** per job. Split longer documents into jobs.
 
 ## Keep models warm
 
@@ -120,11 +120,13 @@ itts synth --voice narrator --stdin --out poem.wav < poem.itts.txt
 | --- | --- |
 | `[[emo=happy:0.3,calm:0.2]]` | Mix speaker-matched emotion prototypes; `[[emo=none]]` restores base emotion |
 | `[[temp=0.72]]` | GPT sampling temperature, `0.05..=2.0`; affects variation, not a direct pitch control |
-| `[[speed=0.9]]` | Speaking-rate multiplier, `0.25..=4.0`; larger is faster |
+| `[[speed=0.9]]` | Speaking-rate multiplier relative to `--speed` (default 1.2), `0.25..=4.0`; larger is faster |
 | `[[pause=600]]` | Insert 600 ms of digital silence; range `0..=5000` ms |
 | `[[voice=other_voice]]` | Switch to another registered speaker |
 | `[[lang=en]]` | Switch language |
 | `[[reset]]` | Restore initial speaker and speech controls |
+
+`--continuity` makes each sentence continue after the previous one instead of starting afresh, and `--previous-text` does the same across separate requests (for line-by-line scripts). `itts annotate --units` returns one emotion/speed/temperature/pause delivery per line ID. Both are described in the [speech-control guide](docs/usage/itts-speech-controls.md).
 | `<行\|hang2>` | Pronunciation override; also supports English ARPAbet |
 
 Eight emotion categories accept English and Chinese names: `happy` / 高兴, `angry` / 愤怒, `sad` / 悲伤, `afraid` / 恐惧, `disgusted` / 反感, `melancholic` / 低落, `surprised` / 惊讶, and `calm` / 平静. Emotion strengths are conditioned model inputs, not calibrated perceptual scores.
@@ -137,12 +139,13 @@ YAML settings live in [config/default.yaml](config/default.yaml) and [config/dir
 itts doctor --output json
 itts synth --voice narrator --text "你好。" --out hi.wav --output json
 itts synth --voice narrator --text "第一句。第二句。" --out stream.wav --output jsonl
+itts synth --voice narrator --text "第一句。第二句。" --out timed.wav --timestamps --output json
 itts schema controls
 itts schema speech-job
 itts schema events
 ```
 
-Use `--output text|json|jsonl` or `ITTS_OUTPUT`. JSON synthesis returns fields such as `status`, `backend`, `durationSecs`, `synthesisSecs`, `rtf`, and `outputPath`. JSONL streams `started` → `chunk` → `done` events. Runtime failures expose stable `error.code`, `message`, and `hint` fields plus documented exit codes. CLI argument parsing errors use Clap's usage diagnostics and exit code 2.
+Use `--output text|json|jsonl` or `ITTS_OUTPUT`. JSON synthesis returns fields such as `status`, `backend`, `durationSecs`, `synthesisSecs`, `rtf`, `outputPath`, and the `seed` that reproduces the take. JSONL streams `started` → `chunk` → `done` events; each chunk names the text it reads. `--timestamps` adds per-character `alignment` (ElevenLabs `with-timestamps` shape) and per-sentence `sentences`, derived from the model's own text attention at a cost of tens of milliseconds per job; see the [agent integration guide](docs/usage/itts-agent-integration.md#3-timestamps-sentences-and-reproducible-takes). Runtime failures expose stable `error.code`, `message`, and `hint` fields plus documented exit codes. CLI argument parsing errors use Clap's usage diagnostics and exit code 2.
 
 For an MCP client that supports stdio servers:
 
@@ -154,7 +157,7 @@ For an MCP client that supports stdio servers:
 }
 ```
 
-Ensure the client can find `itts` on its PATH, or use the absolute binary path. Tools include `status`, `describe_controls`, `synthesize`, `speak`, voice management, and `annotate`. MCP starts the daemon on first use and shares it across sessions. See the [agent integration guide](docs/usage/itts-agent-integration.md) for tool schemas, errors, progress, cancellation, and the socket protocol.
+Ensure the client can find `itts` on its PATH, or use the absolute binary path. Tools include `status`, `describe_controls`, `synthesize`, `speak`, voice management, `annotate`, and `annotate_units`. MCP starts the daemon on first use and shares it across sessions. See the [agent integration guide](docs/usage/itts-agent-integration.md) for tool schemas, errors, progress, cancellation, and the socket protocol.
 
 ## Browser studio and HTTP
 
@@ -177,10 +180,12 @@ curl --fail-with-body http://127.0.0.1:8080/v1/audio/speech \
 | `GET /health` | Engine status and sample rate |
 | `GET /api/voices` | Registered voice IDs and reference durations |
 | `POST /api/annotate` | Pacing annotations for source paragraphs |
+| `POST /v1/annotate` | One delivery (emotion, temperature, speed, pause) per caller-supplied line |
 | `POST /api/speech/stream` | JSON Lines with PCM chunks and completion statistics |
 | `POST /v1/audio/speech` | WAV speech from a `SpeechJob` request |
+| `POST /v1/audio/speech/timestamps` | JSON: base64 WAV, `seed`, character `alignment`, and `sentences` |
 
-The speech route provides an OpenAI-style path, with this project's request schema; it is not a full OpenAI API replacement. HTTP accepts registered voice IDs and rejects `voiceFile`, `refAudio`, and `outputPath`. Limits are 32 KiB request bodies, 120 seconds per request, and eight concurrent requests. The server has no built-in authentication and defaults to loopback; remote deployment needs an authenticated gateway. These controls limit admitted work; inference is serialized by the GPU worker.
+The speech route provides an OpenAI-style path, with this project's request schema; it is not a full OpenAI API replacement. HTTP accepts registered voice IDs and rejects `voiceFile`, `refAudio`, and `outputPath`. Limits are 32 KiB request bodies, 120 seconds per request, and eight concurrent requests; a synthesis request waits up to 60 seconds for the GPU before returning `BUSY`. Annotation routes accept a per-request DeepSeek key in the `X-DeepSeek-Api-Key` header. The server has no built-in authentication and defaults to loopback; remote deployment needs an authenticated gateway. These controls limit admitted work; inference is serialized by the GPU worker.
 
 ## Product decisions and architecture
 
@@ -189,6 +194,8 @@ The goal is convenient local speech for people and agents: repeated use should a
 | Decision | Reason and tradeoff |
 | --- | --- |
 | Focus on Apple Silicon and MLX | Metal and unified memory fit local Mac inference; choosing `mlx-rs` reuses MLX quantized operators and weight layouts. Portability is deliberately limited. |
+| Timestamps from the model's own attention | Two GPT heads align text to the generated codes, which map linearly to audio time; pauses are snapped to the waveform. No extra aligner model, tens of milliseconds per job, median error 17 ms against a forced aligner. Accuracy is tied to this checkpoint's heads. |
+| Optional 48 kHz bandwidth extension | 22.05 kHz is the vocoder's limit and no 22 kHz-mel → 48 kHz vocoder exists. A small GAN adds the upper band while the original audio below 9.5 kHz is kept bin for bin; it is opt-in because it was trained on English read speech only. |
 | Save `.itts_voice` conditioning | Reuse the four Stage-0 output tensors instead of running large reference encoders for every request. Snapshots depend on the model / format and are not general-purpose speaker embeddings. |
 | One GPU-owning actor | MLX state stays on a dedicated thread; bounded channels provide backpressure and cancellation at sentence boundaries. Requests queue rather than execute GPU inference in parallel. |
 | Warm daemon over a local socket | Reuse models across short-lived CLI / MCP processes, trading resident memory for lower startup latency. |

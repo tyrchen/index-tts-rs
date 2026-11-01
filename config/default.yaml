@@ -6,19 +6,19 @@ default_language: "zh"
 text_pos_capacity: 602
 max_text_tokens_per_segment: 120
 use_normalization: true
-max_ref_seconds: 15
 sample_rate: 22050
 interval_silence_ms: 200
 
 sampling:
   greedy: false
-  top_k: 30
+  top_k: 10
   top_p: 0.8
   temperature: 0.8
   repetition_penalty: 10.0
   max_mel_tokens: 1500
 
 cfm:
-  duration_factor: 1.0
+  # speed 1.2 (speed = 1 / duration_factor)
+  duration_factor: 0.8333333
   n_timesteps: 25
   cfg_rate: 0.7

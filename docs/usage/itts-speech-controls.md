@@ -20,7 +20,7 @@ itts synth --voice tyr --emo "melancholic:0.45,calm:0.25" --text "沉默是今�
 | `[[emo=melancholic:0.45,calm:0.25]]` or `[[emo=低落:0.45,平静:0.25]]` | Blend up to 8 IndexTTS-2.5 emotion prototypes (`happy`/`高兴`, `angry`/`愤怒`, `sad`/`悲伤`, `afraid`/`恐惧`, `disgusted`/`反感`, `melancholic`/`低落`, `surprised`/`惊讶`, `calm`/`平静`); `[[emo=none]]` restores the speaker's base emotion |
 | `[[temp=0.75]]` or `[[temperature=0.75]]` | Set GPT sampling temperature (`0.05..=2.0`, default `0.8`); lower (`0.68..0.76`) yields restrained/gentle inflection, higher (`0.84..0.95`) yields stronger prosodic expressiveness |
 | `[[pause=600]]` or `[[pause=600ms]]` | Insert 600 ms of silence before the following speech; range 0–5000 ms |
-| `[[speed=0.9]]` | Change speaking speed until the next speed control or reset; range 0.25–4.0, larger is faster |
+| `[[speed=0.9]]` | Change speaking speed until the next speed control or reset, relative to the job speed (`--speed 1.1` with `[[speed=0.9]]` speaks at 0.99); range 0.25–4.0, larger is faster |
 | `[[voice=tyr]]` | Switch to a registered voice ID |
 | `[[lang=zh]]` | Switch synthesis language |
 | `[[reset]]` | Restore the voice, language, emotion, temperature, and speed supplied to the synthesis command |
@@ -48,8 +48,9 @@ preserved, so the total acoustic gap can exceed the additional silence value.
 
 ## Optional DeepSeek annotation
 
-Set `DEEPSEEK_API_KEY` in the terminal that starts `itts` or the server. The key is read from
-the environment, redacted in Debug output, and never sent to the browser or stored in YAML.
+Set `DEEPSEEK_API_KEY` in the terminal that starts `itts` or the server, or send a key with
+each request (HTTP header `X-DeepSeek-Api-Key`, daemon `apiKey` field). Keys are redacted in
+Debug output, never logged, never sent to the browser, and never stored in YAML.
 
 ```bash
 # Send the source text to DeepSeek once and save an editable control script.
@@ -79,6 +80,62 @@ In the browser, click **AI 朗读标注 · DeepSeek** to prepare a script, revie
 and generate audio. **恢复原文** restores the untagged source. Annotation is optional and adds a
 provider round trip; it is deliberately separate from speech generation so retries can reuse
 an existing script. Local synthesis works without an API key.
+
+### Per-line direction
+
+For scripts that are synthesized line by line (one request per line), `itts annotate --units`
+takes your lines with stable IDs and returns one delivery per line instead of a script:
+
+```bash
+cat > lines.json <<'JSON'
+{ "style": "natural", "brief": "tech documentary narration, restrained and confident",
+  "units": [ { "id": "s1.l1", "text": "三年前，我们的推理服务每天都在超时。" },
+             { "id": "s1.l2", "text": "工程师们一次次熬夜排查，却始终找不到根因。" } ] }
+JSON
+itts annotate --units --stdin --output json < lines.json
+```
+
+```json
+{ "status": "ok", "deliveries": [
+  { "id": "s1.l1", "emo": "melancholic:0.2,calm:0.45", "temperature": 0.76, "speedScale": 0.9,
+    "pauseAfterMs": 520, "controls": "[[emo=melancholic:0.2,calm:0.45]][[temp=0.76]][[speed=0.9]]" },
+  ... ] }
+```
+
+Either prefix the line's text with `controls`, or copy the fields into its `SpeechJob`: `emo`,
+`advanced.temperature`, and `speed` = your base speed × `speedScale` (the default base speed is
+1.2, so `0.9` becomes `1.08`; `[[speed=0.9]]` applies the same scale). `pauseAfterMs` is a suggestion for
+the gap you place after the line. The same request is served by the daemon (`annotate`), MCP
+(`annotate_units`), and HTTP (`POST /v1/annotate`); `itts schema annotate-job` and
+`itts schema annotate-result` publish the JSON Schemas. The provider sees all lines at once and is
+told to change delivery gradually between neighbours unless the text turns, which keeps the
+emotional arc coherent across lines.
+
+## Sentence continuity
+
+By default every sentence is generated as a fresh utterance, so each one starts like the
+beginning of a new speech. `--continuity` (`"continuity": true`) continues each sentence after
+the previous one: the decoder receives the previous sentence's text and speech codes as a prefix
+and keeps going, so pace and intonation carry over. It applies between sentences and across
+paragraphs spoken by the same voice in the same language; paragraph pauses and `[[pause]]` still
+apply, while the fixed inter-sentence silence defaults to `0` because the model speaks its own
+pauses.
+
+When lines are synthesized in separate requests, pass the previous line as `--previous-text`
+(`"previousText"`): the engine regenerates that line's speech codes with the same seed (about
+0.4 s of extra GPT time) and continues after them. The previous text is not spoken, and the
+result stays reproducible from `(input, previousText, seed, …)`.
+
+```bash
+itts synth --voice narrator --seed 7 --out line2.wav \
+  --previous-text "三年前，我们的推理服务每天都在超时。" \
+  --text "工程师们一次次熬夜排查，却始终找不到根因。"
+```
+
+Continuity is off by default because whether it sounds better is a listening decision; with the
+previous sentence excluded from the repetition penalty its error rate is no higher than
+independent synthesis. See the
+[experiment notes](../research/sentence-continuity-research.md).
 
 ## Browser streaming and latency
 

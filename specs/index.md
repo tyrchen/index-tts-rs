@@ -13,3 +13,5 @@
 ## Agent Usability & Service Layer
 
 - [`itts` Agent-First 可用性与服务化能力设计 (`itts-agent-usability-design`)](itts-agent-usability-design.md) — 审计并修复 CLI / Daemon / MCP / HTTP 的可观测性缺口与一致性 Bug（daemon 无就绪输出、相对路径、voice 缓存失效、MCP 不解析内联标签等）；定义统一 `SpeechJob` 请求模型与 `index-tts-rs-service` crate、14 个稳定错误码与退出码、daemon 后台化 / 单例锁 / 协议 v2（握手、多路复用、取消、BUSY）、`itts doctor` / `itts schema`，以及基于 `rmcp` 且复用 daemon 的 MCP 服务。早期规范中关于 `--json`、`synthesize_to_file` 等 CLI/MCP 接口的描述以本文档为准。
+- [`itts` 字级时间戳、可复现种子与 48 kHz 高保真输出设计 (`itts-timestamps-and-hifi-design`)](itts-timestamps-and-hifi-design.md) — 基于 GPT 自身文本注意力（L4H10+L5H10）的零额外权重字级对齐、字符 diff 坐标映射、`alignment`/`sentences`/chunk 文本输出；缺省随机并回报的 seed；`EngineConfig.sample_rate` 类型化与 LavaSR v2 带宽扩展的 48 kHz 输出。
+- [`itts` 逐行朗读指令协议与跨句衔接设计 (`itts-direction-and-continuity-design`)](itts-direction-and-continuity-design.md) — 按行 ID 返回结构化朗读指令的 `AnnotateJob`（CLI / daemon / MCP / HTTP）、按请求提供并脱敏的 DeepSeek key、HTTP 合成排队；基于 GPT 前缀续写的 `continuity` / `previousText` 跨句衔接（含最小生成长度、续写对齐）与 daemon 协议 v3。

@@ -25,17 +25,22 @@ use mlx_rs::{
 use tracing::{debug, info};
 
 use crate::{
-    config::{EmoAlpha, EngineConfig, SpeakerSource, SynthesisRequest, VoiceExtractRequest},
+    align::{SpanTiming, TextMap, align_segment},
+    config::{
+        DEFAULT_SAMPLE_RATE, EmoAlpha, EngineConfig, SampleRate, SpeakerSource, SpeechContext,
+        SynthesisRequest, VoiceExtractRequest,
+    },
     dsp::f32_to_pcm_i16,
     engine::{
         stream::{AudioChunk, StageTimings, SynthesisResult, SynthesisStream},
         telemetry::{EngineTelemetry, StartupEvent, StartupObserver, TelemetrySnapshot},
     },
     error::{IndexTtsError, Result},
-    frontend::Frontend,
+    frontend::{Frontend, PreparedSegment},
     models::{
-        BigVgan, CFM_IN_CHANNELS, CfmDit, DEFAULT_KV_MAX_SEQ, Gpt, KvCache, LengthRegulator,
-        SamplerRng, SemanticCodec, SpkProjWeights, generate_codes, resolve_model_dir,
+        BandwidthExtender, BigVgan, CFM_IN_CHANNELS, CfmDit, CodePrompt, DEFAULT_KV_MAX_SEQ,
+        GPT_TEXT_POS_LEN, Gpt, KvCache, LengthRegulator, SamplerRng, SemanticCodec, SpkProjWeights,
+        generate_codes, generate_codes_after, resolve_hifi_weights, resolve_model_dir,
     },
     voice::{
         CONDS_DIM, CONDS_FRAMES, EmoMatrix, PROMPT_CONDITION_DIM, REF_MEL_BINS, STYLE_DIM,
@@ -50,6 +55,14 @@ pub const STREAM_CHANNEL_CAPACITY: usize = 8;
 /// Ratio of Mel frames to semantic codec frames (`22050 / (256 * 50) = 1.72265625`, rounded to
 /// `1.72` in `pipeline.py:120`).
 pub const MEL_TO_CODEC_RATIO: f64 = 1.72;
+/// Sampler seed used when a request does not set one.
+const DEFAULT_SAMPLER_SEED: u64 = 0x5EED_CAFE_2026;
+/// Most prior codes a continuation carries; longer priors fall back to a fresh utterance so the
+/// new segment keeps at least half of the Mel positional capacity.
+const MAX_PRIOR_CODES: usize = 900;
+/// A continuation may not stop before this many codes per pronounced token (natural speech
+/// uses about 4-5), which prevents an immediate stop right after the prior's sentence end.
+const MIN_CONTINUATION_CODES_PER_TOKEN: usize = 2;
 
 enum EngineCommand {
     SynthesizeStream {
@@ -76,7 +89,6 @@ struct CachedRefAudio {
 }
 
 struct MlxWorkerState {
-    config: EngineConfig,
     model_dir: PathBuf,
     voice_store: VoiceStore,
     frontend: Frontend,
@@ -89,6 +101,7 @@ struct MlxWorkerState {
     spk_proj: SpkProjWeights,
     emo_matrix: EmoMatrix,
     voice_extractor: Option<VoiceExtractor>,
+    bandwidth_extender: Option<BandwidthExtender>,
     last_ref_cache: Option<CachedRefAudio>,
     shutdown_flag: Arc<AtomicBool>,
     telemetry: Arc<EngineTelemetry>,
@@ -113,7 +126,7 @@ fn load_component<T>(
 
 impl MlxWorkerState {
     fn initialize(
-        config: EngineConfig,
+        config: &EngineConfig,
         model_dir: PathBuf,
         voice_store: VoiceStore,
         shutdown_flag: Arc<AtomicBool>,
@@ -164,7 +177,6 @@ impl MlxWorkerState {
         observer(&StartupEvent::EngineReady { elapsed_ms });
 
         Ok(Self {
-            config,
             model_dir,
             voice_store,
             frontend,
@@ -177,10 +189,27 @@ impl MlxWorkerState {
             spk_proj,
             emo_matrix,
             voice_extractor: None,
+            bandwidth_extender: None,
             last_ref_cache: None,
             shutdown_flag,
             telemetry,
         })
+    }
+
+    /// Loads the 48 kHz bandwidth extender on first use (about 56 MB of weights).
+    fn ensure_bandwidth_extender(&mut self) -> Result<&BandwidthExtender> {
+        if self.bandwidth_extender.is_none() {
+            let t0 = Instant::now();
+            let extender = BandwidthExtender::load_from_path(resolve_hifi_weights()?)?;
+            info!(
+                elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0,
+                "Lazily loaded the 48 kHz bandwidth extender"
+            );
+            self.bandwidth_extender = Some(extender);
+        }
+        self.bandwidth_extender
+            .as_ref()
+            .ok_or_else(|| IndexTtsError::actor("failed to initialize BandwidthExtender"))
     }
 
     fn ensure_voice_extractor(&mut self) -> Result<&VoiceExtractor> {
@@ -296,46 +325,46 @@ impl MlxWorkerState {
 
         let t_fe = Instant::now();
         let max_tok = req.max_text_tokens_per_segment.get() as usize;
-        let segments = self
-            .frontend
-            .prepare(req.text.as_str(), req.language, max_tok);
+        let prepared =
+            self.frontend
+                .prepare_text(req.text.as_str(), req.language.as_code(), max_tok);
+        let text_map = TextMap::new(&prepared.normalized, req.text.as_str());
         let frontend_ms = t_fe.elapsed().as_secs_f64() * 1000.0;
+        let segments = prepared.segments;
 
         if segments.is_empty() {
             return;
         }
 
-        let resolved_conds = match req.emo_vector.as_ref() {
-            Some(emo_vec) if !emo_vec.is_zero() => match spk.resolve_conds_with_emotion(
-                &self.spk_proj,
-                &self.emo_matrix,
-                emo_vec,
-                req.emo_alpha,
-            ) {
-                Ok(c) => Cow::Owned(c),
-                Err(err) => {
-                    let _ = chunk_tx.send(Err(err));
-                    return;
-                }
-            },
-            _ => Cow::Borrowed(spk.conds.as_slice()),
+        let arrays = match self.speaker_arrays(&spk, req) {
+            Ok(arrays) => arrays,
+            Err(err) => {
+                let _ = chunk_tx.send(Err(err));
+                return;
+            }
         };
+        let utterance = Utterance {
+            req,
+            text_map: &text_map,
+            lang_id: req.language.token_id(),
+            conds: &arrays.conds,
+            prompt_cond: &arrays.prompt_cond,
+            ref_mel: &arrays.ref_mel,
+            style: &arrays.style,
+            total_segments: segments.len(),
+        };
+        let mut rng = SamplerRng::new(req.sampling.seed.unwrap_or(DEFAULT_SAMPLER_SEED));
+        let t_context = Instant::now();
+        let mut prior = match self.initial_context(&utterance) {
+            Ok(prior) => prior,
+            Err(err) => {
+                let _ = chunk_tx.send(Err(err));
+                return;
+            }
+        };
+        let context_ms = t_context.elapsed().as_secs_f64() * 1000.0;
 
-        let p_i32 = spk.prompt_frames.get() as i32;
-        let conds_arr =
-            Array::from_slice(&resolved_conds, &[1, CONDS_FRAMES as i32, CONDS_DIM as i32]);
-        let prompt_cond_arr = Array::from_slice(
-            &spk.prompt_condition,
-            &[1, p_i32, PROMPT_CONDITION_DIM as i32],
-        );
-        let ref_mel_arr = Array::from_slice(&spk.ref_mel, &[1, REF_MEL_BINS as i32, p_i32]);
-        let style_arr = Array::from_slice(&spk.style, &[1, STYLE_DIM as i32]);
-
-        let lang_id = req.language.token_id();
-        let mut rng = SamplerRng::new(req.sampling.seed.unwrap_or(0x5EED_CAFE_2026));
-        let total_segments = segments.len();
-
-        for (seg_idx, seg_ids) in segments.into_iter().enumerate() {
+        for (seg_idx, segment) in segments.iter().enumerate() {
             if self.shutdown_flag.load(Ordering::Relaxed) || chunk_tx.is_disconnected() {
                 debug!(
                     seg_idx,
@@ -344,29 +373,36 @@ impl MlxWorkerState {
                 break;
             }
 
-            let seg_ids_i32: Vec<i32> = seg_ids.into_iter().map(|id| id as i32).collect();
+            let lead = if seg_idx == 0 {
+                LeadTimings {
+                    voice_extract_ms,
+                    frontend_ms,
+                    context_ms,
+                }
+            } else {
+                LeadTimings::default()
+            };
             let seg_res = self.synthesize_single_segment(
+                &utterance,
                 seg_idx,
-                total_segments,
-                &seg_ids_i32,
-                lang_id,
-                &conds_arr,
-                &prompt_cond_arr,
-                &ref_mel_arr,
-                &style_arr,
-                req,
+                segment,
+                prior.as_ref(),
                 &mut rng,
-                if seg_idx == 0 { voice_extract_ms } else { 0.0 },
-                if seg_idx == 0 { frontend_ms } else { 0.0 },
+                lead,
             );
 
             match seg_res {
                 Ok(Some(chunk)) => {
+                    prior = if req.continuity {
+                        Prior::of(&chunk.spoken)
+                    } else {
+                        None
+                    };
                     if chunk_tx.send(Ok(chunk)).is_err() {
                         break;
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => prior = None,
                 Err(err) => {
                     let _ = chunk_tx.send(Err(err));
                     break;
@@ -375,120 +411,401 @@ impl MlxWorkerState {
         }
     }
 
+    /// Speaker conditioning tensors for one request, with its emotion mixed into `conds`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn speaker_arrays(
+        &self,
+        spk: &SpeakerContext,
+        req: &SynthesisRequest,
+    ) -> Result<SpeakerArrays> {
+        let conds = match req.emo_vector.as_ref() {
+            Some(emo_vec) if !emo_vec.is_zero() => Cow::Owned(spk.resolve_conds_with_emotion(
+                &self.spk_proj,
+                &self.emo_matrix,
+                emo_vec,
+                req.emo_alpha,
+            )?),
+            _ => Cow::Borrowed(spk.conds.as_slice()),
+        };
+        let p = spk.prompt_frames.get() as i32;
+        Ok(SpeakerArrays {
+            conds: Array::from_slice(&conds, &[1, CONDS_FRAMES as i32, CONDS_DIM as i32]),
+            prompt_cond: Array::from_slice(
+                &spk.prompt_condition,
+                &[1, p, PROMPT_CONDITION_DIM as i32],
+            ),
+            ref_mel: Array::from_slice(&spk.ref_mel, &[1, REF_MEL_BINS as i32, p]),
+            style: Array::from_slice(&spk.style, &[1, STYLE_DIM as i32]),
+        })
+    }
+
+    /// The speech the first segment continues after, from [`SynthesisRequest::context`].
+    fn initial_context(&mut self, u: &Utterance<'_>) -> Result<Option<Prior>> {
+        match &u.req.context {
+            SpeechContext::None => Ok(None),
+            SpeechContext::Spoken { .. } => Ok(Prior::of(&u.req.context)),
+            SpeechContext::Text(text) => {
+                let max_tok = u.req.max_text_tokens_per_segment.get() as usize;
+                let prepared =
+                    self.frontend
+                        .prepare_text(text.as_str(), u.req.language.as_code(), max_tok);
+                let Some(segment) = prepared.segments.last() else {
+                    return Ok(None);
+                };
+                let token_ids = segment.token_ids();
+                let seed = u.req.sampling.seed.unwrap_or(DEFAULT_SAMPLER_SEED);
+                let codes = generate_codes(
+                    &self.gpt,
+                    &token_ids,
+                    u.conds,
+                    u.lang_id,
+                    &mut self.kv_cache,
+                    &u.req.sampling,
+                    &mut SamplerRng::new(seed),
+                )?;
+                Ok(Some(Prior { token_ids, codes }))
+            }
+        }
+    }
+
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap,
         clippy::cast_precision_loss,
-        clippy::cast_sign_loss,
-        clippy::too_many_arguments
+        clippy::cast_sign_loss
     )]
     fn synthesize_single_segment(
         &mut self,
+        u: &Utterance<'_>,
         seg_idx: usize,
-        total_segments: usize,
-        token_ids: &[i32],
-        lang_id: i32,
-        conds_arr: &Array,
-        prompt_cond_arr: &Array,
-        ref_mel_arr: &Array,
-        style_arr: &Array,
-        req: &SynthesisRequest,
+        segment: &PreparedSegment,
+        prior: Option<&Prior>,
         rng: &mut SamplerRng,
-        voice_extract_ms: f64,
-        frontend_ms: f64,
+        lead: LeadTimings,
     ) -> Result<Option<AudioChunk>> {
         let seg_start = Instant::now();
+        let req = u.req;
+        let token_ids = segment.token_ids();
+        let continuation = prior.and_then(|prior| Continuation::new(prior, segment));
 
-        // Stage 1: Int8 GPT Autoregressive code generation
+        // Stage 1: Int8 GPT Autoregressive code generation (optionally continuing a prior
+        // segment)
         let t_gpt = Instant::now();
-        let codes = generate_codes(
-            &self.gpt,
-            token_ids,
-            conds_arr,
-            lang_id,
-            &mut self.kv_cache,
-            &req.sampling,
-            rng,
-        )?;
-        let gpt_ms = t_gpt.elapsed().as_secs_f64() * 1000.0;
+        let prompt = continuation.as_ref().map_or(
+            CodePrompt {
+                text_tokens: &token_ids,
+                conds: u.conds,
+                lang_id: u.lang_id,
+                prior_codes: &[],
+                min_codes: 0,
+            },
+            |c| CodePrompt {
+                text_tokens: &c.text_tokens,
+                conds: u.conds,
+                lang_id: u.lang_id,
+                prior_codes: c.prior_codes,
+                min_codes: c.min_codes,
+            },
+        );
+        let codes =
+            generate_codes_after(&self.gpt, &prompt, &mut self.kv_cache, &req.sampling, rng)?;
+        let gpt_ms = lead.context_ms + t_gpt.elapsed().as_secs_f64() * 1000.0;
         if codes.is_empty() {
             return Ok(None);
         }
 
-        // Stage 2a: SemanticCodec VQ decode + ConvNeXt + 2x temporal repeat
+        let (mel, s2mel) = self.render_mel(u, seg_idx, &codes)?;
+
+        // Stage 3: BigVGAN neural vocoder
+        let t_voc = Instant::now();
+        let wav = self.bigvgan.forward(&mel)?.try_as_slice::<f32>()?.to_vec();
+        drop(mel);
+        let _ = mlx_rs::memory::clear_cache();
+        let native_pcm = f32_to_pcm_i16(&wav);
+        let bigvgan_ms = t_voc.elapsed().as_secs_f64() * 1000.0;
+
+        // Timings come from the native audio; bandwidth extension preserves its length.
+        let t_align = Instant::now();
+        let alignment = if req.align {
+            self.align(u, segment, continuation.as_ref(), &codes, &native_pcm)?
+        } else {
+            Vec::new()
+        };
+        let align_ms = t_align.elapsed().as_secs_f64() * 1000.0;
+
+        // Optional Stage 4: 48 kHz bandwidth extension
+        let t_bwe = Instant::now();
+        let pcm_i16 = match req.sample_rate {
+            SampleRate::Hifi => f32_to_pcm_i16(&self.ensure_bandwidth_extender()?.extend(&wav)?),
+            _ => native_pcm,
+        };
+        let bwe_ms = t_bwe.elapsed().as_secs_f64() * 1000.0;
+
+        let total_ms = lead.voice_extract_ms
+            + lead.frontend_ms
+            + lead.context_ms
+            + seg_start.elapsed().as_secs_f64() * 1000.0;
+        let timings = StageTimings {
+            voice_extract_ms: lead.voice_extract_ms,
+            frontend_ms: lead.frontend_ms,
+            gpt_ms,
+            codec_ms: s2mel.codec_ms,
+            regulator_ms: s2mel.regulator_ms,
+            cfm_ms: s2mel.cfm_ms,
+            bigvgan_ms,
+            align_ms,
+            bwe_ms,
+            total_ms,
+        };
+        let mel_tokens = codes.len();
+        Ok(Some(
+            AudioChunk::new(
+                seg_idx,
+                u.total_segments,
+                pcm_i16,
+                req.sample_rate.hz(),
+                mel_tokens,
+                timings,
+            )
+            .with_text(
+                u.text_map.source_chars(segment.normalized_range()),
+                alignment,
+            )
+            .with_spoken(token_ids, codes),
+        ))
+    }
+
+    /// Stage 2: codes → `SemanticCodec` → `LengthRegulator` (+ speaker prompt) → 25-step CFM
+    /// Euler solve, returning the Mel spectrogram and per-stage milliseconds.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    fn render_mel(
+        &self,
+        u: &Utterance<'_>,
+        seg_idx: usize,
+        codes: &[i32],
+    ) -> Result<(Array, S2MelTimings)> {
+        let req = u.req;
         let t_codec = Instant::now();
-        let codes_arr = Array::from_slice(&codes, &[1, codes.len() as i32]);
+        let codes_arr = Array::from_slice(codes, &[1, codes.len() as i32]);
         let s_infer = self.codec.decode(&codes_arr)?;
         let codec_ms = t_codec.elapsed().as_secs_f64() * 1000.0;
 
-        // Stage 2b: LengthRegulator + prompt concatenation
         let t_reg = Instant::now();
         let s_len = usize::try_from(s_infer.dim(1)).unwrap_or(1);
         let duration_factor = f64::from(req.cfm.duration_factor.get());
         let target_len = ((s_len as f64) * MEL_TO_CODEC_RATIO * duration_factor).floor() as usize;
-        let target_len = target_len.max(1);
-        let cond = self.regulator.forward(&s_infer, target_len)?;
-        let cat_condition = concatenate(&[prompt_cond_arr, &cond], 1)?;
+        let cond = self.regulator.forward(&s_infer, target_len.max(1))?;
+        let cat_condition = concatenate(&[u.prompt_cond, &cond], 1)?;
         cat_condition.eval()?;
         let regulator_ms = t_reg.elapsed().as_secs_f64() * 1000.0;
 
-        // Stage 2c: CFM 25-step all-GPU Euler ODE solver
         let t_cfm = Instant::now();
-        let t_total_i32 = cat_condition.dim(1);
-        let cfm_key = req
+        let noise_key = req
             .sampling
             .seed
-            .map(|s| key(s.wrapping_add(seg_idx as u64)));
-        let resolved_key = match cfm_key {
-            Some(k) => Some(k?),
-            None => None,
-        };
+            .map(|seed| key(seed.wrapping_add(seg_idx as u64)))
+            .transpose()?;
         let noise_z = normal::<f32>(
-            &[1, CFM_IN_CHANNELS as i32, t_total_i32],
+            &[1, CFM_IN_CHANNELS as i32, cat_condition.dim(1)],
             None,
             None,
-            resolved_key.as_ref(),
+            noise_key.as_ref(),
         )?;
         let mel = self.cfm.solve_euler(
             &cat_condition,
-            ref_mel_arr,
-            style_arr,
+            u.ref_mel,
+            u.style,
             &noise_z,
             req.cfm.n_timesteps as usize,
             req.cfm.cfg_rate.get(),
         )?;
         let cfm_ms = t_cfm.elapsed().as_secs_f64() * 1000.0;
+        Ok((
+            mel,
+            S2MelTimings {
+                codec_ms,
+                regulator_ms,
+                cfm_ms,
+            },
+        ))
+    }
 
-        // Stage 3: BigVGAN neural vocoder
-        let t_voc = Instant::now();
-        let wav_arr = self.bigvgan.forward(&mel)?;
-        let wav_slice = wav_arr.try_as_slice::<f32>()?;
-        let pcm_i16 = f32_to_pcm_i16(wav_slice);
-        drop(wav_arr);
-        drop(mel);
-        let _ = mlx_rs::memory::clear_cache();
-        let bigvgan_ms = t_voc.elapsed().as_secs_f64() * 1000.0;
-
-        let total_ms = voice_extract_ms + frontend_ms + seg_start.elapsed().as_secs_f64() * 1000.0;
-        let timings = StageTimings {
-            voice_extract_ms,
-            frontend_ms,
-            gpt_ms,
-            codec_ms,
-            regulator_ms,
-            cfm_ms,
-            bigvgan_ms,
-            total_ms,
+    /// Per-character timings of one synthesized segment from the decoder's text attention.
+    fn align(
+        &mut self,
+        u: &Utterance<'_>,
+        segment: &PreparedSegment,
+        continuation: Option<&Continuation<'_>>,
+        codes: &[i32],
+        pcm: &[i16],
+    ) -> Result<Vec<SpanTiming>> {
+        let attention = match continuation {
+            Some(c) => {
+                let attention = self.gpt.alignment_attention(
+                    &c.text_tokens,
+                    u.conds,
+                    u.lang_id,
+                    c.prior_codes,
+                    codes,
+                    &mut self.kv_cache,
+                )?;
+                c.segment_columns(&attention, codes.len(), segment.tokens.len())
+            }
+            None => self.gpt.alignment_attention(
+                &segment.token_ids(),
+                u.conds,
+                u.lang_id,
+                &[],
+                codes,
+                &mut self.kv_cache,
+            )?,
         };
-
-        Ok(Some(AudioChunk::new(
-            seg_idx,
-            total_segments,
-            pcm_i16,
-            self.config.sample_rate,
+        Ok(align_segment(
+            segment,
+            u.text_map,
+            &attention,
             codes.len(),
-            timings,
-        )))
+            pcm,
+            DEFAULT_SAMPLE_RATE,
+        ))
+    }
+}
+
+/// Per-utterance inputs shared by every segment.
+struct Utterance<'a> {
+    req: &'a SynthesisRequest,
+    text_map: &'a TextMap,
+    lang_id: i32,
+    conds: &'a Array,
+    prompt_cond: &'a Array,
+    ref_mel: &'a Array,
+    style: &'a Array,
+    total_segments: usize,
+}
+
+/// Speaker conditioning tensors of one request.
+struct SpeakerArrays {
+    conds: Array,
+    prompt_cond: Array,
+    ref_mel: Array,
+    style: Array,
+}
+
+/// Work done before the first segment, attributed to it (milliseconds).
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "mirrors the StageTimings field names"
+)]
+struct LeadTimings {
+    voice_extract_ms: f64,
+    frontend_ms: f64,
+    /// GPT time spent generating codes for [`SpeechContext::Text`].
+    context_ms: f64,
+}
+
+/// Stage 2 timings (milliseconds).
+#[derive(Debug, Clone, Copy)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "mirrors the StageTimings field names"
+)]
+struct S2MelTimings {
+    codec_ms: f64,
+    regulator_ms: f64,
+    cfm_ms: f64,
+}
+
+/// A segment already spoken, which the next one continues after.
+#[derive(Debug, Clone)]
+struct Prior {
+    token_ids: Vec<i32>,
+    codes: Vec<i32>,
+}
+
+impl Prior {
+    fn of(context: &SpeechContext) -> Option<Self> {
+        match context {
+            SpeechContext::Spoken { token_ids, codes } if !codes.is_empty() => Some(Self {
+                token_ids: token_ids.clone(),
+                codes: codes.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// GPT inputs that continue a segment after a [`Prior`]: the prior text followed by the
+/// segment's text (without its language prefix), with the prior codes already spoken.
+struct Continuation<'a> {
+    text_tokens: Vec<i32>,
+    prior_codes: &'a [i32],
+    prior_tokens: usize,
+    /// Leading segment tokens that lie wholly in the language prefix (dropped from the text).
+    dropped: usize,
+    min_codes: usize,
+}
+
+impl<'a> Continuation<'a> {
+    /// `None` when the combined sequence would exceed the decoder's positional capacity, in
+    /// which case the segment is synthesized as a fresh utterance.
+    fn new(prior: &'a Prior, segment: &PreparedSegment) -> Option<Self> {
+        let dropped = segment
+            .tokens
+            .iter()
+            .take_while(|token| token.bytes.end <= segment.prefix_len)
+            .count();
+        let text_tokens: Vec<i32> = prior
+            .token_ids
+            .iter()
+            .copied()
+            .chain(segment.token_ids().into_iter().skip(dropped))
+            .collect();
+        if text_tokens.len() + 2 > GPT_TEXT_POS_LEN || prior.codes.len() > MAX_PRIOR_CODES {
+            return None;
+        }
+        let spoken = segment
+            .tokens
+            .iter()
+            .filter(|token| segment.is_spoken(token))
+            .count();
+        Some(Self {
+            text_tokens,
+            prior_codes: &prior.codes,
+            prior_tokens: prior.token_ids.len(),
+            dropped,
+            min_codes: MIN_CONTINUATION_CODES_PER_TOKEN * spoken,
+        })
+    }
+
+    /// Maps attention over the continued text (`<BOS>, prior, segment body, <EOS>`) onto the
+    /// columns of the segment alone (`<BOS>, segment tokens, <EOS>`); dropped prefix tokens get
+    /// zero attention.
+    fn segment_columns(&self, attention: &[f32], frames: usize, segment_tokens: usize) -> Vec<f32> {
+        let source_cols = self.text_tokens.len() + 2;
+        let target_cols = segment_tokens + 2;
+        let mut out = vec![0.0_f32; frames * target_cols];
+        for (row, target) in attention
+            .chunks_exact(source_cols)
+            .zip(out.chunks_exact_mut(target_cols))
+        {
+            let mut set = |to: usize, from: usize| {
+                if let (Some(slot), Some(&value)) = (target.get_mut(to), row.get(from)) {
+                    *slot = value;
+                }
+            };
+            set(0, 0);
+            for j in self.dropped..segment_tokens {
+                set(j + 1, 1 + self.prior_tokens + j - self.dropped);
+            }
+            set(target_cols - 1, source_cols - 1);
+        }
+        out
     }
 }
 
@@ -693,7 +1010,7 @@ impl IndexTtsEngine {
     pub async fn synthesize(&self, req: SynthesisRequest) -> Result<SynthesisResult> {
         let start = Instant::now();
         let interval_ms = req.interval_silence_ms;
-        let sample_rate = self.config.sample_rate;
+        let sample_rate = req.sample_rate.hz();
         let stream = self.synthesize_stream(req)?;
 
         let mut chunks = Vec::new();
@@ -717,7 +1034,7 @@ impl IndexTtsEngine {
     pub fn synthesize_blocking(&self, req: SynthesisRequest) -> Result<SynthesisResult> {
         let start = Instant::now();
         let interval_ms = req.interval_silence_ms;
-        let sample_rate = self.config.sample_rate;
+        let sample_rate = req.sample_rate.hz();
         let stream = self.synthesize_stream(req)?;
 
         let mut chunks = Vec::new();
@@ -871,7 +1188,7 @@ fn spawn_worker_thread(
         .name("index-tts-mlx-worker".to_owned())
         .spawn(move || {
             match MlxWorkerState::initialize(
-                config,
+                &config,
                 model_dir,
                 voice_store,
                 flag_clone,
@@ -1036,6 +1353,123 @@ mod tests {
 
         let evicted = engine.evict_voice_extractor_blocking();
         assert_eq!(evicted.ok(), Some(false));
+        assert!(engine.stop().is_ok());
+    }
+
+    #[test]
+    fn test_should_align_every_spoken_character_within_the_segment() {
+        if resolve_model_dir(None, DEFAULT_MODEL_REPO).is_err() {
+            return;
+        }
+        let Ok(temp_voices) = tempfile::tempdir() else {
+            return;
+        };
+        let cfg = EngineConfig::builder()
+            .voices_dir(Some(temp_voices.path().to_path_buf()))
+            .build();
+        let Ok(engine) = IndexTtsEngine::start(cfg) else {
+            return;
+        };
+        let golden_voice = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("golden_speaker.itts_voice");
+        let Ok(text) = SynthesisText::new("你好，世界。") else {
+            return;
+        };
+        let sampling = SamplingParams::builder().seed(Some(7)).build();
+        let req = SynthesisRequest::builder()
+            .text(text)
+            .speaker(SpeakerSource::VoiceFile(golden_voice))
+            .language(Language::Zh)
+            .sampling(sampling)
+            .align(true)
+            .build();
+        let Ok(stream) = engine.synthesize_stream(req) else {
+            return;
+        };
+        let chunk = stream.recv();
+        assert!(matches!(chunk, Some(Ok(_))), "synthesis failed: {chunk:?}");
+        if let Some(Ok(chunk)) = chunk {
+            assert_eq!(chunk.text_chars, 0..6);
+            let spoken: Vec<_> = chunk
+                .alignment
+                .iter()
+                .map(|span| span.chars.clone())
+                .collect();
+            assert_eq!(spoken, [0..1, 1..2, 3..4, 4..5]);
+            let duration = chunk.duration_secs();
+            assert!(chunk.alignment.windows(2).all(|pair| match pair {
+                [a, b] => a.end_secs <= b.start_secs + 1e-4,
+                _ => true,
+            }));
+            assert!(
+                chunk.alignment.iter().all(|span| {
+                    0.0 <= span.start_secs
+                        && span.start_secs < span.end_secs
+                        && span.end_secs <= duration + 1e-4
+                }),
+                "{:?} {duration}",
+                chunk.alignment
+            );
+            assert!(
+                chunk.timings.align_ms > 0.0,
+                "{:?} {duration}",
+                chunk.alignment
+            );
+        }
+        assert!(engine.stop().is_ok());
+    }
+
+    #[test]
+    fn test_should_continue_segments_and_align_the_continuation() {
+        if resolve_model_dir(None, DEFAULT_MODEL_REPO).is_err() {
+            return;
+        }
+        let Ok(temp_voices) = tempfile::tempdir() else {
+            return;
+        };
+        let cfg = EngineConfig::builder()
+            .voices_dir(Some(temp_voices.path().to_path_buf()))
+            .build();
+        let Ok(engine) = IndexTtsEngine::start(cfg) else {
+            return;
+        };
+        let golden_voice = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("golden_speaker.itts_voice");
+        let (Ok(text), Ok(previous)) = (
+            SynthesisText::new("第一句测试。第二句测试。"),
+            SynthesisText::new("开场白。"),
+        ) else {
+            return;
+        };
+        let req = SynthesisRequest::builder()
+            .text(text)
+            .speaker(SpeakerSource::VoiceFile(golden_voice))
+            .language(Language::Zh)
+            .sampling(SamplingParams::builder().seed(Some(3)).build())
+            .max_text_tokens_per_segment(NonZeroU32::new(10).unwrap_or(NonZeroU32::MIN))
+            .context(SpeechContext::Text(previous))
+            .continuity(true)
+            .align(true)
+            .build();
+        let Ok(stream) = engine.synthesize_stream(req) else {
+            return;
+        };
+        let chunks: Vec<_> = stream.into_iter().collect();
+        assert_eq!(chunks.len(), 2);
+        if let Some(Ok(second)) = chunks.get(1) {
+            assert_eq!(second.text_chars, 6..12);
+            let spoken: Vec<_> = second
+                .alignment
+                .iter()
+                .map(|span| span.chars.clone())
+                .collect();
+            assert_eq!(spoken, [6..7, 7..8, 8..9, 9..10, 10..11]);
+            assert!(
+                matches!(&second.spoken, SpeechContext::Spoken { codes, .. } if !codes.is_empty())
+            );
+        }
         assert!(engine.stop().is_ok());
     }
 }

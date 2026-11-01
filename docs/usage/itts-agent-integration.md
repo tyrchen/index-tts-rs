@@ -12,7 +12,7 @@ itts doctor --output json
 
 ```json
 {
-  "version": "0.2.0",
+  "version": "0.3.0",
   "ready": true,
   "checks": [
     { "name": "platform", "status": "ok", "summary": "macOS on Apple Silicon (Metal)" },
@@ -45,10 +45,56 @@ Every command accepts `--output text|json|jsonl` (or `ITTS_OUTPUT=json`).
 - `jsonl`: compact lines; `synth` streams `started` → `chunk`… → `done`, `models pull` streams
   download `progress`, and `daemon start` streams startup progress followed by `ready`.
 
-With `synth --out -`, stdout carries raw 16-bit little-endian mono PCM at 22050 Hz and the
-summary goes to stderr.
+With `synth --out -`, stdout carries raw 16-bit little-endian mono PCM (22050 Hz, or 48000 Hz with
+`--sample-rate 48000`) and the summary goes to stderr.
 
-## 3. Errors and exit codes
+## 3. Timestamps, sentences, and reproducible takes
+
+Add `--timestamps` (CLI) or `"timestamps": true` (daemon, MCP, HTTP) to receive when every
+character is heard. Timings come from the GPT decoder's own text attention, snapped to the
+synthesized waveform's pauses; they cost about 15–45 ms per job and need no extra model.
+
+```bash
+itts synth --voice narrator --timestamps --output json \
+  --text '大家好！[[pause=400]]今天是2026年10月31日。' --out hello.wav
+```
+
+```jsonc
+{
+  "seed": 3071825384613407,
+  "alignment": {
+    "text": "大家好！今天是2026年10月31日。",   // the input without [[...]] controls
+    "start": [0.62, 0.79, 0.99, 1.17, 2.40, ...],  // seconds, one per Unicode scalar
+    "end":   [0.79, 0.99, 1.17, 2.40, 2.55, ...]
+  },
+  "sentences": [
+    { "text": "大家好！", "chars": { "start": 0, "end": 4 }, "start": 0.62, "end": 1.17 },
+    { "text": "今天是2026年10月31日。", "chars": { "start": 4, "end": 19 }, "start": 2.40, "end": 5.20 }
+  ]
+}
+```
+
+- Indices are Unicode scalars: in JavaScript use `Array.from(alignment.text)`.
+- Numbers, symbols, and English words are mapped back to the characters you wrote (`2026` gets
+  the time of its spoken form). Punctuation and whitespace span the pause between neighbours.
+- Accuracy against a forced aligner (MMS): median 16–18 ms, 96–98% of word/character onsets within
+  100 ms across Chinese and English, two voices, emotions, and 0.8–1.3× speed. See
+  [the research note](../research/gpt-attention-alignment-research.md).
+
+Every job reports the `seed` that drove GPT sampling and CFM noise (in `started` and in the
+summary). When `--seed` / `advanced.seed` is omitted a random one is drawn; passing the reported
+seed back reproduces the audio bit for bit on the same machine.
+
+`--sample-rate 48000` (`"sampleRate": 48000`) returns 48 kHz audio: the native 22.05 kHz band is
+kept and 10–24 kHz is added by a bandwidth extender whose weights `itts models pull` fetches
+(`itts doctor` reports them as `hifi`). Durations and timestamps do not change.
+
+Each `chunk` event carries `text` (the part of the input it reads, closing punctuation included;
+consecutive chunks partition the text), `textOffset` (its character index), `startSecs` (where
+the chunk, including its leading pause, starts in the job audio), and with timestamps an
+`alignment` for that chunk on the job timeline.
+
+## 4. Errors and exit codes
 
 ```json
 { "status": "error",
@@ -70,7 +116,7 @@ summary goes to stderr.
 | 10 | `ANNOTATION_UNAVAILABLE` / `ANNOTATION_FAILED` | `DEEPSEEK_API_KEY` missing / provider failure |
 | 11 | `IO` | Filesystem failure |
 
-## 4. Warm daemon
+## 5. Warm daemon
 
 ```bash
 itts daemon start          # detaches; exits 0 once ready (or already running)
@@ -94,7 +140,7 @@ itts daemon stop
   so they mean the caller's working directory. Disconnecting a client cancels its job at the next
   sentence boundary.
 
-## 5. MCP server
+## 6. MCP server
 
 ```json
 { "mcpServers": { "itts": { "command": "itts", "args": ["mcp"] } } }
@@ -107,30 +153,34 @@ any number of sessions share one model and `initialize` answers immediately.
 | --- | --- |
 | `status` | The `itts doctor` report |
 | `describe_controls` | The `itts schema controls` catalog |
-| `synthesize` | Write a WAV (`outputPath` required); returns duration, RTF, absolute path |
+| `synthesize` | Write a WAV (`outputPath` required); returns duration, RTF, absolute path, seed, and with `timestamps` the alignment and sentences |
 | `speak` | Play through the default output device |
 | `list_voices`, `inspect_voice`, `register_voice`, `remove_voice` | Voice management |
 | `annotate` | DeepSeek pacing and emotion tags (text is never rewritten) |
+| `annotate_units` | One delivery per caller-supplied line (`AnnotateJob` → `AnnotateResult`; see the speech-controls guide) |
 
 Synthesis tools take `SpeechJob` fields: `input`, `voice` | `voiceFile` | `refAudio`, `emoRef`,
 `emoAlpha`, `emo`, `lang`, `speed`, `paragraphPauseMs`, `intervalSilenceMs`, `outputPath`,
-`advanced` (`greedy`, `seed`, `temperature`, `topK`, `topP`, `repetitionPenalty`,
+`sampleRate`, `timestamps`, `continuity`, `previousText`, `advanced` (`greedy`, `seed`, `temperature`, `topK`, `topP`, `repetitionPenalty`,
 `maxMelTokens`, `maxTextTokens`, `nTimesteps`, `cfgRate`). Results include `structuredContent`;
 failures are `isError` results whose structured content is the error body above. Requests with a
-progress token receive `notifications/progress` per synthesized segment, and MCP cancellation
-stops the daemon job.
+progress token receive `notifications/progress` per synthesized segment (the message names the
+sentence just finished), and MCP cancellation stops the daemon job.
 
-## 6. Daemon wire protocol
+## 7. Daemon wire protocol
 
-For direct integrations, the socket speaks newline-delimited JSON (protocol version 2):
+For direct integrations, the socket speaks newline-delimited JSON (protocol version 3):
 
 ```text
-→ {"id":1,"method":"hello","clientVersion":"0.2.0","protocolVersion":2}
-← {"id":1,"event":"welcome","serverVersion":"0.2.0","protocolVersion":2}
+→ {"id":1,"method":"hello","clientVersion":"0.3.0","protocolVersion":3}
+← {"id":1,"event":"welcome","serverVersion":"0.3.0","protocolVersion":3}
 → {"id":2,"method":"synth","job":{"input":"你好","voice":"tyr","outputPath":"/abs/out.wav"},"includePcm":false}
 ← {"id":2,"event":"started",...}  {"id":2,"event":"chunk",...}  {"id":2,"event":"done",...}
 → {"id":3,"method":"cancel","target":2}
+→ {"id":4,"method":"annotate","job":{"units":[{"id":"l1","text":"你好。"}]},"apiKey":"sk-..."}
+← {"id":4,"event":"annotated","deliveries":[{"id":"l1","speedScale":0.95,...}]}
 ```
 
-Other methods: `status`, `stop`, `voiceAdd`. Paths must be absolute. Requests on one connection
+`apiKey` is optional (the daemon's `DEEPSEEK_API_KEY` is the fallback) and is never logged; a key
+the provider rejects yields `ANNOTATION_UNAVAILABLE`. Other methods: `status`, `stop`, `voiceAdd`. Paths must be absolute. Requests on one connection
 are multiplexed by `id`; lines are limited to 256 KiB.

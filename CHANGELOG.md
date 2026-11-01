@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## 0.3.0
+
+- Added per-character and per-sentence timestamps from GPT attention alignment
+  (`--timestamps`, `POST /v1/audio/speech/timestamps`), and report the seed of
+  every synthesis for reproducible output.
+- Added optional 48 kHz output through LavaSR bandwidth extension.
+- Added per-line annotation (`AnnotateJob`, daemon `annotate`, `POST /v1/annotate`,
+  MCP `annotate_units`) with per-request DeepSeek keys; the daemon protocol is now 3.
+- Added opt-in cross-sentence continuity (`continuity`, `previousText`).
+- HTTP synthesis now queues for up to 60 s instead of returning `BUSY` at once.
+- Changed defaults: `top_k` 10 (fewer Mandarin tone errors) and speed 1.2; inline
+  `[[speed=X]]` is relative to the job speed. Removed the unused
+  `max_ref_seconds` setting.
+
 ## 0.2.0
 
 - Added a shared speech-job service layer, stable runtime errors, JSON / JSONL
