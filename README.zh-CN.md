@@ -51,7 +51,7 @@ cargo build --release --workspace --locked
 准备一段清晰、单人讲话的录音，建议 3–15 秒，并取得说话者授权。支持 WAV、MP3、FLAC、M4A 容器；能否解码取决于容器内的编码格式，推荐使用 WAV PCM。
 
 ```bash
-# 下载 yunfengwang/IndexTTS-2.5-mlx 到 Hugging Face 缓存。
+# 下载 yunfengwang/IndexTTS-2.5-mlx（以及 56 MB 的 48 kHz 扩展权重）到 Hugging Face 缓存。
 itts models pull
 itts models info
 itts doctor
@@ -84,7 +84,7 @@ itts synth --voice-file /path/to/narrator.itts_voice \
   --text "复用已经提取的说话人条件。" --out snapshot.wav
 ```
 
-WAV 输出为 **22,050 Hz、单声道、有符号 16 位 PCM**。`--out -` 向标准输出写入无文件头的小端 PCM，摘要写入标准错误。每个任务的文本上限为 **16,384 个 UTF-8 字节**，长文档请拆成多个任务。
+WAV 默认输出为 **22,050 Hz、单声道、有符号 16 位 PCM**。模型本身的音频只到 11 kHz；`--sample-rate 48000` 保留这部分频带，并用 [LavaSR v2](https://huggingface.co/YatharthS/LavaSR) 带宽扩展模型（Apache-2.0，8 秒语音约 35 ms）补出 10–24 kHz，详见[评测](docs/research/speech-bandwidth-extension-research.md)。两种采样率下时长与时间戳完全相同。`--out -` 向标准输出写入无文件头的小端 PCM，摘要写入标准错误。每个任务的文本上限为 **16,384 个 UTF-8 字节**，长文档请拆成多个任务。
 
 ## 让模型保持常驻
 
@@ -120,11 +120,13 @@ itts synth --voice narrator --stdin --out poem.wav < poem.itts.txt
 | --- | --- |
 | `[[emo=高兴:0.3,平静:0.2]]` | 混合与说话人匹配的情绪原型；`[[emo=none]]` 恢复参考声音的基础情绪 |
 | `[[temp=0.72]]` | GPT 采样温度，`0.05..=2.0`；影响变化程度，不是直接的音高控制 |
-| `[[speed=0.9]]` | 语速倍率，`0.25..=4.0`，越大越快 |
+| `[[speed=0.9]]` | 语速倍率（相对 `--speed`，默认 1.2），`0.25..=4.0`，越大越快 |
 | `[[pause=600]]` | 插入 600 毫秒数字静音；范围 `0..=5000` 毫秒 |
 | `[[voice=other_voice]]` | 切换到另一个已注册声音 |
 | `[[lang=en]]` | 切换语言 |
 | `[[reset]]` | 恢复初始声音与朗读参数 |
+
+`--continuity` 让每一句接着上一句说，而不是每句都重新起头；`--previous-text` 在分开的请求之间（逐行脚本）实现同样的效果。`itts annotate --units` 按行 ID 返回每行的情绪/语速/温度/停顿指令。详见[朗读控制指南](docs/usage/itts-speech-controls.md)。
 | `<行\|hang2>` | 强制指定读音；也支持英语 ARPAbet |
 
 八类情绪支持中英文名称：高兴 / `happy`、愤怒 / `angry`、悲伤 / `sad`、恐惧 / `afraid`、反感 / `disgusted`、低落 / `melancholic`、惊讶 / `surprised`、平静 / `calm`。情绪权重是模型条件输入，不是经过标定的听感强度评分。
@@ -137,12 +139,13 @@ YAML 配置见 [config/default.yaml](config/default.yaml) 和 [config/director.y
 itts doctor --output json
 itts synth --voice narrator --text "你好。" --out hi.wav --output json
 itts synth --voice narrator --text "第一句。第二句。" --out stream.wav --output jsonl
+itts synth --voice narrator --text "第一句。第二句。" --out timed.wav --timestamps --output json
 itts schema controls
 itts schema speech-job
 itts schema events
 ```
 
-使用 `--output text|json|jsonl` 或 `ITTS_OUTPUT` 选择格式。JSON 合成结果包含 `status`、`backend`、`durationSecs`、`synthesisSecs`、`rtf`、`outputPath` 等字段；JSONL 按 `started` → `chunk` → `done` 流式输出。运行时错误提供稳定的 `error.code`、`message`、`hint` 和有文档说明的退出码。CLI 参数解析错误使用 Clap 的用法提示，退出码为 2。
+使用 `--output text|json|jsonl` 或 `ITTS_OUTPUT` 选择格式。JSON 合成结果包含 `status`、`backend`、`durationSecs`、`synthesisSecs`、`rtf`、`outputPath`，以及可复现本次结果的 `seed`；JSONL 按 `started` → `chunk` → `done` 流式输出，每个 chunk 都标明它读的是哪段文字。加 `--timestamps` 会额外返回逐字时间 `alignment`（与 ElevenLabs `with-timestamps` 结构一致）和逐句时间 `sentences`，它们来自模型自身的文本注意力，每个任务只多花几十毫秒；详见[智能体集成指南](docs/usage/itts-agent-integration.md#3-timestamps-sentences-and-reproducible-takes)。运行时错误提供稳定的 `error.code`、`message`、`hint` 和有文档说明的退出码。CLI 参数解析错误使用 Clap 的用法提示，退出码为 2。
 
 支持 stdio 服务的 MCP 客户端可配置：
 
@@ -154,7 +157,7 @@ itts schema events
 }
 ```
 
-确保客户端 PATH 中能找到 `itts`，也可以使用二进制绝对路径。工具包括 `status`、`describe_controls`、`synthesize`、`speak`、声音管理和 `annotate`。MCP 首次需要时启动 daemon，多个会话共享模型。工具参数、错误、进度、取消和 socket 协议见[智能体集成指南](docs/usage/itts-agent-integration.md)。
+确保客户端 PATH 中能找到 `itts`，也可以使用二进制绝对路径。工具包括 `status`、`describe_controls`、`synthesize`、`speak`、声音管理、`annotate` 和 `annotate_units`。MCP 首次需要时启动 daemon，多个会话共享模型。工具参数、错误、进度、取消和 socket 协议见[智能体集成指南](docs/usage/itts-agent-integration.md)。
 
 ## 浏览器工作台与 HTTP
 
@@ -177,10 +180,12 @@ curl --fail-with-body http://127.0.0.1:8080/v1/audio/speech \
 | `GET /health` | 引擎状态和采样率 |
 | `GET /api/voices` | 已注册声音 ID 与参考音频时长 |
 | `POST /api/annotate` | 按源段落返回节奏标注 |
+| `POST /v1/annotate` | 为调用方给出的每一行返回朗读指令（情绪、温度、语速、停顿） |
 | `POST /api/speech/stream` | 包含 PCM 音频块与统计信息的 JSON Lines |
 | `POST /v1/audio/speech` | 根据 `SpeechJob` 请求生成 WAV |
+| `POST /v1/audio/speech/timestamps` | JSON：base64 WAV、`seed`、逐字 `alignment` 与 `sentences` |
 
-语音接口采用 OpenAI 风格的路径，使用本项目的请求格式，并非完整的 OpenAI API 替代实现。HTTP 仅接受已注册声音 ID，拒绝 `voiceFile`、`refAudio`、`outputPath`。请求体上限为 32 KiB，单次请求超时 120 秒，同时接入请求上限为八个。服务没有内置鉴权，默认绑定本机回环地址；远程部署需要有鉴权的网关。这些限制控制接入工作量，GPU worker 仍串行推理。
+语音接口采用 OpenAI 风格的路径，使用本项目的请求格式，并非完整的 OpenAI API 替代实现。HTTP 仅接受已注册声音 ID，拒绝 `voiceFile`、`refAudio`、`outputPath`。请求体上限为 32 KiB，单次请求超时 120 秒，同时接入请求上限为八个；合成请求在 GPU 忙时最多排队 60 秒，超时才返回 `BUSY`。标注接口可通过请求头 `X-DeepSeek-Api-Key` 按请求提供 DeepSeek key。服务没有内置鉴权，默认绑定本机回环地址；远程部署需要有鉴权的网关。这些限制控制接入工作量，GPU worker 仍串行推理。
 
 ## 产品决策与架构
 
@@ -189,6 +194,8 @@ curl --fail-with-body http://127.0.0.1:8080/v1/audio/speech \
 | 决策 | 原因与取舍 |
 | --- | --- |
 | 专注 Apple Silicon 与 MLX | Metal 和统一内存适合 Mac 本地推理；选择 `mlx-rs` 可复用 MLX 量化算子和权重布局，代价是平台覆盖有限。 |
+| 用模型自身注意力生成时间戳 | GPT 的两个注意力头把文本对齐到生成的 codes，而 codes 与音频时间线性对应；停顿再按波形修正。不需要额外的对齐模型，每个任务只多几十毫秒，相对强制对齐器的中位误差 17 ms。精度依赖本版权重的注意力头。 |
+| 可选的 48 kHz 带宽扩展 | 22.05 kHz 是声码器上限，也没有现成的"22k mel → 48k"声码器。用一个小型 GAN 补出高频，9.5 kHz 以下逐 bin 保留原始音频；它只在英文朗读数据上训练过，所以默认关闭。 |
 | 保存 `.itts_voice` 条件快照 | 复用 Stage 0 的四个输出张量，避免每次运行大型参考编码器。快照依赖模型与格式，不是通用说话人 embedding。 |
 | 一个 actor 拥有 GPU 状态 | MLX 状态放在专用线程，有界通道提供背压，支持在句子边界取消；多个请求排队执行，不并行抢占 GPU 推理。 |
 | 通过本机 socket 使用常驻 daemon | 短生命周期的 CLI / MCP 进程复用模型，以常驻内存换取更低启动延迟。 |

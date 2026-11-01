@@ -10,13 +10,12 @@ use std::path::Path;
 use mlx_rs::{
     Array,
     fast::layer_norm,
-    nn::gelu,
     ops::{addmm, conv1d, indexing::TryIndexOp},
 };
 
 use crate::{
     error::{IndexTtsError, Result},
-    models::{FilteredWeights, ModelWeightKind, SafeTensorsLoader},
+    models::{FilteredWeights, ModelWeightKind, SafeTensorsLoader, convnext::ConvNeXtBlock},
 };
 
 /// Output feature dimension of the semantic codec (`1024`).
@@ -35,39 +34,6 @@ pub const CODEC_NUM_LAYERS: usize = 12;
 pub const CODEC_NORM_EPS: f32 = 1e-6;
 /// Temporal upsampling repetition factor (`2`).
 pub const CODEC_UPSAMPLE_FACTOR: i32 = 2;
-
-#[derive(Debug, Clone)]
-struct ConvNeXtBlock {
-    dwconv_weight: Array,
-    dwconv_bias: Array,
-    norm_weight: Array,
-    norm_bias: Array,
-    pwconv1_weight: Array,
-    pwconv1_bias: Array,
-    pwconv2_weight: Array,
-    pwconv2_bias: Array,
-    gamma: Array,
-}
-
-impl ConvNeXtBlock {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let residual = x;
-        let h = conv1d(x, &self.dwconv_weight, 1, 3, 1, CODEC_VOCOS_DIM as i32)?
-            .add(&self.dwconv_bias)?;
-        let h = layer_norm(
-            &h,
-            Some(&self.norm_weight),
-            Some(&self.norm_bias),
-            CODEC_NORM_EPS,
-        )?;
-        let h = addmm(&self.pwconv1_bias, &h, self.pwconv1_weight.t(), None, None)?;
-        let h = gelu(&h)?;
-        let h = addmm(&self.pwconv2_bias, &h, self.pwconv2_weight.t(), None, None)?;
-        let h = self.gamma.multiply(&h)?;
-        Ok(residual.add(&h)?)
-    }
-}
 
 /// Decoder-only `SemanticCodec` (`raw/semantic_codec.safetensors`).
 #[derive(Debug, Clone)]
@@ -134,46 +100,16 @@ impl SemanticCodec {
             weights.tensor_array_shaped("decoder.0.norm.weight", &[CODEC_VOCOS_DIM])?;
         let norm_bias = weights.tensor_array_shaped("decoder.0.norm.bias", &[CODEC_VOCOS_DIM])?;
 
-        let mut convnext = Vec::with_capacity(CODEC_NUM_LAYERS);
-        for i in 0..CODEC_NUM_LAYERS {
-            let prefix = format!("decoder.0.convnext.{i}");
-            let dwconv_weight = weights.tensor_array_shaped(
-                &format!("{prefix}.dwconv.weight"),
-                &[CODEC_VOCOS_DIM, 7, 1],
-            )?;
-            let dwconv_bias = weights
-                .tensor_array_shaped(&format!("{prefix}.dwconv.bias"), &[CODEC_VOCOS_DIM])?;
-            let block_norm_weight = weights
-                .tensor_array_shaped(&format!("{prefix}.norm.weight"), &[CODEC_VOCOS_DIM])?;
-            let block_norm_bias =
-                weights.tensor_array_shaped(&format!("{prefix}.norm.bias"), &[CODEC_VOCOS_DIM])?;
-            let pwconv1_weight = weights.tensor_array_shaped(
-                &format!("{prefix}.pwconv1.weight"),
-                &[CODEC_INTERMEDIATE, CODEC_VOCOS_DIM],
-            )?;
-            let pwconv1_bias = weights
-                .tensor_array_shaped(&format!("{prefix}.pwconv1.bias"), &[CODEC_INTERMEDIATE])?;
-            let pwconv2_weight = weights.tensor_array_shaped(
-                &format!("{prefix}.pwconv2.weight"),
-                &[CODEC_VOCOS_DIM, CODEC_INTERMEDIATE],
-            )?;
-            let pwconv2_bias = weights
-                .tensor_array_shaped(&format!("{prefix}.pwconv2.bias"), &[CODEC_VOCOS_DIM])?;
-            let gamma =
-                weights.tensor_array_shaped(&format!("{prefix}.gamma"), &[CODEC_VOCOS_DIM])?;
-
-            convnext.push(ConvNeXtBlock {
-                dwconv_weight,
-                dwconv_bias,
-                norm_weight: block_norm_weight,
-                norm_bias: block_norm_bias,
-                pwconv1_weight,
-                pwconv1_bias,
-                pwconv2_weight,
-                pwconv2_bias,
-                gamma,
-            });
-        }
+        let convnext = (0..CODEC_NUM_LAYERS)
+            .map(|i| {
+                ConvNeXtBlock::from_weights(
+                    weights,
+                    &format!("decoder.0.convnext.{i}"),
+                    CODEC_VOCOS_DIM,
+                    CODEC_INTERMEDIATE,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let final_norm_weight =
             weights.tensor_array_shaped("decoder.0.final_layer_norm.weight", &[CODEC_VOCOS_DIM])?;

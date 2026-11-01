@@ -15,12 +15,15 @@ use hf_hub::{
 };
 use index_tts_rs_core::{
     config::{DEFAULT_MODEL_REPO, EngineConfig},
-    models::{ModelWeightKind, resolve_model_dir},
+    models::{
+        HIFI_MODEL_REPO, HIFI_MODEL_REVISION, ModelWeightKind, resolve_hifi_weights,
+        resolve_model_dir,
+    },
 };
 use index_tts_rs_service::ServiceError;
 use serde::Serialize;
 use serde_json::json;
-use tokio::fs;
+use tokio::{fs, task::spawn_blocking};
 
 use crate::{daemon::lifecycle::display_path, output::OutputMode};
 
@@ -80,21 +83,32 @@ pub async fn run(config: &EngineConfig, command: ModelsCommand, output: OutputMo
                 .iter()
                 .map(|a| a.size_bytes)
                 .sum::<u64>();
+            let (hifi_path, hifi_downloaded) = ensure_hifi(output).await?;
             output.emit(
                 &json!({ "status": "ok", "repo": repo, "modelDir": model_dir,
-                    "downloaded": downloaded, "totalWeightBytes": total_bytes }),
+                    "downloaded": downloaded, "totalWeightBytes": total_bytes,
+                    "hifiWeights": hifi_path, "hifiDownloaded": hifi_downloaded }),
                 |out| {
-                    let verb = if downloaded {
-                        "downloaded"
-                    } else {
-                        "already present"
+                    let verb = |fetched: bool| {
+                        if fetched {
+                            "downloaded"
+                        } else {
+                            "already present"
+                        }
                     };
                     writeln!(
                         out,
-                        "✔ model {verb}: {repo} ({:.2} GiB)",
+                        "✔ model {}: {repo} ({:.2} GiB)",
+                        verb(downloaded),
                         to_mib(total_bytes) / 1024.0
                     )?;
-                    writeln!(out, "  → {}", display_path(&model_dir))
+                    writeln!(out, "  → {}", display_path(&model_dir))?;
+                    writeln!(
+                        out,
+                        "✔ 48 kHz extender {}: {HIFI_MODEL_REPO}",
+                        verb(hifi_downloaded)
+                    )?;
+                    writeln!(out, "  → {}", display_path(&hifi_path))
                 },
             )
         }
@@ -102,9 +116,14 @@ pub async fn run(config: &EngineConfig, command: ModelsCommand, output: OutputMo
             let model_dir = resolve_model_dir(config.model_dir.as_deref(), &config.model_repo)?;
             let artifacts = artifacts(&model_dir).await;
             let total_bytes = artifacts.iter().map(|a| a.size_bytes).sum::<u64>();
+            let hifi = spawn_blocking(resolve_hifi_weights)
+                .await
+                .context("hifi weight check failed")?
+                .ok();
             output.emit(
                 &json!({ "modelRepo": config.model_repo, "modelDir": model_dir,
-                    "totalWeightBytes": total_bytes, "artifacts": artifacts }),
+                    "totalWeightBytes": total_bytes, "artifacts": artifacts,
+                    "hifiWeights": hifi }),
                 |out| {
                     writeln!(out, "repo   {}", config.model_repo)?;
                     writeln!(out, "dir    {}", display_path(&model_dir))?;
@@ -116,7 +135,11 @@ pub async fn run(config: &EngineConfig, command: ModelsCommand, output: OutputMo
                             to_mib(a.size_bytes)
                         )?;
                     }
-                    writeln!(out, "total  {:.2} GiB", to_mib(total_bytes) / 1024.0)
+                    writeln!(out, "total  {:.2} GiB", to_mib(total_bytes) / 1024.0)?;
+                    match &hifi {
+                        Some(path) => writeln!(out, "hifi   {}", display_path(path)),
+                        None => writeln!(out, "hifi   not downloaded (run `itts models pull`)"),
+                    }
                 },
             )
         }
@@ -169,6 +192,35 @@ async fn download(repo: &str, output: OutputMode) -> Result<PathBuf> {
                 .with_hint("the download is incomplete; run `itts models pull` again")
         )
     })
+}
+
+/// Fetches the pinned 48 kHz bandwidth-extender weights unless already verified in the cache.
+/// Returns the weight path and whether it was downloaded now.
+async fn ensure_hifi(output: OutputMode) -> Result<(PathBuf, bool)> {
+    if let Ok(Ok(path)) = spawn_blocking(resolve_hifi_weights).await {
+        return Ok((path, false));
+    }
+    let client = HFClient::new().context("failed to initialize Hugging Face Hub client")?;
+    let (owner, name) = split_id(HIFI_MODEL_REPO);
+    let file = ModelWeightKind::BandwidthExtender.relative_path();
+    client
+        .model(owner, name)
+        .download_file()
+        .filename(file)
+        .revision(HIFI_MODEL_REVISION)
+        .progress(FileReporter {
+            output,
+            label: format!("[hifi] {file}"),
+            last_bucket: AtomicU64::new(u64::MAX),
+        })
+        .send()
+        .await
+        .with_context(|| format!("failed to download `{file}` from `{HIFI_MODEL_REPO}`"))?;
+    let path = spawn_blocking(resolve_hifi_weights)
+        .await
+        .context("hifi weight check failed")?
+        .map_err(|err| anyhow!(ServiceError::from(err)))?;
+    Ok((path, true))
 }
 
 /// Reports one file's download progress in 10% steps (JSON lines in `jsonl` mode).

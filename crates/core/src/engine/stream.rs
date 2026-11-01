@@ -1,12 +1,14 @@
 //! Streaming synthesis output types ([`StageTimings`], [`AudioChunk`], [`SynthesisResult`],
 //! and [`SynthesisStream`]).
 
-use std::path::Path;
+use std::{ops::Range, path::Path};
 
 use flume::Receiver;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    align::SpanTiming,
+    config::SpeechContext,
     dsp::{encode_wav_i16_bytes, write_wav_i16_file},
     error::Result,
 };
@@ -31,6 +33,12 @@ pub struct StageTimings {
     pub cfm_ms: f64,
     /// Stage 3 `BigVgan` 256x neural vocoder time in milliseconds.
     pub bigvgan_ms: f64,
+    /// Text alignment (teacher-forced attention + decoding) time in milliseconds.
+    #[serde(default)]
+    pub align_ms: f64,
+    /// 48 kHz bandwidth extension time in milliseconds.
+    #[serde(default)]
+    pub bwe_ms: f64,
     /// Total end-to-end wall-clock latency in milliseconds.
     pub total_ms: f64,
 }
@@ -45,6 +53,8 @@ impl StageTimings {
         self.regulator_ms += other.regulator_ms;
         self.cfm_ms += other.cfm_ms;
         self.bigvgan_ms += other.bigvgan_ms;
+        self.align_ms += other.align_ms;
+        self.bwe_ms += other.bwe_ms;
     }
 }
 
@@ -65,6 +75,17 @@ pub struct AudioChunk {
     pub mel_tokens: usize,
     /// Per-stage timing breakdown for this segment.
     pub timings: StageTimings,
+    /// Character (Unicode scalar) range of the request text this segment reads.
+    #[serde(default)]
+    pub text_chars: Range<usize>,
+    /// Per-character timings relative to this segment's audio; empty unless the request set
+    /// [`crate::config::SynthesisRequest::align`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alignment: Vec<SpanTiming>,
+    /// This segment's text tokens and semantic codes, for continuing after it
+    /// ([`crate::config::SpeechContext::Spoken`]).
+    #[serde(skip)]
+    pub spoken: SpeechContext,
 }
 
 impl AudioChunk {
@@ -94,7 +115,25 @@ impl AudioChunk {
             sample_rate,
             mel_tokens,
             timings,
+            text_chars: 0..0,
+            alignment: Vec::new(),
+            spoken: SpeechContext::None,
         }
+    }
+
+    /// Attaches the request-text range this segment reads and its character timings.
+    #[must_use]
+    pub fn with_text(mut self, text_chars: Range<usize>, alignment: Vec<SpanTiming>) -> Self {
+        self.text_chars = text_chars;
+        self.alignment = alignment;
+        self
+    }
+
+    /// Attaches the segment's text tokens and codes so later speech can continue after it.
+    #[must_use]
+    pub fn with_spoken(mut self, token_ids: Vec<i32>, codes: Vec<i32>) -> Self {
+        self.spoken = SpeechContext::Spoken { token_ids, codes };
+        self
     }
 
     /// Returns the duration of this segment's PCM buffer in seconds.

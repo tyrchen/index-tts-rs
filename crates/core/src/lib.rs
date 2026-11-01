@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 #![warn(rust_2024_compatibility, missing_docs, missing_debug_implementations)]
 
+pub mod align;
 pub mod config;
 pub mod dsp;
 pub mod engine;
@@ -29,8 +30,8 @@ pub mod voice;
 
 pub use config::{
     CfgRate, CfmParams, DurationFactor, EmoAlpha, EngineConfig, Language, RepetitionPenalty,
-    SamplingParams, SpeakerSource, SynthesisRequest, SynthesisText, Temperature, TopK, TopP,
-    VoiceExtractRequest, VoiceId,
+    SampleRate, SamplingParams, SpeakerSource, SpeechContext, SynthesisRequest, SynthesisText,
+    Temperature, TopK, TopP, VoiceExtractRequest, VoiceId,
 };
 pub use engine::{
     AudioChunk, IndexTtsEngine, StageTimings, SynthesisOutput, SynthesisResult, SynthesisStream,

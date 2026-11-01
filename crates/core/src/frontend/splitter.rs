@@ -4,15 +4,16 @@
 //! while preserving `<|SPECIAL_TOKEN_*|>` atomic blocks and stripping reserved
 //! `START_TEXT_TOKEN` (`0`) and `STOP_TEXT_TOKEN` (`1`) IDs.
 
-use std::path::Path;
+use std::{ops::Range, path::Path};
 
 use crate::{
+    align::is_punctuation,
     config::{DEFAULT_MAX_TEXT_TOKENS_PER_SEGMENT, Language},
     error::Result,
     frontend::{
         normalizer::{TextNormalizer, clean_punctuation},
         parser::{apply_pronunciation_annotations, split_atomic_pieces, uppercase_special_tokens},
-        tokenizer::{TIKTOKEN_VOCAB_FILENAME, TiktokenTokenizer},
+        tokenizer::{TIKTOKEN_VOCAB_FILENAME, TiktokenTokenizer, TokenSpan},
     },
 };
 
@@ -238,6 +239,38 @@ impl Frontend {
         lang_raw: &str,
         max_text_tokens_per_segment: usize,
     ) -> Vec<Vec<u32>> {
+        self.prepare_text(text, lang_raw, max_text_tokens_per_segment)
+            .segments
+            .into_iter()
+            .map(|segment| segment.tokens.into_iter().map(|token| token.id).collect())
+            .collect()
+    }
+
+    /// Runs the full text preparation pipeline and keeps the normalized text plus, for each
+    /// segment, the encoded text and every token's byte range. Token IDs are identical to
+    /// [`Self::prepare_with_lang_str`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use index_tts_rs_core::{frontend::Frontend, models::resolve_model_dir};
+    ///
+    /// if let Ok(dir) = resolve_model_dir(None, "yunfengwang/IndexTTS-2.5-mlx") {
+    ///     let fe = Frontend::from_model_dir(&dir, 602, true, None)?;
+    ///     let prepared = fe.prepare_text("第一句。第二句。", "zh", 6);
+    ///     assert_eq!(prepared.segments.len(), 2);
+    ///     let second = &prepared.segments[1];
+    ///     assert_eq!(&prepared.normalized[second.normalized_range()], "第二句.");
+    /// }
+    /// # Ok::<(), index_tts_rs_core::error::IndexTtsError>(())
+    /// ```
+    #[must_use]
+    pub fn prepare_text(
+        &self,
+        text: &str,
+        lang_raw: &str,
+        max_text_tokens_per_segment: usize,
+    ) -> PreparedText {
         let lang = lang_raw.to_ascii_lowercase();
         let lang_prefix = format!("<|{lang}|> ");
 
@@ -254,25 +287,105 @@ impl Frontend {
         working = apply_pronunciation_annotations(&working);
         working = uppercase_special_tokens(&working);
 
-        let segments =
-            self.split_text_by_tokens(&working, max_text_tokens_per_segment, &lang_prefix);
+        let pieces = self.split_text_by_tokens(&working, max_text_tokens_per_segment, &lang_prefix);
         let max_cap = self.text_pos_capacity.saturating_sub(2).max(1);
 
-        let mut encoded_segments = Vec::with_capacity(segments.len());
-        for seg in segments {
-            let full = format!("{lang_prefix}{seg}");
-            let mut ids: Vec<u32> = self
-                .tokenizer
-                .encode_with_special(&full)
-                .into_iter()
-                .filter(|&t| t > 1)
-                .collect();
-            if ids.len() > max_cap {
-                ids.truncate(max_cap);
-            }
-            encoded_segments.push(ids);
+        let mut cursor = 0_usize;
+        let segments = pieces
+            .into_iter()
+            .map(|piece| {
+                // Segments partition `working` in order; locate defensively all the same.
+                let normalized_offset = working
+                    .get(cursor..)
+                    .and_then(|rest| rest.find(piece.as_str()))
+                    .map_or(cursor, |found| cursor + found);
+                cursor = normalized_offset + piece.len();
+                let text = format!("{lang_prefix}{piece}");
+                let mut tokens: Vec<TokenSpan> = self
+                    .tokenizer
+                    .encode_with_offsets(&text)
+                    .into_iter()
+                    .filter(|token| token.id > 1)
+                    .collect();
+                tokens.truncate(max_cap);
+                PreparedSegment {
+                    text,
+                    tokens,
+                    prefix_len: lang_prefix.len(),
+                    normalized_offset,
+                }
+            })
+            .collect();
+        PreparedText {
+            normalized: working,
+            segments,
         }
-        encoded_segments
+    }
+}
+
+/// Output of [`Frontend::prepare_text`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedText {
+    /// Normalized text the segments were cut from (no language prefix).
+    pub normalized: String,
+    /// Tokenized segments in reading order.
+    pub segments: Vec<PreparedSegment>,
+}
+
+/// One tokenized sentence segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedSegment {
+    /// Encoded text: the `<|lang|> ` prefix followed by the segment's normalized text.
+    pub text: String,
+    /// Tokens with byte ranges into [`Self::text`].
+    pub tokens: Vec<TokenSpan>,
+    /// Byte length of the language prefix at the start of [`Self::text`].
+    pub prefix_len: usize,
+    /// Byte offset of the segment body within [`PreparedText::normalized`].
+    pub normalized_offset: usize,
+}
+
+impl PreparedSegment {
+    /// Token IDs as fed to the GPT decoder.
+    #[must_use]
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn token_ids(&self) -> Vec<i32> {
+        self.tokens.iter().map(|token| token.id as i32).collect()
+    }
+
+    /// Byte range of the segment body within [`PreparedText::normalized`].
+    #[must_use]
+    pub fn normalized_range(&self) -> Range<usize> {
+        let body = self.text.len().saturating_sub(self.prefix_len);
+        self.normalized_offset..self.normalized_offset + body
+    }
+
+    /// Byte range of `token` within [`PreparedText::normalized`], or `None` for tokens wholly
+    /// inside the language prefix. A token that merged the prefix's trailing space with the
+    /// first word (` honestly`) is clipped to its body part.
+    #[must_use]
+    pub fn normalized_bytes(&self, token: &TokenSpan) -> Option<Range<usize>> {
+        let end = token
+            .bytes
+            .end
+            .checked_sub(self.prefix_len)
+            .filter(|&end| end > 0)?;
+        let start = token.bytes.start.saturating_sub(self.prefix_len);
+        Some(self.normalized_offset + start..self.normalized_offset + end)
+    }
+
+    /// Whether `token` is pronounced: not a special token, whitespace, or punctuation.
+    #[must_use]
+    pub fn is_spoken(&self, token: &TokenSpan) -> bool {
+        let Some(bytes) = self.text.as_bytes().get(token.bytes.clone()) else {
+            return false;
+        };
+        if bytes.starts_with(b"<|") && bytes.ends_with(b"|>") {
+            return false;
+        }
+        String::from_utf8_lossy(bytes)
+            .chars()
+            .any(|ch| !ch.is_whitespace() && !is_punctuation(ch))
     }
 }
 

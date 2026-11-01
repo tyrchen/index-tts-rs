@@ -1,9 +1,11 @@
 //! Neural network model loaders and operator implementations.
 
 pub mod bigvgan;
+pub mod bwe;
 pub mod campplus;
 pub mod cfm;
 pub mod codec;
+mod convnext;
 pub mod emo;
 pub mod gpt;
 pub mod loader;
@@ -15,6 +17,7 @@ pub use bigvgan::{
     BIGVGAN_FILTER_LEN, BIGVGAN_HOP_LENGTH, BIGVGAN_NUM_MELS, BIGVGAN_RES_DILATIONS,
     BIGVGAN_RES_KERNELS, BIGVGAN_UP_INIT_CH, BIGVGAN_UP_KERNELS, BIGVGAN_UP_RATES, BigVgan,
 };
+pub use bwe::{BWE_LAYERS, BandwidthExtender, CROSSOVER_HZ, CROSSOVER_WIDTH_HZ};
 pub use campplus::{
     CAMP_BLOCK_DILATIONS, CAMP_BLOCK_KERNELS, CAMP_BLOCK_LAYERS, CAMP_BN_EPS, CAMP_BN_SIZE,
     CAMP_EMB_DIM, CAMP_FCM_OUT_CHANNELS, CAMP_FEAT_DIM, CAMP_GROWTH_RATE, CAMP_INIT_CHANNELS,
@@ -41,14 +44,18 @@ pub use gpt::{
     Gpt, KvCache, START_MEL_TOKEN, START_TEXT_TOKEN, STOP_MEL_TOKEN, STOP_TEXT_TOKEN,
 };
 pub use loader::{
-    FilteredWeights, LoadedTensor, ModelWeightKind, SEMANTIC_ACTIVE_LAYERS, SPK_PROJ_IN_DIM,
-    SPK_PROJ_OUT_DIM, SafeTensorsLoader, SpkProjWeights, resolve_model_dir,
+    FilteredWeights, HIFI_MODEL_REPO, HIFI_MODEL_REVISION, HIFI_WEIGHTS_BLAKE3, LoadedTensor,
+    ModelWeightKind, SEMANTIC_ACTIVE_LAYERS, SPK_PROJ_IN_DIM, SPK_PROJ_OUT_DIM, SafeTensorsLoader,
+    SpkProjWeights, resolve_hifi_weights, resolve_model_dir,
 };
 pub use regulator::{
     LR_CHANNELS, LR_IN_CHANNELS, LR_NORM_EPS, LR_NUM_BLOCKS, LengthRegulator,
     nearest_expand_indices,
 };
-pub use sampler::{BITSET_WORDS, SamplerRng, SeenTokenBitSet, generate_codes, sample_next_token};
+pub use sampler::{
+    BITSET_WORDS, CodePrompt, SamplerRng, SeenTokenBitSet, generate_codes, generate_codes_after,
+    sample_next_token,
+};
 pub use semantic::{
     SEMANTIC_CONV_KERNEL, SEMANTIC_CONV_PAD_LEFT, SEMANTIC_DIM, SEMANTIC_DIST_TABLE_SIZE,
     SEMANTIC_FEAT_DIM, SEMANTIC_HEAD_DIM, SEMANTIC_INTERMEDIATE, SEMANTIC_LEFT_POS,

@@ -248,9 +248,16 @@ impl From<&DirectorError> for ServiceError {
                  [[voice=ID]] [[lang=CODE]] [[reset]]",
             ),
             DirectorError::MissingKey => {
-                Self::new(ErrorCode::AnnotationUnavailable, err.to_string())
-                    .with_hint("export DEEPSEEK_API_KEY=<key> before starting itts")
+                Self::new(ErrorCode::AnnotationUnavailable, err.to_string()).with_hint(
+                    "export DEEPSEEK_API_KEY=<key> before starting itts, or send a key with the \
+                     request",
+                )
             }
+            DirectorError::Provider(401 | 403) => Self::new(
+                ErrorCode::AnnotationUnavailable,
+                "the annotation provider rejected the API key",
+            )
+            .with_hint("check DEEPSEEK_API_KEY or the key sent with the request"),
             DirectorError::Io(_) | DirectorError::Config { .. } => Self::invalid(err.to_string()),
             _ => Self::new(ErrorCode::AnnotationFailed, err.to_string())
                 .with_hint("retry later; the source text was not modified"),
@@ -268,6 +275,17 @@ mod tests {
     use serde_json::{json, to_value};
 
     use super::{ErrorCode, ServiceError};
+
+    #[rstest]
+    #[case(DirectorError::Provider(401), ErrorCode::AnnotationUnavailable)]
+    #[case(DirectorError::Provider(403), ErrorCode::AnnotationUnavailable)]
+    #[case(DirectorError::Provider(503), ErrorCode::AnnotationFailed)]
+    fn test_should_classify_provider_statuses(
+        #[case] error: DirectorError,
+        #[case] expected: ErrorCode,
+    ) {
+        assert_eq!(ServiceError::from(error).code, expected);
+    }
 
     #[test]
     fn test_should_serialize_codes_in_screaming_snake_case() -> serde_json::Result<()> {

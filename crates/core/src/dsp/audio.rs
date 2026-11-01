@@ -19,7 +19,7 @@ use symphonia::core::{
 };
 
 use crate::{
-    config::{DEFAULT_MAX_REF_SECONDS, DEFAULT_SAMPLE_RATE, validate_safe_file_path},
+    config::{DEFAULT_SAMPLE_RATE, MAX_REF_SECONDS, validate_safe_file_path},
     error::{IndexTtsError, Result},
 };
 
@@ -254,7 +254,7 @@ pub fn decode_audio_file(path: impl AsRef<Path>) -> Result<DecodedAudio> {
 #[must_use]
 pub fn truncate_ref_audio(samples: &[f32], sample_rate: u32, max_seconds: u32) -> &[f32] {
     let effective_secs = if max_seconds == 0 {
-        DEFAULT_MAX_REF_SECONDS
+        MAX_REF_SECONDS
     } else {
         max_seconds
     };

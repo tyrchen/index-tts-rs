@@ -16,6 +16,7 @@ base64.workspace = true
 index-tts-rs-core.workspace = true
 index-tts-rs-director.workspace = true
 schemars.workspace = true
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

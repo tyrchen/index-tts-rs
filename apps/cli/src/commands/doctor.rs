@@ -5,13 +5,13 @@ use std::{env, path::Path};
 use anyhow::Result;
 use index_tts_rs_core::{
     config::EngineConfig,
-    models::{ModelWeightKind, resolve_model_dir},
+    models::{HIFI_MODEL_REPO, ModelWeightKind, resolve_hifi_weights, resolve_model_dir},
     voice::{VoiceStore, default_voices_dir},
 };
 use index_tts_rs_service::ServiceError;
 use schemars::JsonSchema;
 use serde::Serialize;
-use tokio::fs;
+use tokio::{fs, task::spawn_blocking};
 
 use crate::{
     daemon::{
@@ -37,7 +37,7 @@ pub enum CheckStatus {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Check {
-    /// Area (`platform`, `model`, `voices`, `daemon`, `director`, `audio`).
+    /// Area (`platform`, `model`, `hifi`, `voices`, `daemon`, `director`, `audio`).
     pub name: &'static str,
     /// Health.
     pub status: CheckStatus,
@@ -78,7 +78,11 @@ impl Check {
 
 /// Collects the report.
 pub async fn collect(config: &EngineConfig, socket: &Path) -> DoctorReport {
-    let mut checks = vec![platform_check(), model_check(config).await];
+    let mut checks = vec![
+        platform_check(),
+        model_check(config).await,
+        hifi_check().await,
+    ];
     checks.extend(voice_checks(config));
     checks.push(daemon_check(socket).await);
     checks.push(director_check());
@@ -163,6 +167,29 @@ async fn model_check(config: &EngineConfig) -> Check {
                     .unwrap_or_else(|| "run `itts models pull`".to_owned()),
             )
         }
+    }
+}
+
+async fn hifi_check() -> Check {
+    match spawn_blocking(resolve_hifi_weights).await {
+        Ok(Ok(path)) => Check::new(
+            "hifi",
+            CheckStatus::Ok,
+            format!(
+                "48 kHz bandwidth extender ({HIFI_MODEL_REPO}) at {}",
+                display_path(&path)
+            ),
+        ),
+        Ok(Err(err)) => Check::new(
+            "hifi",
+            CheckStatus::Warn,
+            format!(
+                "48 kHz output unavailable: {}",
+                ServiceError::from(err).message
+            ),
+        )
+        .hint("run `itts models pull` to fetch the 56 MB extender weights"),
+        Err(err) => Check::new("hifi", CheckStatus::Warn, format!("check failed: {err}")),
     }
 }
 

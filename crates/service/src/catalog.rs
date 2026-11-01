@@ -1,12 +1,13 @@
 //! Self-description for agents: inline control syntax, emotions, languages, parameter ranges,
 //! error codes, and JSON Schemas. Served by `itts schema` and the MCP `describe_controls` tool.
 
-use index_tts_rs_core::config::EMOTION_NAMES;
+use index_tts_rs_core::config::{DEFAULT_SAMPLE_RATE, EMOTION_NAMES, HIFI_SAMPLE_RATE};
 use schemars::{JsonSchema, Schema, schema_for};
 use serde::Serialize;
 use serde_json::{Value, to_value};
 
 use crate::{
+    annotation::{AnnotateJob, AnnotateResult},
     error::{ErrorCode, ServiceError},
     events::JobEvent,
     request::{MAX_SILENCE_MS, MAX_SPEED, MIN_SPEED, SpeechJob},
@@ -63,6 +64,9 @@ pub struct Catalog {
     pub speed_range: [f32; 2],
     /// Upper bound for pauses and silences in milliseconds.
     pub max_silence_ms: u32,
+    /// Accepted `sampleRate` values in Hz (`48000` is bandwidth-extended and needs the extender
+    /// weights from `itts models pull`).
+    pub sample_rates: Vec<u32>,
     /// Stable error codes.
     pub errors: Vec<ErrorSpec>,
 }
@@ -128,6 +132,7 @@ pub fn catalog() -> Catalog {
         languages: vec!["zh", "en", "ja", "yue", "es", "ar", "zh/en"],
         speed_range: [MIN_SPEED, MAX_SPEED],
         max_silence_ms: MAX_SILENCE_MS,
+        sample_rates: vec![DEFAULT_SAMPLE_RATE, HIFI_SAMPLE_RATE],
         errors,
     }
 }
@@ -142,6 +147,10 @@ pub enum SchemaKind {
     Events,
     /// The [`ServiceError`] body.
     Error,
+    /// The [`AnnotateJob`] request.
+    AnnotateJob,
+    /// The [`AnnotateResult`] response.
+    AnnotateResult,
 }
 
 /// Returns the JSON Schema for `kind`.
@@ -157,6 +166,8 @@ pub fn json_schema(kind: SchemaKind) -> Value {
         SchemaKind::SpeechJob => schema_for!(SpeechJob),
         SchemaKind::Events => schema_for!(JobEvent),
         SchemaKind::Error => schema_for!(ServiceError),
+        SchemaKind::AnnotateJob => schema_for!(AnnotateJob),
+        SchemaKind::AnnotateResult => schema_for!(AnnotateResult),
     };
     to_value(schema).unwrap_or(Value::Null)
 }

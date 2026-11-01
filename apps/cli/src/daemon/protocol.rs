@@ -9,11 +9,14 @@
 use std::path::PathBuf;
 
 use index_tts_rs_core::{engine::TelemetrySnapshot, voice::VoiceEntry};
-use index_tts_rs_service::{ChunkInfo, JobEvent, JobStarted, JobSummary, ServiceError, SpeechJob};
+use index_tts_rs_service::{
+    AnnotateJob, AnnotateResult, ApiKey, ChunkInfo, JobEvent, JobStarted, JobSummary, ServiceError,
+    SpeechJob,
+};
 use serde::{Deserialize, Serialize};
 
 /// Protocol version; bumped on any incompatible wire change.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 /// Maximum accepted request line length in bytes.
 pub const MAX_LINE_BYTES: usize = 256 * 1024;
 
@@ -46,6 +49,15 @@ pub enum Request {
     Cancel {
         /// Request `id` to cancel.
         target: u64,
+    },
+    /// Choose a delivery per unit; `apiKey` overrides the daemon's `DEEPSEEK_API_KEY`.
+    #[serde(rename_all = "camelCase")]
+    Annotate {
+        /// Units to direct.
+        job: Box<AnnotateJob>,
+        /// Provider key for this request only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<ApiKey>,
     },
     /// Extract and register a voice using the resident models.
     #[serde(rename_all = "camelCase")]
@@ -196,6 +208,8 @@ pub enum Response {
         /// Registered voice.
         voice: Box<VoiceEntry>,
     },
+    /// Deliveries chosen for an `annotate` request.
+    Annotated(Box<AnnotateResult>),
     /// Job planned.
     Started(JobStarted),
     /// Job chunk.
@@ -313,6 +327,22 @@ mod tests {
                 ..
             }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_accept_annotate_requests_without_leaking_the_key() -> serde_json::Result<()> {
+        let envelope: RequestEnvelope = from_str(
+            r#"{"id":4,"method":"annotate","job":{"units":[{"id":"a","text":"你好。"}]},"apiKey":"sk-secret"}"#,
+        )?;
+        assert!(matches!(
+            envelope.request,
+            Request::Annotate {
+                api_key: Some(_),
+                ..
+            }
+        ));
+        assert!(!format!("{envelope:?}").contains("sk-secret"));
         Ok(())
     }
 

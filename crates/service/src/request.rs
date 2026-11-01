@@ -6,16 +6,19 @@
 //! all deserialize into this one type, so they share identical semantics.
 
 use std::{
+    hash::{BuildHasher, Hasher, RandomState},
     num::NonZeroU32,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use index_tts_rs_core::{
     config::{
         CfgRate, CfmParams, DurationFactor, EmoAlpha, EmotionVector, EngineConfig, Language,
-        RepetitionPenalty, SamplingParams, SpeakerSource, SynthesisRequest, SynthesisText,
-        Temperature, TopK, TopP, VoiceId, validate_safe_file_path,
+        RepetitionPenalty, SampleRate, SamplingParams, SpeakerSource, SpeechContext,
+        SynthesisRequest, SynthesisText, Temperature, TopK, TopP, VoiceId, validate_safe_file_path,
     },
     voice::{VoiceStore, default_voices_dir},
 };
@@ -24,7 +27,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
-use crate::error::{ErrorCode, ServiceError};
+use crate::{
+    error::{ErrorCode, ServiceError},
+    transcript::Transcript,
+};
 
 /// Default silence between explicit paragraphs, in milliseconds.
 pub const DEFAULT_PARAGRAPH_PAUSE_MS: u32 = 600;
@@ -77,7 +83,7 @@ pub struct SpeechJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(setter(into))]
     pub lang: Option<String>,
-    /// Speaking rate multiplier (`0.25..=4.0`, default `1.0`; larger is faster).
+    /// Speaking rate multiplier (`0.25..=4.0`, default from config: `1.2`; larger is faster).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed: Option<f32>,
     /// Silence between blank-line separated paragraphs (`0..=5000` ms, default `600`).
@@ -89,10 +95,39 @@ pub struct SpeechJob {
     /// Write the result to this `.wav` path (the parent directory must exist).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_path: Option<PathBuf>,
+    /// Output sample rate: `22050` (native) or `48000` (bandwidth-extended; needs the extender
+    /// weights from `itts models pull`). Default from config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<u32>,
+    /// Continue each sentence after the previous one instead of starting every sentence as a
+    /// fresh utterance: intonation, pace, and pauses carry across sentence and paragraph
+    /// boundaries (same voice and language). Inter-sentence silence defaults to `0` because
+    /// the model speaks its own pauses.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[builder(setter(!strip_option))]
+    pub continuity: bool,
+    /// Text spoken just before `input` (for example the previous script line synthesized in
+    /// another job), at most 16 KiB without controls. The first sentence continues after it;
+    /// only its last sentence is used and it is not spoken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(setter(into))]
+    pub previous_text: Option<String>,
+    /// Return per-character timings (`alignment`) and sentence timings (`sentences`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[builder(setter(!strip_option))]
+    pub timestamps: bool,
     /// Low-level sampling and solver overrides; omitted fields use the configured defaults.
     #[serde(default, skip_serializing_if = "AdvancedOptions::is_empty")]
     #[builder(setter(!strip_option))]
     pub advanced: AdvancedOptions,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if signature"
+)]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Low-level GPT sampling and CFM solver overrides.
@@ -104,7 +139,8 @@ pub struct AdvancedOptions {
     /// Deterministic greedy (`argmax`) decoding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub greedy: Option<bool>,
-    /// RNG seed for reproducible output.
+    /// RNG seed for reproducible output. When omitted a random seed is drawn and reported in
+    /// the job summary, so any result can be reproduced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
     /// Sampling temperature (`0.05..=2.0`).
@@ -158,6 +194,16 @@ pub enum PathPolicy {
 pub struct PreparedJob {
     /// Utterances to synthesize in order, with their leading pauses.
     pub plan: Vec<PlannedUtterance>,
+    /// Where each utterance came from in the script, for projecting timings.
+    pub transcript: Arc<Transcript>,
+    /// Seed driving GPT sampling and CFM noise for every utterance.
+    pub seed: u64,
+    /// Whether character timings were requested.
+    pub timestamps: bool,
+    /// Output sample rate of every chunk.
+    pub sample_rate: SampleRate,
+    /// Whether consecutive utterances continue after one another.
+    pub continuity: bool,
     /// Where to write the assembled WAV, if requested.
     pub output_path: Option<PathBuf>,
     /// Human-readable speaker of the first utterance (voice ID or file name).
@@ -246,38 +292,71 @@ impl SpeechJob {
             Some(spec) => EmotionVector::parse_spec(spec)?,
             None => None,
         };
+        let default_interval = if self.continuity {
+            0
+        } else {
+            config.interval_silence_ms
+        };
         let interval_silence_ms = bounded_silence(
             "intervalSilenceMs",
-            self.interval_silence_ms
-                .unwrap_or(config.interval_silence_ms),
+            self.interval_silence_ms.unwrap_or(default_interval),
         )?;
+        let context = self.previous_context()?;
         let paragraph_pause_ms = bounded_silence(
             "paragraphPauseMs",
             self.paragraph_pause_ms
                 .unwrap_or(DEFAULT_PARAGRAPH_PAUSE_MS),
         )?;
 
+        let sample_rate = self
+            .sample_rate
+            .map_or(Ok(config.sample_rate), SampleRate::try_from)?;
+        let mut sampling = self.advanced.sampling(config)?;
+        let seed = sampling.seed.unwrap_or_else(random_seed);
+        sampling.seed = Some(seed);
         let base = SynthesisRequest::builder()
             .text(text)
             .speaker(speaker)
             .language(language)
-            .sampling(self.advanced.sampling(config)?)
+            .sampling(sampling)
             .cfm(self.cfm(config)?)
             .max_text_tokens_per_segment(self.advanced.max_text_tokens(config)?)
             .interval_silence_ms(interval_silence_ms)
             .emo_audio_path(self.emo_ref.clone())
             .emo_alpha(EmoAlpha::new(self.emo_alpha.unwrap_or(1.0))?)
             .emo_vector(emo_vector)
+            .align(self.timestamps)
+            .sample_rate(sample_rate)
+            .continuity(self.continuity)
             .build();
         let label = speaker_label(&base.speaker);
-        let plan = plan_utterances(&base, paragraph_pause_ms)?;
-        ensure_voices_registered(config, &plan)?;
+        let mut reading = plan_utterances(&base, paragraph_pause_ms)?;
+        ensure_voices_registered(config, &reading.utterances)?;
+        if let Some(first) = reading.utterances.first_mut() {
+            first.request.context = context;
+        }
+        let transcript = Arc::new(Transcript::new(self.input.as_str(), &reading));
         Ok(PreparedJob {
-            plan,
+            plan: reading.utterances,
+            transcript,
+            seed,
+            timestamps: self.timestamps,
+            sample_rate,
+            continuity: self.continuity,
             output_path: self.output_path.clone(),
             speaker: label,
             language,
         })
+    }
+
+    fn previous_context(&self) -> Result<SpeechContext, ServiceError> {
+        match self.previous_text.as_deref() {
+            None => Ok(SpeechContext::None),
+            Some(text) if text.contains("[[") => Err(ServiceError::invalid(
+                "previousText must be plain text without [[controls]]",
+            )),
+            Some(text) => Ok(SpeechContext::Text(SynthesisText::new(text)?)),
+        }
     }
 
     fn check_paths(&self, policy: PathPolicy) -> Result<(), ServiceError> {
@@ -421,6 +500,18 @@ pub fn resolve_input_path(base: &Path, path: &Path, field: &str) -> Result<PathB
     })
 }
 
+/// Draws a fresh seed from the process's randomly keyed hasher; reproducibility comes from
+/// reporting it, not from its quality, so OS-seeded `SipHash` keys suffice.
+fn random_seed() -> u64 {
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u128(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos()),
+    );
+    hasher.finish()
+}
+
 fn bounded(field: &str, value: u32, min: u32, max: u32) -> Result<u32, ServiceError> {
     if (min..=max).contains(&value) {
         Ok(value)
@@ -502,7 +593,9 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use index_tts_rs_core::config::{EngineConfig, Language, SpeakerSource, VoiceId};
+    use index_tts_rs_core::config::{
+        EngineConfig, Language, SpeakerSource, SpeechContext, VoiceId,
+    };
     use rstest::rstest;
     use serde_json::{Value, from_str, from_value, json};
     use tempfile::TempDir;
@@ -551,6 +644,53 @@ mod tests {
         assert_eq!(second.pause_before_ms, 900);
         assert!(second.request.emo_vector.is_some());
         assert!((second.request.cfm.duration_factor.get() - 0.5).abs() < f32::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_continue_only_the_first_utterance_after_previous_text()
+    -> Result<(), Box<dyn Error>> {
+        let prepared = prepare(json!({
+            "input": "第一段。\n\n第二段。",
+            "voice": "narrator",
+            "continuity": true,
+            "previousText": "上一句。"
+        }))?;
+        assert!(prepared.continuity);
+        let contexts: Vec<bool> = prepared
+            .plan
+            .iter()
+            .map(|part| matches!(part.request.context, SpeechContext::Text(_)))
+            .collect();
+        assert_eq!(contexts, [true, false]);
+        assert!(prepared.plan.iter().all(|part| part.request.continuity));
+        assert!(
+            prepared
+                .plan
+                .iter()
+                .all(|part| part.request.interval_silence_ms == 0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_keep_explicit_interval_and_reject_controls_in_previous_text()
+    -> Result<(), Box<dyn Error>> {
+        let prepared = prepare(json!({
+            "input": "你好。", "voice": "narrator", "continuity": true, "intervalSilenceMs": 150
+        }))?;
+        assert!(
+            prepared
+                .plan
+                .iter()
+                .all(|part| part.request.interval_silence_ms == 150)
+        );
+        let err = prepare(json!({
+            "input": "你好。", "voice": "narrator", "previousText": "[[pause=100]]上一句。"
+        }))
+        .err()
+        .map(|err| err.to_string());
+        assert!(err.is_some_and(|message| message.contains("previousText")));
         Ok(())
     }
 

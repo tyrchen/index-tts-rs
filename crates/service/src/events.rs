@@ -8,7 +8,12 @@ use index_tts_rs_core::engine::{AudioChunk, StageTimings};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{error::ServiceError, request::PreparedJob, run::JobChunk};
+use crate::{
+    error::ServiceError,
+    request::PreparedJob,
+    run::JobChunk,
+    transcript::{Alignment, SentenceTiming},
+};
 
 /// Where a job executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -34,6 +39,8 @@ pub struct JobStarted {
     pub utterances: usize,
     /// Execution backend.
     pub backend: Backend,
+    /// Seed driving this job; pass it as `advanced.seed` to reproduce the audio.
+    pub seed: u64,
 }
 
 impl JobStarted {
@@ -45,6 +52,7 @@ impl JobStarted {
             language: job.language.as_code().to_owned(),
             utterances: job.plan.len(),
             backend,
+            seed: job.seed,
         }
     }
 }
@@ -73,6 +81,15 @@ pub struct ChunkInfo {
     /// Per-stage timings in milliseconds.
     #[schemars(with = "BTreeMap<String, f64>")]
     pub timings: StageTimings,
+    /// Where this chunk (including its leading silence) starts in the job audio, in seconds.
+    pub start_secs: f32,
+    /// The spoken text this chunk reads, including its closing punctuation.
+    pub text: String,
+    /// Character index of `text` within the job's spoken text (the script without controls).
+    pub text_offset: usize,
+    /// Character timings of `text` on the job timeline, when `timestamps` was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alignment: Option<Alignment>,
     /// Base64 little-endian `i16` mono PCM, present only when the client asked for audio.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pcm_base64: Option<String>,
@@ -91,6 +108,10 @@ impl ChunkInfo {
             duration_secs: audio.duration_secs(),
             mel_tokens: audio.mel_tokens,
             timings: audio.timings,
+            start_secs: chunk.start_secs,
+            text: chunk.text.clone(),
+            text_offset: chunk.text_offset,
+            alignment: chunk.alignment.clone(),
             pcm_base64: include_pcm.then(|| encode_pcm(&audio.pcm_i16)),
         }
     }
@@ -116,6 +137,10 @@ impl ChunkInfo {
         Ok(JobChunk {
             utterance_index: self.utterance_index,
             total_utterances: self.total_utterances,
+            start_secs: self.start_secs,
+            text: self.text,
+            text_offset: self.text_offset,
+            alignment: self.alignment,
             audio: AudioChunk::new(
                 self.segment_index,
                 self.total_segments,
@@ -157,6 +182,14 @@ pub struct JobSummary {
     /// Aggregated per-stage timings in milliseconds.
     #[schemars(with = "BTreeMap<String, f64>")]
     pub timings: StageTimings,
+    /// Seed that produced this audio; pass it as `advanced.seed` to reproduce it.
+    pub seed: u64,
+    /// Character timings over the spoken text, when `timestamps` was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alignment: Option<Alignment>,
+    /// Sentence timings derived from `alignment`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sentences: Vec<SentenceTiming>,
 }
 
 /// One event of a job stream.
@@ -188,19 +221,32 @@ mod tests {
     use serde_json::{from_value, json, to_value};
 
     use super::{ChunkInfo, JobEvent};
-    use crate::{ErrorCode, ServiceError, run::JobChunk};
+    use crate::{ErrorCode, ServiceError, run::JobChunk, transcript::Alignment};
 
     #[test]
-    fn test_should_round_trip_pcm_through_chunk_events() -> Result<(), ServiceError> {
+    fn test_should_round_trip_pcm_text_and_alignment_through_chunk_events()
+    -> Result<(), ServiceError> {
+        let alignment = Alignment {
+            text: "你好。".to_owned(),
+            start: vec![1.0, 1.2, 1.4],
+            end: vec![1.2, 1.4, 1.5],
+        };
         let chunk = JobChunk {
             utterance_index: 1,
             total_utterances: 2,
             audio: AudioChunk::new(0, 3, vec![-2, 0, 32767], 22050, 7, StageTimings::default()),
+            start_secs: 0.8,
+            text: "你好。".to_owned(),
+            text_offset: 4,
+            alignment: Some(alignment.clone()),
         };
         let info: ChunkInfo = chunk.info(true);
         let restored = info.into_job_chunk()?;
         assert_eq!(restored.audio.pcm_i16, vec![-2, 0, 32767]);
         assert_eq!(restored.utterance_index, 1);
+        assert_eq!(restored.text, "你好。");
+        assert_eq!(restored.text_offset, 4);
+        assert_eq!(restored.alignment, Some(alignment));
         Ok(())
     }
 

@@ -19,7 +19,8 @@ use index_tts_rs_core::{
 };
 use index_tts_rs_director::{Director, DirectorConfig};
 use index_tts_rs_service::{
-    Catalog, ErrorCode, JobEvent, JobSummary, ServiceError, SpeechJob, catalog, resolve_input_path,
+    AnnotateJob, AnnotateResult, Catalog, ErrorCode, JobEvent, JobSummary, ServiceError, SpeechJob,
+    catalog, resolve_input_path,
 };
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
@@ -149,7 +150,9 @@ fn tools() -> Vec<Tool> {
         tool::<SpeechJob>(
             "synthesize",
             "Synthesize speech to a 22.05 kHz mono WAV at outputPath. Supports inline controls \
-             and emotion; returns duration, RTF, and the absolute output path.",
+             and emotion; returns duration, RTF, the absolute output path, and the seed that \
+             reproduces the take. Set timestamps:true for per-character `alignment` and \
+             per-sentence `sentences` timings.",
             writes.clone(),
         )
         .with_raw_output_schema(schema_for_output::<JobSummary>()),
@@ -182,6 +185,15 @@ fn tools() -> Vec<Tool> {
              (requires DEEPSEEK_API_KEY). Feed the result to synthesize.",
             read_only.clone().open_world(true),
         ),
+        tool::<AnnotateJob>(
+            "annotate_units",
+            "Ask DeepSeek for one delivery per unit you supply (e.g. one per script line): emo, \
+             temperature, speed, pauseAfterMs, and the same as inline controls. Units keep your \
+             ids and text is never rewritten; copy each delivery into a synthesize call. Requires \
+             DEEPSEEK_API_KEY.",
+            read_only.clone().open_world(true),
+        )
+        .with_raw_output_schema(schema_for_output::<AnnotateResult>()),
         tool::<NoArgs>(
             "status",
             "Environment and daemon readiness: platform, model, voices, daemon, annotation, audio \
@@ -296,6 +308,10 @@ impl IttsMcp {
                 let script = director.annotate(&args.input, args.poetry).await?;
                 Ok(json!({ "script": script }))
             }
+            "annotate_units" => {
+                let job: AnnotateJob = parse(name, args)?;
+                json_value(&job.run(DirectorConfig::default(), None).await?)
+            }
             "status" => {
                 parse::<NoArgs>(name, args)?;
                 json_value(&doctor::collect(&self.config, &self.launch.paths.socket).await)
@@ -318,7 +334,7 @@ impl IttsMcp {
         let playback = if play { Some(Playback::start()?) } else { None };
         let mut client = self.client().await?;
 
-        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<(f64, f64)>();
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<(f64, f64, String)>();
         let synth = async {
             // Owning the sender here closes the channel when synthesis ends, which ends `forward`.
             let progress_tx = progress_tx;
@@ -329,7 +345,7 @@ impl IttsMcp {
                         done += 1.0;
                         let total = (info.total_segments * info.total_utterances).max(1);
                         #[allow(clippy::cast_precision_loss, reason = "segment counts are small")]
-                        let _ = progress_tx.send((done, total as f64));
+                        let _ = progress_tx.send((done, total as f64, info.text.clone()));
                         if let Some(playback) = &playback {
                             let chunk = info.into_job_chunk()?;
                             playback.enqueue(chunk.audio.pcm_i16, chunk.audio.sample_rate)?;
@@ -341,14 +357,14 @@ impl IttsMcp {
         };
         let token = context.meta.get_progress_token();
         let forward = async {
-            while let Some((done, total)) = progress_rx.recv().await {
+            while let Some((done, total, text)) = progress_rx.recv().await {
                 if let Some(token) = &token {
                     let _ = context
                         .peer
                         .notify_progress(
                             ProgressNotificationParam::new(token.clone(), done)
                                 .with_total(total.max(done))
-                                .with_message(format!("synthesized segment {done:.0}")),
+                                .with_message(format!("synthesized segment {done:.0}: {text}")),
                         )
                         .await;
                 }

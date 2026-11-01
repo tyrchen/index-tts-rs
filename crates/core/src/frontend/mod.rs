@@ -14,5 +14,5 @@ pub use parser::{
     apply_pronunciation_annotations, correct_pinyin, has_cjk_ideograph, is_kana,
     split_atomic_pieces, uppercase_special_tokens,
 };
-pub use splitter::Frontend;
-pub use tokenizer::{TIKTOKEN_VOCAB_FILENAME, TiktokenTokenizer};
+pub use splitter::{Frontend, PreparedSegment, PreparedText};
+pub use tokenizer::{TIKTOKEN_VOCAB_FILENAME, TiktokenTokenizer, TokenSpan};

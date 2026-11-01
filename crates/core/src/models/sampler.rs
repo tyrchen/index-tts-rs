@@ -283,17 +283,29 @@ pub fn sample_next_token(
     Ok(candidates.last().map_or(0, |&(id, _)| id))
 }
 
+/// Inputs that condition one run of Mel code generation.
+#[derive(Debug, Clone, Copy)]
+pub struct CodePrompt<'a> {
+    /// Text token IDs (language prefix included).
+    pub text_tokens: &'a [i32],
+    /// `[1, 3, 1280]` speaker/emotion conditioning.
+    pub conds: &'a Array,
+    /// Language token ID.
+    pub lang_id: i32,
+    /// Codes already spoken for the beginning of `text_tokens`; generation continues after
+    /// them. Empty for a fresh utterance.
+    pub prior_codes: &'a [i32],
+    /// Fewest new codes before [`STOP_MEL_TOKEN`] may be sampled. Continuations need it: the
+    /// prior codes end where an utterance ended, so the model is inclined to stop at once.
+    pub min_codes: usize,
+}
+
 /// Generates discrete semantic Mel codes (`0..8192`) autoregressively using [`Gpt`] until
 /// [`STOP_MEL_TOKEN`] (`8193`) or `params.max_mel_tokens` is reached.
 ///
 /// # Errors
 ///
 /// Returns [`IndexTtsError`] if prefill or step decoding fails.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss
-)]
 pub fn generate_codes(
     gpt: &Gpt,
     text_tokens: &[i32],
@@ -303,19 +315,65 @@ pub fn generate_codes(
     params: &SamplingParams,
     rng: &mut SamplerRng,
 ) -> Result<Vec<i32>> {
-    let max_steps = (params.max_mel_tokens as usize).min(GPT_MEL_POS_LEN.saturating_sub(3));
+    let prompt = CodePrompt {
+        text_tokens,
+        conds,
+        lang_id,
+        prior_codes: &[],
+        min_codes: 0,
+    };
+    generate_codes_after(gpt, &prompt, cache, params, rng)
+}
+
+/// Generates the Mel codes that follow `prompt.prior_codes` (only the new codes are returned).
+/// Prior codes count toward the positional capacity but not toward the repetition penalty.
+///
+/// # Errors
+///
+/// Returns [`IndexTtsError::Validation`] if no positions remain, or [`IndexTtsError`] if
+/// prefill or step decoding fails.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+pub fn generate_codes_after(
+    gpt: &Gpt,
+    prompt: &CodePrompt<'_>,
+    cache: &mut KvCache,
+    params: &SamplingParams,
+    rng: &mut SamplerRng,
+) -> Result<Vec<i32>> {
+    let prior = prompt.prior_codes.len();
+    let max_steps = (params.max_mel_tokens as usize)
+        .min(GPT_MEL_POS_LEN.saturating_sub(3).saturating_sub(prior));
     if max_steps == 0 {
         return Err(IndexTtsError::validation(
             "max_mel_tokens",
-            "max_mel_tokens must be >= 1",
+            "no Mel positions left to generate (max_mel_tokens is 0 or the prior codes fill the \
+             capacity)",
         ));
     }
 
-    let mut logits = gpt.prefill(text_tokens, conds, lang_id, cache)?;
+    let mut logits = gpt.prefill_after(
+        prompt.text_tokens,
+        prompt.conds,
+        prompt.lang_id,
+        prompt.prior_codes,
+        cache,
+    )?;
+    // The repetition penalty guards the new codes against loops; prior codes were already
+    // spoken, and penalizing them pushes the continuation toward unusual phone codes (an audible
+    // accent, ~1.6x the error rate in testing).
     let mut seen = SeenTokenBitSet::new_with_initial_tokens();
     let mut codes = Vec::with_capacity(max_steps.min(512));
 
     for step in 0..max_steps {
+        if codes.len() < prompt.min_codes
+            && let Some(stop) = logits.get_mut(STOP_MEL_TOKEN as usize)
+        {
+            *stop = f32::NEG_INFINITY;
+        }
         let tok = sample_next_token(&mut logits, &seen, params, rng)?;
         if tok == STOP_MEL_TOKEN {
             break;
@@ -325,7 +383,7 @@ pub fn generate_codes(
             seen.insert(tok as usize);
         }
         if step + 1 < max_steps {
-            let pos_idx = (step as i32) + 2;
+            let pos_idx = (prior + step) as i32 + 2;
             logits = gpt.step(cache, tok, pos_idx)?;
         }
     }

@@ -12,7 +12,7 @@ description: >-
 
 # `itts` Speech Synthesis & Emotional Prosody Director Skill
 
-`itts` is the native Rust + MLX Metal CLI for **IndexTTS-2.5** on Apple Silicon (`22050 Hz` 16-bit mono WAV, zero-shot voice cloning, 8-class emotion conditioning, and inline prosody controls).
+`itts` is the native Rust + MLX Metal CLI for **IndexTTS-2.5** on Apple Silicon (`22050 Hz` 16-bit mono WAV, or `48000 Hz` with `--sample-rate 48000`; zero-shot voice cloning, 8-class emotion conditioning, inline prosody controls, and per-character timestamps).
 
 ## 1. Start Here: Diagnose, Then Use JSON
 
@@ -93,9 +93,14 @@ itts annotate --stdin --poetry < poem.txt > poem.itts.txt
 itts synth --voice tyr --stdin --out poem.wav --output json < poem.itts.txt
 ```
 
-Useful flags: `--speed 0.9` (larger is faster), `--emo "calm:0.6"`, `--lang en`, `--paragraph-pause 800`, `--seed 7` / `--greedy` for reproducibility. Unset options use the config defaults.
+Useful flags: `--speed 0.9` (larger is faster), `--emo "calm:0.6"`, `--lang en`, `--paragraph-pause 800`, `--seed 7` / `--greedy` for reproducibility, `--sample-rate 48000` for full-band audio (bandwidth-extended above 10 kHz; needs `itts models pull`). Unset options use the config defaults.
 
-`--output json` prints one summary (`status`, `backend`, `durationSecs`, `synthesisSecs`, `rtf`, `segments`, `outputPath`). `--output jsonl` streams `started` → `chunk`… → `done` events, one per line, for progress tracking.
+`--output json` prints one summary (`status`, `backend`, `durationSecs`, `synthesisSecs`, `rtf`, `segments`, `outputPath`, `seed`). `--output jsonl` streams `started` → `chunk`… → `done` events, one per line; each `chunk` carries the `text` it reads and its `startSecs` in the output.
+
+- **Reproducible takes:** every result reports `seed`. Passing it back with `--seed` reproduces the audio bit for bit, so audition several takes and keep the seed of the one you like.
+- **Continuity:** `--continuity` makes each sentence continue after the previous one (no "fresh start" at every sentence); for line-by-line scripts pass the previous line with `--previous-text`. Off by default — audition before adopting.
+- **Per-line direction:** `itts annotate --units --stdin --output json < lines.json` takes `{"units":[{"id","text"}],"brief"?}` and returns per-line `emo`, `temperature`, `speed`, `pauseAfterMs`, and `controls` (MCP tool `annotate_units`). Copy them into each line's synth call.
+- **Timestamps:** `--timestamps` adds `alignment` (`text` without control tags, plus per-character `start`/`end` seconds indexed by Unicode scalar) and `sentences` (`text`, `start`, `end`). Use them for subtitles, cutting one file into per-sentence clips, or syncing visuals to a word.
 
 ## 5. Directing Emotion, Tone Temperature, Speed & Pauses
 
@@ -113,7 +118,7 @@ Controls are stateful and apply to all subsequent utterances until changed or re
 |---|---|---|
 | `[[emo=...]]` | `name:weight,...` (`0.0..=1.0`, sum auto-capped `<= 0.8`) or `none` | Blends the 8 IndexTTS-2.5 emotion prototypes matched to the speaker's timbre |
 | `[[temp=...]]` | `0.05..=2.0` (default `0.80`) | GPT sampling temperature: `0.68..0.75` restrained/intimate; `0.78..0.84` warm narrative; `0.85..0.92` dramatic/exclamatory |
-| `[[speed=...]]` | `0.25..=4.0` (default `1.0`) | Speaking rate multiplier (`0.82..0.94` for slow poetic/solemn lines; `1.02..1.15` for brisk lines) |
+| `[[speed=...]]` | `0.25..=4.0` (relative to the job speed, default `1.2`) | Speaking rate multiplier (`0.82..0.94` for slow poetic/solemn lines; `1.02..1.15` for brisk lines) |
 | `[[pause=...]]` | `0..=5000` (`ms` optional) | Exact digital silence inserted before the next spoken unit (`350..650` intra-stanza turn; `750..1200` stanza break) |
 | `[[voice=...]]` | `<voice_id>` | Switches speaker mid-script (e.g. multi-character dialogue) |
 | `[[lang=...]]` | `zh`, `en`, `zh/en`, `ja`, `yue`, `es`, `ar` | Switches synthesis language |
@@ -137,7 +142,7 @@ For detailed calibration guidelines and complete poetry/dialogue templates (such
 
 ## 6. MCP Server
 
-`itts mcp` serves the Model Context Protocol over stdio and shares the daemon (starting it on first use), so multiple agent sessions share one resident model. Tools: `status`, `describe_controls`, `synthesize` (requires `outputPath`), `speak`, `list_voices`, `inspect_voice`, `register_voice`, `remove_voice`, `annotate`. Tool arguments use the same fields as `itts schema speech-job` (`input`, `voice`, `voiceFile`, `refAudio`, `emo`, `lang`, `speed`, `paragraphPauseMs`, `outputPath`, `advanced`). Failures are `isError` results whose structured content is `{code, message, hint}`. Long jobs report `notifications/progress` per segment and honor cancellation.
+`itts mcp` serves the Model Context Protocol over stdio and shares the daemon (starting it on first use), so multiple agent sessions share one resident model. Tools: `status`, `describe_controls`, `synthesize` (requires `outputPath`), `speak`, `list_voices`, `inspect_voice`, `register_voice`, `remove_voice`, `annotate`, `annotate_units`. Tool arguments use the same fields as `itts schema speech-job` (`input`, `voice`, `voiceFile`, `refAudio`, `emo`, `lang`, `speed`, `paragraphPauseMs`, `outputPath`, `sampleRate`, `timestamps`, `continuity`, `previousText`, `advanced`). Failures are `isError` results whose structured content is `{code, message, hint}`. Long jobs report `notifications/progress` per segment and honor cancellation.
 
 ## 7. Verification
 

@@ -19,9 +19,7 @@ use mlx_rs::Array;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{
-        DEFAULT_MAX_REF_SECONDS, DEFAULT_SAMPLE_RATE, EmoAlpha, VoiceId, validate_safe_file_path,
-    },
+    config::{DEFAULT_SAMPLE_RATE, EmoAlpha, MAX_REF_SECONDS, VoiceId, validate_safe_file_path},
     dsp::{
         FBANK_SAMPLE_RATE, campplus_fbank, decode_audio_bytes, mel_spectrogram, resample_sinc_hann,
         truncate_ref_audio, w2v_features,
@@ -35,11 +33,9 @@ use crate::{
 pub const DEFAULT_VOICES_SUBDIR: &str = ".cache/index-tts-rs/voices";
 
 /// Maximum number of 22,050 Hz samples retained from reference audio (`15 * 22050 = 330,750`).
-pub const MAX_REF_SAMPLES_22K: usize =
-    (DEFAULT_MAX_REF_SECONDS as usize) * (DEFAULT_SAMPLE_RATE as usize);
+pub const MAX_REF_SAMPLES_22K: usize = (MAX_REF_SECONDS as usize) * (DEFAULT_SAMPLE_RATE as usize);
 /// Maximum number of 16,000 Hz samples retained from reference audio (`15 * 16000 = 240,000`).
-pub const MAX_REF_SAMPLES_16K: usize =
-    (DEFAULT_MAX_REF_SECONDS as usize) * (FBANK_SAMPLE_RATE as usize);
+pub const MAX_REF_SAMPLES_16K: usize = (MAX_REF_SECONDS as usize) * (FBANK_SAMPLE_RATE as usize);
 
 /// Summary descriptor for a registered `.itts_voice` snapshot in [`VoiceStore`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -214,16 +210,15 @@ impl VoiceExtractor {
         emo_alpha: EmoAlpha,
         regulator: &LengthRegulator,
     ) -> Result<SpeakerContext> {
-        let wav_22k = truncate_ref_audio(audio_22k, DEFAULT_SAMPLE_RATE, DEFAULT_MAX_REF_SECONDS);
-        let wav_16k = truncate_ref_audio(audio_16k, FBANK_SAMPLE_RATE, DEFAULT_MAX_REF_SECONDS);
+        let wav_22k = truncate_ref_audio(audio_22k, DEFAULT_SAMPLE_RATE, MAX_REF_SECONDS);
+        let wav_16k = truncate_ref_audio(audio_16k, FBANK_SAMPLE_RATE, MAX_REF_SECONDS);
 
         // 1. W2V-BERT semantic conditioning features [1, Te, 1024]
         let (spk_cond_emb, spk_frames) = self.encode_semantic(wav_16k)?;
 
         // 2. Emotion vector [1, 1280]
         let emovec_arr = if let Some(emo_16k) = emo_audio_16k {
-            let emo_trimmed =
-                truncate_ref_audio(emo_16k, FBANK_SAMPLE_RATE, DEFAULT_MAX_REF_SECONDS);
+            let emo_trimmed = truncate_ref_audio(emo_16k, FBANK_SAMPLE_RATE, MAX_REF_SECONDS);
             let (emo_cond_emb, emo_frames) = self.encode_semantic(emo_trimmed)?;
             self.emo_vec.forward(&emo_cond_emb, &[emo_frames])?
         } else {
@@ -309,8 +304,8 @@ impl VoiceExtractor {
             _ => None,
         };
 
-        let wav_22k = truncate_ref_audio(&audio_22k, DEFAULT_SAMPLE_RATE, DEFAULT_MAX_REF_SECONDS);
-        let wav_16k = truncate_ref_audio(&audio_16k, FBANK_SAMPLE_RATE, DEFAULT_MAX_REF_SECONDS);
+        let wav_22k = truncate_ref_audio(&audio_22k, DEFAULT_SAMPLE_RATE, MAX_REF_SECONDS);
+        let wav_16k = truncate_ref_audio(&audio_16k, FBANK_SAMPLE_RATE, MAX_REF_SECONDS);
 
         // 1. Load & run SemanticModel, then drop it immediately (~859 MB freed)
         let (spk_cond_emb, spk_frames, emo_cond_opt) = {
@@ -319,8 +314,7 @@ impl VoiceExtractor {
             let (spk_emb, spk_f) = Self::encode_semantic_with(&semantic_model, wav_16k)?;
             spk_emb.eval()?;
             let emo_opt = if let Some(emo_pcm) = emo_16k.as_deref() {
-                let emo_trimmed =
-                    truncate_ref_audio(emo_pcm, FBANK_SAMPLE_RATE, DEFAULT_MAX_REF_SECONDS);
+                let emo_trimmed = truncate_ref_audio(emo_pcm, FBANK_SAMPLE_RATE, MAX_REF_SECONDS);
                 let (emo_emb, emo_f) = Self::encode_semantic_with(&semantic_model, emo_trimmed)?;
                 emo_emb.eval()?;
                 Some((emo_emb, emo_f))

@@ -5,7 +5,7 @@
 //! and executes linear-time regex pre-tokenization + byte-pair merging with 100%
 //! bit-exact parity against Python `tiktoken`.
 
-use std::{collections::HashMap, fs, path::Path, sync::LazyLock};
+use std::{collections::HashMap, fs, ops::Range, path::Path, sync::LazyLock};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use regex::Regex;
@@ -67,6 +67,15 @@ static PRETOKEN_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+")
         .unwrap_or_else(|_| unreachable!())
 });
+
+/// One encoded token and the byte range of the source text it covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenSpan {
+    /// Token ID.
+    pub id: u32,
+    /// Byte range within the encoded text.
+    pub bytes: Range<usize>,
+}
 
 /// Pure-Rust Tiktoken BPE tokenizer for IndexTTS-2.5.
 #[derive(Debug, Clone)]
@@ -203,6 +212,34 @@ impl TiktokenTokenizer {
     /// ```
     #[must_use]
     pub fn encode_with_special(&self, text: &str) -> Vec<u32> {
+        self.encode_with_offsets(text)
+            .into_iter()
+            .map(|token| token.id)
+            .collect()
+    }
+
+    /// Encodes `text` like [`Self::encode_with_special`], also returning the byte range of
+    /// `text` each token covers. Ranges are non-overlapping and ascending; a byte-level token
+    /// may cover part of a multi-byte character.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use index_tts_rs_core::{
+    ///     frontend::tokenizer::{TIKTOKEN_VOCAB_FILENAME, TiktokenTokenizer},
+    ///     models::resolve_model_dir,
+    /// };
+    ///
+    /// if let Ok(dir) = resolve_model_dir(None, "yunfengwang/IndexTTS-2.5-mlx") {
+    ///     let tok = TiktokenTokenizer::from_path(dir.join(TIKTOKEN_VOCAB_FILENAME))?;
+    ///     let tokens = tok.encode_with_offsets("<|zh|> 大家好");
+    ///     assert_eq!(tokens.first().map(|t| t.bytes.clone()), Some(0..6));
+    ///     assert_eq!(tokens.last().map(|t| t.bytes.end), Some(16));
+    /// }
+    /// # Ok::<(), index_tts_rs_core::error::IndexTtsError>(())
+    /// ```
+    #[must_use]
+    pub fn encode_with_offsets(&self, text: &str) -> Vec<TokenSpan> {
         let mut out = Vec::new();
         let mut last_end = 0_usize;
 
@@ -210,10 +247,13 @@ impl TiktokenTokenizer {
             if m.start() > last_end
                 && let Some(ordinary) = text.get(last_end..m.start())
             {
-                self.encode_ordinary_into(ordinary, &mut out);
+                self.encode_ordinary_into(ordinary, last_end, &mut out);
             }
             if let Some(&spec_id) = self.special_tokens.get(m.as_str()) {
-                out.push(spec_id);
+                out.push(TokenSpan {
+                    id: spec_id,
+                    bytes: m.range(),
+                });
             }
             last_end = m.end();
         }
@@ -221,7 +261,7 @@ impl TiktokenTokenizer {
         if last_end < text.len()
             && let Some(tail) = text.get(last_end..)
         {
-            self.encode_ordinary_into(tail, &mut out);
+            self.encode_ordinary_into(tail, last_end, &mut out);
         }
 
         out
@@ -233,7 +273,7 @@ impl TiktokenTokenizer {
         self.encode_with_special(text).len()
     }
 
-    fn encode_ordinary_into(&self, text: &str, out: &mut Vec<u32>) {
+    fn encode_ordinary_into(&self, text: &str, base: usize, out: &mut Vec<TokenSpan>) {
         let mut pos = 0_usize;
         while pos < text.len() {
             let Some(rest) = text.get(pos..) else {
@@ -253,18 +293,21 @@ impl TiktokenTokenizer {
             };
 
             if let Some(piece) = rest.get(..advance_bytes) {
-                self.bpe_encode_piece(piece.as_bytes(), out);
+                self.bpe_encode_piece(piece.as_bytes(), base.saturating_add(pos), out);
             }
             pos = pos.saturating_add(advance_bytes.max(1));
         }
     }
 
-    fn bpe_encode_piece(&self, piece: &[u8], out: &mut Vec<u32>) {
+    fn bpe_encode_piece(&self, piece: &[u8], base: usize, out: &mut Vec<TokenSpan>) {
         if piece.is_empty() {
             return;
         }
         if let Some(&rank) = self.encoder.get(piece) {
-            out.push(rank);
+            out.push(TokenSpan {
+                id: rank,
+                bytes: base..base.saturating_add(piece.len()),
+            });
             return;
         }
         if piece.len() == 1 {
@@ -322,7 +365,10 @@ impl TiktokenTokenizer {
                 && let Some(sub) = piece.get(start..end)
                 && let Some(&rank) = self.encoder.get(sub)
             {
-                out.push(rank);
+                out.push(TokenSpan {
+                    id: rank,
+                    bytes: base.saturating_add(start)..base.saturating_add(end),
+                });
             }
         }
     }

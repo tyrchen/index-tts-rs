@@ -25,6 +25,7 @@ use index_tts_rs_core::{
     engine::{IndexTtsEngine, StartupEvent},
     voice::{VoiceEntry, VoiceStore, default_voices_dir},
 };
+use index_tts_rs_director::DirectorConfig;
 use index_tts_rs_service::{
     Backend, ErrorCode, JobAccumulator, JobRun, JobStarted, JobSummary, PathPolicy, ServiceError,
     SpeechJob,
@@ -622,6 +623,25 @@ async fn dispatch(
             });
             jobs.insert(id, handle);
         }
+        Request::Annotate { job, api_key } => {
+            let Some(slot) = shared.try_acquire_slot() else {
+                send(tx, id, error_response(busy(shared))).await;
+                return;
+            };
+            let (shared, tx) = (Arc::clone(shared), tx.clone());
+            let handle = tasks.spawn(async move {
+                let result = job.run(DirectorConfig::default(), api_key.as_ref()).await;
+                finish_request(
+                    &shared,
+                    &tx,
+                    id,
+                    result.map(|r| Response::Annotated(Box::new(r))),
+                )
+                .await;
+                drop(slot);
+            });
+            jobs.insert(id, handle);
+        }
         Request::VoiceAdd {
             voice_id,
             ref_audio,
@@ -688,8 +708,8 @@ async fn synth(
     }
     let started = Instant::now();
     let output_path = prepared.output_path.clone();
-    let mut acc = JobAccumulator::new(engine.config().sample_rate, output_path.is_some());
-    let mut run = JobRun::new(engine, prepared.plan);
+    let mut acc = JobAccumulator::new(&prepared, output_path.is_some());
+    let mut run = JobRun::new(engine, prepared);
     while let Some(chunk) = run.next_chunk().await? {
         let info = chunk.info(include_pcm);
         acc.push(&chunk);

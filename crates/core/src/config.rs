@@ -29,11 +29,19 @@ pub const MAX_VOICE_ID_BYTES: usize = 64;
 /// Maximum Mel vocabulary size (`8194`).
 pub const MEL_VOCAB_SIZE: u32 = 8_194;
 
-/// Output audio sample rate in Hz (`22050`).
+/// Default speaking rate (`1.2`, i.e. a CFM duration factor of `1 / 1.2`). At `1.0` sentence-
+/// by-sentence narration runs at about 4.8 Chinese characters per second, slower than natural
+/// narration; `1.2` (about 5.7) was preferred in listening tests.
+pub const DEFAULT_SPEED: f32 = 1.2;
+
+/// Native output sample rate of the `BigVGAN` vocoder in Hz (`22050`).
 pub const DEFAULT_SAMPLE_RATE: u32 = 22_050;
 
-/// Maximum reference audio duration in seconds (`15`).
-pub const DEFAULT_MAX_REF_SECONDS: u32 = 15;
+/// Bandwidth-extended output sample rate in Hz (`48000`).
+pub const HIFI_SAMPLE_RATE: u32 = 48_000;
+
+/// Reference audio beyond this many seconds is ignored (`15`, the model's prompt limit).
+pub const MAX_REF_SECONDS: u32 = 15;
 
 /// Default GPT text positional embedding capacity (`602`).
 pub const DEFAULT_TEXT_POS_CAPACITY: usize = 602;
@@ -254,6 +262,71 @@ impl<'de> Deserialize<'de> for VoiceId {
     {
         let raw = String::deserialize(deserializer)?;
         Self::new(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Output sample rate of synthesized audio.
+///
+/// The model natively produces 22.05 kHz (content up to 11 kHz). 48 kHz keeps that band
+/// unchanged and synthesizes 11-24 kHz with the `LavaSR` v2 bandwidth extender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(try_from = "u32", into = "u32")]
+#[non_exhaustive]
+pub enum SampleRate {
+    /// Native 22,050 Hz vocoder output.
+    #[default]
+    Native,
+    /// 48,000 Hz bandwidth-extended output.
+    Hifi,
+}
+
+impl SampleRate {
+    /// The rate in Hz.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use index_tts_rs_core::config::SampleRate;
+    ///
+    /// assert_eq!(SampleRate::try_from(48_000)?.hz(), 48_000);
+    /// assert!(SampleRate::try_from(44_100).is_err());
+    /// # Ok::<(), index_tts_rs_core::error::IndexTtsError>(())
+    /// ```
+    #[must_use]
+    pub const fn hz(self) -> u32 {
+        match self {
+            Self::Native => DEFAULT_SAMPLE_RATE,
+            Self::Hifi => HIFI_SAMPLE_RATE,
+        }
+    }
+}
+
+impl TryFrom<u32> for SampleRate {
+    type Error = IndexTtsError;
+
+    fn try_from(hz: u32) -> Result<Self> {
+        match hz {
+            DEFAULT_SAMPLE_RATE => Ok(Self::Native),
+            HIFI_SAMPLE_RATE => Ok(Self::Hifi),
+            _ => Err(IndexTtsError::validation(
+                "sample_rate",
+                format!(
+                    "sample rate must be {DEFAULT_SAMPLE_RATE} or {HIFI_SAMPLE_RATE} Hz, got {hz}"
+                ),
+            )),
+        }
+    }
+}
+
+impl From<SampleRate> for u32 {
+    fn from(rate: SampleRate) -> Self {
+        rate.hz()
+    }
+}
+
+impl fmt::Display for SampleRate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} Hz", self.hz())
     }
 }
 
@@ -539,8 +612,10 @@ impl TopK {
 }
 
 impl Default for TopK {
+    /// `10`: sampling wider than the ten likeliest codes noticeably increases Mandarin tone
+    /// errors (about 2x at `30`) without adding prosodic range.
     fn default() -> Self {
-        Self(30)
+        Self(10)
     }
 }
 
@@ -1212,7 +1287,7 @@ pub struct SamplingParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub seed: Option<u64>,
-    /// Top-K candidate truncation (`0..=8194`, default `30`).
+    /// Top-K candidate truncation (`0..=8194`, default `10`).
     #[builder(default)]
     pub top_k: TopK,
     /// Nucleus sampling threshold (`0.01..=1.0`, default `0.8`).
@@ -1249,7 +1324,8 @@ impl Default for SamplingParams {
 #[serde(rename_all = "snake_case", default)]
 #[non_exhaustive]
 pub struct CfmParams {
-    /// Speaking rate duration multiplier (`0.25..=4.0`, default `1.0`).
+    /// CFM duration factor (`0.25..=4.0`, default `1 / DEFAULT_SPEED`); speaking rate is its
+    /// inverse.
     #[builder(default)]
     pub duration_factor: DurationFactor,
     /// Number of Euler ODE integration steps (`1..=100`, default `25`).
@@ -1264,7 +1340,7 @@ pub struct CfmParams {
 impl Default for CfmParams {
     fn default() -> Self {
         Self {
-            duration_factor: DurationFactor::default(),
+            duration_factor: DurationFactor(DEFAULT_SPEED.recip()),
             n_timesteps: 25,
             cfg_rate: CfgRate::default(),
         }
@@ -1310,14 +1386,9 @@ pub struct EngineConfig {
     /// Whether to run text normalization (numbers, tech terms, contractions).
     #[builder(default = true)]
     pub use_normalization: bool,
-    /// Maximum reference audio duration in seconds (`1..=30`, default `15`).
-    #[validate(range(min = 1, max = 30))]
-    #[builder(default = DEFAULT_MAX_REF_SECONDS)]
-    pub max_ref_seconds: u32,
-    /// Output waveform sample rate (`22050` Hz).
-    #[validate(range(min = 8000, max = 48000))]
-    #[builder(default = DEFAULT_SAMPLE_RATE)]
-    pub sample_rate: u32,
+    /// Default output sample rate (`22050` native or `48000` bandwidth-extended).
+    #[builder(default)]
+    pub sample_rate: SampleRate,
     /// Silence inserted between segments in milliseconds (`0..=5000`, default `200`).
     #[validate(range(min = 0, max = 5000))]
     #[builder(default = DEFAULT_INTERVAL_SILENCE_MS)]
@@ -1344,8 +1415,7 @@ impl Default for EngineConfig {
             text_pos_capacity: DEFAULT_TEXT_POS_CAPACITY,
             max_text_tokens_per_segment: DEFAULT_MAX_TEXT_TOKENS_PER_SEGMENT,
             use_normalization: true,
-            max_ref_seconds: DEFAULT_MAX_REF_SECONDS,
-            sample_rate: DEFAULT_SAMPLE_RATE,
+            sample_rate: SampleRate::Native,
             interval_silence_ms: DEFAULT_INTERVAL_SILENCE_MS,
             sampling: SamplingParams::default(),
             cfm: CfmParams::default(),
@@ -1452,7 +1522,7 @@ impl EngineConfig {
     ///
     /// let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config/default.yaml");
     /// let cfg = EngineConfig::from_yaml_file(&path)?;
-    /// assert_eq!(cfg.sample_rate, 22050);
+    /// assert_eq!(cfg.sample_rate.hz(), 22050);
     /// # Ok::<(), index_tts_rs_core::error::IndexTtsError>(())
     /// ```
     pub fn from_yaml_file(path: impl AsRef<Path>) -> Result<Self> {
@@ -1488,6 +1558,29 @@ pub enum SpeakerSource {
     VoiceFile(PathBuf),
     /// Path to a raw reference audio file (`.wav`, `.mp3`, `.flac`, `.m4a`).
     ReferenceAudio(PathBuf),
+}
+
+/// What was spoken just before a request, so its first segment continues that speech instead
+/// of starting a fresh utterance (see [`SynthesisRequest::context`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum SpeechContext {
+    /// No preceding speech.
+    #[default]
+    None,
+    /// Preceding text whose speech is not available: the engine generates its semantic codes
+    /// (GPT only, seeded like the request) and continues after them. Only its last segment is
+    /// used.
+    Text(SynthesisText),
+    /// A previously synthesized segment, exactly as the engine produced it.
+    #[serde(rename_all = "camelCase")]
+    Spoken {
+        /// The segment's text token IDs (language prefix included).
+        token_ids: Vec<i32>,
+        /// The segment's semantic codes.
+        codes: Vec<i32>,
+    },
 }
 
 /// Validated synthesis request parameters built via [`TypedBuilder`].
@@ -1527,6 +1620,23 @@ pub struct SynthesisRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub emo_vector: Option<EmotionVector>,
+    /// Compute per-character timings for every segment (see [`crate::align`]).
+    #[serde(default)]
+    #[builder(default)]
+    pub align: bool,
+    /// Output sample rate of every segment.
+    #[serde(default)]
+    #[builder(default)]
+    pub sample_rate: SampleRate,
+    /// Speech preceding this request; its first segment continues after it.
+    #[serde(default)]
+    #[builder(default)]
+    pub context: SpeechContext,
+    /// Continue each segment after the previous one (GPT prefix continuation) instead of
+    /// synthesizing every segment as a fresh utterance.
+    #[serde(default)]
+    #[builder(default)]
+    pub continuity: bool,
 }
 
 /// Request to extract a [`crate::voice::SpeakerContext`] from reference audio.

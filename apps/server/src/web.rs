@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, Request, State, rejection::JsonRejection},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{Next, from_fn_with_state},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -20,10 +20,11 @@ use futures_util::stream::unfold;
 use index_tts_rs_core::{dsp::encode_wav_i16_bytes, engine::IndexTtsEngine};
 use index_tts_rs_director::{Director, DirectorConfig};
 use index_tts_rs_service::{
-    ErrorCode, JobChunk, JobRun, PathPolicy, PreparedJob, ServiceError, SpeechJob,
+    AnnotateJob, AnnotateResult, ApiKey, ErrorCode, JobAccumulator, JobChunk, JobRun, JobSummary,
+    PathPolicy, PreparedJob, ServiceError, SpeechJob,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json, to_vec};
+use serde_json::{Value, json, to_value, to_vec};
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     task::spawn_blocking,
@@ -34,6 +35,8 @@ use tracing::{error, instrument};
 const MAX_HTTP_BODY_BYTES: usize = 32_768;
 const MAX_CONCURRENT_REQUESTS: usize = 8;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Longest a request waits for the GPU behind other synthesis jobs.
+const QUEUE_WAIT: Duration = Duration::from_secs(60);
 /// Longest audio a single request may produce, in seconds.
 const MAX_AUDIO_SECS: usize = 600;
 const INDEX_HTML: &str = include_str!("../static/index.html");
@@ -140,21 +143,65 @@ struct AnnotationPayload {
     poetry: bool,
 }
 
-#[instrument(skip(state, payload))]
+/// Request header carrying a per-request `DeepSeek` key; otherwise `DEEPSEEK_API_KEY` is used.
+const PROVIDER_KEY_HEADER: &str = "x-deepseek-api-key";
+/// Longest accepted provider key header, in bytes.
+const MAX_PROVIDER_KEY_BYTES: usize = 512;
+
+/// Reads the optional per-request provider key. Its value is never logged.
+fn provider_key(headers: &HeaderMap) -> Result<Option<ApiKey>, ApiError> {
+    let Some(value) = headers.get(PROVIDER_KEY_HEADER) else {
+        return Ok(None);
+    };
+    let key = value
+        .to_str()
+        .ok()
+        .filter(|key| !key.is_empty() && key.len() <= MAX_PROVIDER_KEY_BYTES)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidArgument,
+                format!(
+                    "{PROVIDER_KEY_HEADER} must be 1..={MAX_PROVIDER_KEY_BYTES} visible ASCII \
+                     bytes"
+                ),
+            )
+        })?;
+    Ok(Some(ApiKey::new(key)))
+}
+
+#[instrument(skip_all)]
 async fn annotate(
     State(state): State<AppState>,
+    headers: HeaderMap,
     payload: Result<Json<AnnotationPayload>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Json(payload) = payload.map_err(|rejection| ApiError::rejected(&rejection))?;
     let config = state.director_config.as_ref().clone();
-    let director = spawn_blocking(move || Director::from_env(config).map_err(ServiceError::from))
-        .await
-        .map_err(ApiError::internal)??;
+    let director = match provider_key(&headers)? {
+        Some(key) => Director::new(config, key.into_secret()),
+        None => Director::from_env(config),
+    }
+    .map_err(ServiceError::from)?;
     let script = director
         .annotate(&payload.input, payload.poetry)
         .await
         .map_err(ServiceError::from)?;
     Ok(Json(json!({"script": script})))
+}
+
+/// Per-unit delivery direction for caller-supplied units (`AnnotateJob` → `AnnotateResult`).
+#[instrument(skip_all)]
+async fn annotate_units(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<AnnotateJob>, JsonRejection>,
+) -> Result<Json<AnnotateResult>, ApiError> {
+    let Json(job) = payload.map_err(|rejection| ApiError::rejected(&rejection))?;
+    let key = provider_key(&headers)?;
+    let config = state.director_config.as_ref().clone();
+    let result = job.run(config, key.as_ref()).await?;
+    Ok(Json(result))
 }
 
 /// Validates a request body for this transport.
@@ -187,8 +234,10 @@ pub(super) fn router(engine: Arc<IndexTtsEngine>, director_config: DirectorConfi
         .route("/health", get(health))
         .route("/api/voices", get(voices))
         .route("/v1/audio/speech", post(speech))
+        .route("/v1/audio/speech/timestamps", post(speech_timestamps))
         .route("/api/speech/stream", post(speech_stream))
         .route("/api/annotate", post(annotate))
+        .route("/v1/annotate", post(annotate_units))
         .fallback(|| async {
             ApiError::new(
                 StatusCode::NOT_FOUND,
@@ -271,23 +320,11 @@ async fn speech(
     payload: Result<Json<SpeechJob>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(job) = payload.map_err(|rejection| ApiError::rejected(&rejection))?;
-    let mut session = ReadingSession::start(state, &job)?;
-    let sample_rate = session.engine.config().sample_rate;
-    let mut pcm = Vec::new();
-    while let Some(packet) = session.next_packet().await? {
-        pcm.extend(packet.pcm);
-    }
-    if pcm.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            ErrorCode::InvalidArgument,
-            "没有生成可播放的语音，请检查文本。",
-        ));
-    }
-    let wav =
-        spawn_blocking(move || encode_wav_i16_bytes(&pcm, sample_rate).map_err(ServiceError::from))
-            .await
-            .map_err(ApiError::internal)??;
+    let (summary, pcm) = ReadingSession::start(state, &job, true)
+        .await?
+        .read_all()
+        .await?;
+    let wav = wav_bytes(pcm, summary.sample_rate).await?;
     Ok((
         [
             (header::CONTENT_TYPE, "audio/wav"),
@@ -301,42 +338,70 @@ async fn speech(
         .into_response())
 }
 
-#[derive(Debug)]
-struct ReadingSession {
-    engine: Arc<IndexTtsEngine>,
-    run: JobRun,
-    _permit: OwnedSemaphorePermit,
-    started: Instant,
-    samples: usize,
+/// Like `/v1/audio/speech`, but returns JSON with the WAV as base64 plus character and sentence
+/// timings (`timestamps` is implied).
+#[instrument(skip(state, payload))]
+async fn speech_timestamps(
+    State(state): State<AppState>,
+    payload: Result<Json<SpeechJob>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(mut job) = payload.map_err(|rejection| ApiError::rejected(&rejection))?;
+    job.timestamps = true;
+    let (summary, pcm) = ReadingSession::start(state, &job, true)
+        .await?
+        .read_all()
+        .await?;
+    let wav = wav_bytes(pcm, summary.sample_rate).await?;
+    let mut body = to_value(&summary).map_err(ApiError::internal)?;
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "audioBase64".to_owned(),
+            Value::String(STANDARD.encode(wav)),
+        );
+        object.insert("audioFormat".to_owned(), Value::String("wav".to_owned()));
+    }
+    Ok(Json(body))
+}
+
+async fn wav_bytes(pcm: Vec<i16>, sample_rate: u32) -> Result<Vec<u8>, ApiError> {
+    spawn_blocking(move || encode_wav_i16_bytes(&pcm, sample_rate).map_err(ServiceError::from))
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::from)
 }
 
 #[derive(Debug)]
-struct PcmPacket {
-    pcm: Vec<i16>,
-    paragraph_index: usize,
-    total_paragraphs: usize,
+struct ReadingSession {
+    run: JobRun,
+    acc: JobAccumulator,
+    _permit: OwnedSemaphorePermit,
+    started: Instant,
 }
 
 impl ReadingSession {
-    fn start(state: AppState, job: &SpeechJob) -> Result<Self, ApiError> {
-        let permit = state.synthesis.try_acquire_owned().map_err(|_| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                ErrorCode::Busy,
-                "已有语音正在生成，请稍后重试。",
-            )
-        })?;
+    /// Validates the job, then waits up to [`QUEUE_WAIT`] for the GPU. Admission is already
+    /// bounded by the request semaphore, so at most `MAX_CONCURRENT_REQUESTS - 1` jobs queue.
+    async fn start(state: AppState, job: &SpeechJob, keep_pcm: bool) -> Result<Self, ApiError> {
         let prepared = prepare_job(&state.engine, job)?;
+        let permit = timeout(QUEUE_WAIT, Arc::clone(&state.synthesis).acquire_owned())
+            .await
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ErrorCode::Busy,
+                    "排队等待超过一分钟，请稍后重试。",
+                )
+            })?
+            .map_err(ApiError::internal)?;
         Ok(Self {
-            run: JobRun::new(state.engine.as_ref().clone(), prepared.plan),
-            engine: state.engine,
+            acc: JobAccumulator::new(&prepared, keep_pcm),
+            run: JobRun::new(state.engine.as_ref().clone(), prepared),
             _permit: permit,
             started: Instant::now(),
-            samples: 0,
         })
     }
 
-    async fn next_packet(&mut self) -> Result<Option<PcmPacket>, ApiError> {
+    async fn next_chunk(&mut self) -> Result<Option<JobChunk>, ApiError> {
         let next = timeout_at(self.started + REQUEST_TIMEOUT, self.run.next_chunk())
             .await
             .map_err(|_| {
@@ -346,51 +411,60 @@ impl ReadingSession {
                     "生成超时，请分段提交较长文本。",
                 )
             })??;
-        next.map(|chunk| self.packet(chunk)).transpose()
-    }
-
-    fn packet(&mut self, chunk: JobChunk) -> Result<PcmPacket, ApiError> {
-        self.samples = self.samples.saturating_add(chunk.audio.pcm_i16.len());
+        let Some(chunk) = next else {
+            return Ok(None);
+        };
         let max_samples = usize::try_from(chunk.audio.sample_rate)
             .map_err(ApiError::internal)?
             .saturating_mul(MAX_AUDIO_SECS);
-        if self.samples > max_samples {
+        if self.acc.samples().saturating_add(chunk.audio.pcm_i16.len()) > max_samples {
             return Err(ApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 ErrorCode::InvalidArgument,
                 "音频超过十分钟，请分段提交。",
             ));
         }
-        Ok(PcmPacket {
-            pcm: chunk.audio.pcm_i16,
-            paragraph_index: chunk.utterance_index,
-            total_paragraphs: chunk.total_utterances,
-        })
+        self.acc.push(&chunk);
+        Ok(Some(chunk))
     }
 
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "Audio is capped to ten minutes, at most 28.8M samples, exactly representable in \
-                  f64"
-    )]
-    fn summary(&self) -> Value {
-        let elapsed = self.started.elapsed().as_secs_f64();
-        let duration = self.samples as f64 / f64::from(self.engine.config().sample_rate);
-        json!({ "event": "done", "wallSecs": elapsed, "durationSecs": duration,
-            "sampleRate": self.engine.config().sample_rate, "samples": self.samples,
-            "paragraphs": self.run.total_utterances() })
+    async fn read_all(mut self) -> Result<(JobSummary, Vec<i16>), ApiError> {
+        while self.next_chunk().await?.is_some() {}
+        self.finish()
+    }
+
+    fn finish(mut self) -> Result<(JobSummary, Vec<i16>), ApiError> {
+        if self.acc.samples() == 0 {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ErrorCode::InvalidArgument,
+                "没有生成可播放的语音，请检查文本。",
+            ));
+        }
+        let pcm = self.acc.take_pcm();
+        let summary = self.acc.finish(self.started.elapsed(), None)?;
+        Ok((summary, pcm))
     }
 }
 
-impl PcmPacket {
-    fn into_event(self, sample_rate: u32, elapsed: f64) -> Value {
-        let mut bytes = Vec::with_capacity(self.pcm.len().saturating_mul(2));
-        for sample in self.pcm {
-            bytes.extend_from_slice(&sample.to_le_bytes());
-        }
-        json!({ "event": "chunk", "pcmBase64": STANDARD.encode(bytes), "sampleRate": sample_rate,
-            "utteranceIndex": self.paragraph_index, "totalUtterances": self.total_paragraphs, "elapsedSecs": elapsed })
+fn chunk_event(chunk: &JobChunk, elapsed: f64) -> Value {
+    let mut bytes = Vec::with_capacity(chunk.audio.pcm_i16.len().saturating_mul(2));
+    for sample in &chunk.audio.pcm_i16 {
+        bytes.extend_from_slice(&sample.to_le_bytes());
     }
+    json!({ "event": "chunk", "pcmBase64": STANDARD.encode(bytes), "sampleRate": chunk.audio.sample_rate,
+        "utteranceIndex": chunk.utterance_index, "totalUtterances": chunk.total_utterances,
+        "elapsedSecs": elapsed, "startSecs": chunk.start_secs, "text": chunk.text,
+        "textOffset": chunk.text_offset, "alignment": chunk.alignment })
+}
+
+fn done_event(summary: &JobSummary) -> Result<Value, ApiError> {
+    let mut event = to_value(summary).map_err(ApiError::internal)?;
+    if let Some(object) = event.as_object_mut() {
+        object.insert("event".to_owned(), Value::String("done".to_owned()));
+        object.insert("paragraphs".to_owned(), json!(summary.utterances));
+    }
+    Ok(event)
 }
 
 fn event_bytes(event: &Value) -> Result<Bytes, IoError> {
@@ -399,35 +473,32 @@ fn event_bytes(event: &Value) -> Result<Bytes, IoError> {
     Ok(Bytes::from(bytes))
 }
 
+fn error_event(error: &ApiError) -> Value {
+    json!({"event": "error", "error": error.message, "code": error.code})
+}
+
 #[instrument(skip(state, payload))]
 async fn speech_stream(
     State(state): State<AppState>,
     payload: Result<Json<SpeechJob>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(job) = payload.map_err(|rejection| ApiError::rejected(&rejection))?;
-    let session = ReadingSession::start(state, &job)?;
+    let session = ReadingSession::start(state, &job, false).await?;
     let stream = unfold(Some(session), |session| async move {
         let mut session = session?;
-        match session.next_packet().await {
-            Ok(Some(packet)) => {
-                let event = packet.into_event(
-                    session.engine.config().sample_rate,
-                    session.started.elapsed().as_secs_f64(),
-                );
+        match session.next_chunk().await {
+            Ok(Some(chunk)) => {
+                let event = chunk_event(&chunk, session.started.elapsed().as_secs_f64());
                 Some((event_bytes(&event), Some(session)))
             }
             Ok(None) => {
-                let event = if session.samples == 0 {
-                    json!({"event": "error", "error": "没有生成可播放的语音，请检查文本。"})
-                } else {
-                    session.summary()
-                };
+                let event = session
+                    .finish()
+                    .and_then(|(summary, _)| done_event(&summary))
+                    .unwrap_or_else(|error| error_event(&error));
                 Some((event_bytes(&event), None))
             }
-            Err(error) => Some((
-                event_bytes(&json!({"event": "error", "error": error.message, "code": error.code})),
-                None,
-            )),
+            Err(error) => Some((event_bytes(&error_event(&error)), None)),
         }
     });
     Ok((
@@ -439,13 +510,13 @@ async fn speech_stream(
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc};
+    use std::{path::Path, sync::Arc, time::Duration};
 
-    use anyhow::{Context, Result, ensure};
+    use anyhow::{Context, Result, anyhow, ensure};
     use axum::{
         Router,
         body::{Body, to_bytes},
-        http::{Request as HttpRequest, StatusCode, header},
+        http::{HeaderMap, HeaderValue, Request as HttpRequest, StatusCode, header},
         middleware::from_fn_with_state,
         routing::get,
     };
@@ -460,10 +531,18 @@ mod tests {
     use rstest::rstest;
     use serde_json::{Value, from_slice, from_str};
     use tempfile::tempdir;
-    use tokio::{sync::Semaphore, task::spawn_blocking};
+    use tokio::{
+        spawn,
+        sync::Semaphore,
+        task::spawn_blocking,
+        time::{sleep, timeout},
+    };
     use tower::ServiceExt;
 
-    use super::{ApiError, MAX_HTTP_BODY_BYTES, guard_request, router};
+    use super::{
+        ApiError, MAX_HTTP_BODY_BYTES, MAX_PROVIDER_KEY_BYTES, PROVIDER_KEY_HEADER, guard_request,
+        provider_key, router,
+    };
 
     #[rstest]
     #[case(r#"{"input":"你好","voice":"tyr","refAudio":"/tmp/ref.wav"}"#)]
@@ -480,6 +559,21 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_read_optional_provider_key_header() -> Result<()> {
+        let mut headers = HeaderMap::new();
+        assert!(matches!(provider_key(&headers), Ok(None)));
+        headers.insert(PROVIDER_KEY_HEADER, HeaderValue::from_static("sk-test"));
+        let key = provider_key(&headers).map_err(|err| anyhow!(err.message))?;
+        assert!(key.is_some_and(|key| !format!("{key:?}").contains("sk-test")));
+        headers.insert(
+            PROVIDER_KEY_HEADER,
+            HeaderValue::from_str(&"k".repeat(MAX_PROVIDER_KEY_BYTES + 1))?,
+        );
+        assert!(provider_key(&headers).is_err());
         Ok(())
     }
 
@@ -670,12 +764,15 @@ mod tests {
                     r#"{"input":"你好。[[pause=750]][[speed=0.9]]再见。","voice":"test_voice"}"#,
                 ))
         };
+        // A second request queues behind the GPU instead of failing, and proceeds once the
+        // first job is released.
         let pending = app.clone().oneshot(make_request()?).await?;
         assert_eq!(pending.status(), StatusCode::OK);
-        let competing = app.clone().oneshot(make_request()?).await?;
-        assert_eq!(competing.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let competing = spawn(app.clone().oneshot(make_request()?));
+        sleep(Duration::from_millis(200)).await;
+        assert!(!competing.is_finished());
         drop(pending);
-        let response = app.oneshot(make_request()?).await?;
+        let response = timeout(Duration::from_secs(30), competing).await???;
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), 4_000_000).await?;
         let events = bytes
@@ -697,7 +794,7 @@ mod tests {
             let encoded = chunk
                 .get("pcmBase64")
                 .and_then(Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("missing PCM"))?;
+                .ok_or_else(|| anyhow!("missing PCM"))?;
             let pcm = STANDARD.decode(encoded)?;
             samples += pcm.len() / 2;
             if index == 1 {

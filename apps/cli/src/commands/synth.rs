@@ -56,7 +56,7 @@ pub struct SynthArgs {
     /// Language (`zh`, `en`, `ja`, `yue`, `es`, `ar`, `zh/en`; default from config).
     #[arg(long, short = 'l')]
     lang: Option<String>,
-    /// Speaking rate (`0.25..=4.0`, default `1.0`; larger is faster).
+    /// Speaking rate (`0.25..=4.0`, default from config: `1.2`; larger is faster).
     #[arg(long, short = 's')]
     speed: Option<f32>,
     /// Silence between blank-line separated paragraphs (`0..=5000` ms, default `600`).
@@ -71,6 +71,20 @@ pub struct SynthArgs {
     /// Play through the default audio output while synthesizing.
     #[arg(long, short = 'p')]
     play: bool,
+    /// Report per-character and per-sentence timings (`alignment` / `sentences` in JSON).
+    #[arg(long)]
+    timestamps: bool,
+    /// Continue each sentence after the previous one (intonation and pace carry across
+    /// sentences; inter-sentence silence defaults to 0).
+    #[arg(long)]
+    continuity: bool,
+    /// Text spoken just before this one (e.g. the previous script line); the first sentence
+    /// continues after it. Not spoken.
+    #[arg(long)]
+    previous_text: Option<String>,
+    /// Output sample rate: 22050 (native) or 48000 (bandwidth-extended above 11 kHz).
+    #[arg(long)]
+    sample_rate: Option<u32>,
     /// Run in-process instead of using the warm daemon.
     #[arg(long)]
     no_daemon: bool,
@@ -89,7 +103,7 @@ struct AdvancedArgs {
     /// Deterministic greedy decoding.
     #[arg(long)]
     greedy: bool,
-    /// RNG seed for reproducible output.
+    /// RNG seed for reproducible output (a random one is reported when omitted).
     #[arg(long)]
     seed: Option<u64>,
     /// Sampling temperature (`0.05..=2.0`).
@@ -240,6 +254,10 @@ fn build_job(args: &SynthArgs) -> Result<SpeechJob> {
     job.paragraph_pause_ms = args.paragraph_pause;
     job.interval_silence_ms = args.interval_silence;
     job.output_path = args.out.clone().filter(|out| out != Path::new("-"));
+    job.timestamps = args.timestamps;
+    job.sample_rate = args.sample_rate;
+    job.continuity = args.continuity;
+    job.previous_text.clone_from(&args.previous_text);
     Ok(job)
 }
 
@@ -381,11 +399,22 @@ fn emit_outcome(output: OutputMode, sink: Sink, outcome: &SynthOutcome<'_>) -> R
         };
         writeln!(
             out,
-            "✔ {:.2} s audio · {} segment(s) · synthesized in {:.2} s (RTF {:.3}, {via})",
-            summary.duration_secs, summary.segments, summary.synthesis_secs, summary.rtf
+            "✔ {:.2} s audio · {} segment(s) · synthesized in {:.2} s (RTF {:.3}, {via}) · seed {}",
+            summary.duration_secs,
+            summary.segments,
+            summary.synthesis_secs,
+            summary.rtf,
+            summary.seed
         )?;
         if let Some(path) = &summary.output_path {
             writeln!(out, "  → {}", display_path(path))?;
+        }
+        for sentence in &summary.sentences {
+            writeln!(
+                out,
+                "  {:>7.2}–{:<7.2} {}",
+                sentence.start, sentence.end, sentence.text
+            )?;
         }
         Ok(())
     };
