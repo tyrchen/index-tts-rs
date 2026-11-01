@@ -139,8 +139,9 @@ pub struct AdvancedOptions {
     /// Deterministic greedy (`argmax`) decoding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub greedy: Option<bool>,
-    /// RNG seed for reproducible output. When omitted a random seed is drawn and reported in
-    /// the job summary, so any result can be reproduced.
+    /// RNG seed for reproducible output. When omitted a random seed in `0..2^53` is drawn and
+    /// reported in the job summary, so any result can be reproduced (the range survives
+    /// JavaScript's `JSON.parse` losslessly).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
     /// Sampling temperature (`0.05..=2.0`).
@@ -500,8 +501,12 @@ pub fn resolve_input_path(base: &Path, path: &Path, field: &str) -> Result<PathB
     })
 }
 
+/// Largest integer a JavaScript number holds exactly (`Number.MAX_SAFE_INTEGER`).
+const MAX_SAFE_SEED: u64 = (1 << 53) - 1;
+
 /// Draws a fresh seed from the process's randomly keyed hasher; reproducibility comes from
-/// reporting it, not from its quality, so OS-seeded `SipHash` keys suffice.
+/// reporting it, not from its quality, so OS-seeded `SipHash` keys suffice. Seeds stay within
+/// [`MAX_SAFE_SEED`] so JSON clients can send a reported seed back unchanged.
 fn random_seed() -> u64 {
     let mut hasher = RandomState::new().build_hasher();
     hasher.write_u128(
@@ -509,7 +514,7 @@ fn random_seed() -> u64 {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos()),
     );
-    hasher.finish()
+    hasher.finish() & MAX_SAFE_SEED
 }
 
 fn bounded(field: &str, value: u32, min: u32, max: u32) -> Result<u32, ServiceError> {
@@ -600,7 +605,7 @@ mod tests {
     use serde_json::{Value, from_str, from_value, json};
     use tempfile::TempDir;
 
-    use super::{PathPolicy, PreparedJob, SpeechJob};
+    use super::{MAX_SAFE_SEED, PathPolicy, PreparedJob, SpeechJob, random_seed};
     use crate::{ErrorCode, ServiceError};
 
     /// A config whose voices directory registers `narrator`, `tyr`, and `other`.
@@ -627,6 +632,15 @@ mod tests {
         let fixture = fixture()?;
         let job: SpeechJob = from_value(value)?;
         Ok(job.prepare(&fixture.config, PathPolicy::LocalAbsolute)?)
+    }
+
+    #[test]
+    fn test_should_draw_seeds_that_javascript_numbers_hold_exactly() {
+        assert!(
+            (0..64)
+                .map(|_| random_seed())
+                .all(|seed| seed <= MAX_SAFE_SEED)
+        );
     }
 
     #[test]

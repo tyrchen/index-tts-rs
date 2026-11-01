@@ -23,8 +23,9 @@ use crate::{
     player::Playback,
 };
 
-/// Bytes read from stdin at most (16 KiB text limit plus one byte to detect overflow).
-const MAX_STDIN_BYTES: u64 = 16_385;
+/// Bytes of plain text read from stdin at most (16 KiB text limit plus one byte so the
+/// engine reports the overflow).
+pub const MAX_STDIN_TEXT_BYTES: u64 = 16_385;
 
 /// `itts synth` arguments.
 #[derive(Debug, Args)]
@@ -170,16 +171,16 @@ struct SynthOutcome<'a> {
     summary: &'a JobSummary,
 }
 
-/// Reads input text from `--text` or `--stdin`.
+/// Reads input from `--text` or at most `max_stdin_bytes` of `--stdin`.
 ///
 /// # Errors
 ///
 /// Returns an error if neither source is given or stdin cannot be read.
-pub fn read_text(text: Option<&str>, from_stdin: bool) -> Result<String> {
+pub fn read_text(text: Option<&str>, from_stdin: bool, max_stdin_bytes: u64) -> Result<String> {
     if from_stdin {
         let mut raw = String::new();
         io::stdin()
-            .take(MAX_STDIN_BYTES)
+            .take(max_stdin_bytes)
             .read_to_string(&mut raw)
             .context("failed to read text from stdin")?;
         return Ok(raw);
@@ -241,7 +242,11 @@ pub async fn run(config: EngineConfig, args: SynthArgs, output: OutputMode) -> R
 
 fn build_job(args: &SynthArgs) -> Result<SpeechJob> {
     let mut job = SpeechJob::builder()
-        .input(read_text(args.text.as_deref(), args.stdin)?)
+        .input(read_text(
+            args.text.as_deref(),
+            args.stdin,
+            MAX_STDIN_TEXT_BYTES,
+        )?)
         .advanced(AdvancedOptions::from(&args.advanced))
         .build();
     job.voice.clone_from(&args.voice);

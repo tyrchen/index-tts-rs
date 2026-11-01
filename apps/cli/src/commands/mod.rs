@@ -16,6 +16,10 @@ use serde_json::{from_str, json, to_value};
 
 use crate::output::OutputMode;
 
+/// Bytes of an `AnnotateJob` document read from stdin at most (the daemon's 256 KiB line limit,
+/// plus one byte to detect overflow).
+const MAX_UNITS_JSON_BYTES: u64 = 256 * 1024 + 1;
+
 /// `itts annotate` arguments.
 #[derive(Debug, Args)]
 pub struct AnnotateArgs {
@@ -60,7 +64,21 @@ pub enum SchemaTarget {
 ///
 /// Returns the classified annotation failure.
 pub async fn annotate(args: AnnotateArgs, output: OutputMode) -> Result<()> {
-    let text = synth::read_text(args.text.as_deref(), args.stdin)?;
+    // A units document carries up to 16 KiB of text plus IDs, a brief, and JSON escaping; the
+    // director enforces the decoded limits.
+    let max_stdin = if args.units {
+        MAX_UNITS_JSON_BYTES
+    } else {
+        synth::MAX_STDIN_TEXT_BYTES
+    };
+    let text = synth::read_text(args.text.as_deref(), args.stdin, max_stdin)?;
+    if args.units && text.len() as u64 >= MAX_UNITS_JSON_BYTES {
+        return Err(ServiceError::invalid(format!(
+            "AnnotateJob documents are limited to {} bytes",
+            MAX_UNITS_JSON_BYTES - 1
+        ))
+        .into());
+    }
     let config = match args.director_config {
         Some(path) => DirectorConfig::from_yaml_file(path).await?,
         None => DirectorConfig::default(),

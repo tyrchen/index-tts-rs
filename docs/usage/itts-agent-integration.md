@@ -61,7 +61,7 @@ itts synth --voice narrator --timestamps --output json \
 
 ```jsonc
 {
-  "seed": 17127547225857486438,
+  "seed": 3071825384613407,
   "alignment": {
     "text": "大家好！今天是2026年10月31日。",   // the input without [[...]] controls
     "start": [0.62, 0.79, 0.99, 1.17, 2.40, ...],  // seconds, one per Unicode scalar
