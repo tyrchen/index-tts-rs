@@ -1709,7 +1709,7 @@ dependencies = [
 
 [[package]]
 name = "index-tts-rs-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1732,7 +1732,7 @@ dependencies = [
 
 [[package]]
 name = "index-tts-rs-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "approx",
  "arc-swap",
@@ -1764,7 +1764,7 @@ dependencies = [
 
 [[package]]
 name = "index-tts-rs-director"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "config",
  "index-tts-rs-core",
@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "index-tts-rs-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1803,7 +1803,7 @@ dependencies = [
 
 [[package]]
 name = "index-tts-rs-service"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "index-tts-rs-core",
