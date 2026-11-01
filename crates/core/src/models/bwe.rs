@@ -349,20 +349,22 @@ mod tests {
 
     use super::{
         BWE_HOP, BWE_N_FFT, BandwidthExtender, CROSSOVER_HZ, CROSSOVER_WIDTH_HZ, PAD, crossover,
-        reflect_pad,
+        dsp_error, reflect_pad,
     };
     use crate::{
         config::{DEFAULT_SAMPLE_RATE, HIFI_SAMPLE_RATE},
         dsp::resample_sinc_hann,
+        error::Result,
         models::resolve_hifi_weights,
     };
 
-    fn spectrum(signal: Option<&[f32]>) -> Option<Vec<Complex32>> {
-        let mut input = signal?.to_vec();
+    fn spectrum(signal: &[f32]) -> Result<Vec<Complex32>> {
+        let mut input = signal.to_vec();
         let fft = RealFftPlanner::<f32>::new().plan_fft_forward(input.len());
         let mut out = fft.make_output_vec();
-        fft.process(&mut input, &mut out).ok()?;
-        Some(out)
+        fft.process(&mut input, &mut out)
+            .map_err(|err| dsp_error(&err))?;
+        Ok(out)
     }
 
     /// Energy per band `[lo, hi)` Hz of a 48 kHz signal.
@@ -389,13 +391,11 @@ mod tests {
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss
     )]
-    fn test_should_extend_bandwidth_preserving_length_and_low_band() {
+    fn test_should_extend_bandwidth_preserving_length_and_low_band() -> Result<()> {
         let Ok(path) = resolve_hifi_weights() else {
-            return;
+            return Ok(());
         };
-        let Ok(extender) = BandwidthExtender::load_from_path(path) else {
-            panic!("bandwidth extender failed to load");
-        };
+        let bwe = BandwidthExtender::load_from_path(path)?;
         // One second of a voiced, speech-like signal: a 140 Hz harmonic series below 9 kHz.
         let audio: Vec<f32> = (0..DEFAULT_SAMPLE_RATE)
             .map(|i| {
@@ -405,24 +405,15 @@ mod tests {
                     .sum()
             })
             .collect();
-        let Ok(extended) = extender.extend(&audio) else {
-            panic!("extension failed");
-        };
-        let Ok(upsampled) = resample_sinc_hann(&audio, DEFAULT_SAMPLE_RATE, HIFI_SAMPLE_RATE)
-        else {
-            panic!("resample failed");
-        };
+        let extended = bwe.extend(&audio)?;
+        let upsampled = resample_sinc_hann(&audio, DEFAULT_SAMPLE_RATE, HIFI_SAMPLE_RATE)?;
         assert_eq!(extended.len(), upsampled.len());
         // Within the generated span (whole STFT frames), every bin below the crossover band is
         // the original's.
         let frames = (upsampled.len() + 2 * PAD - BWE_N_FFT) / BWE_HOP + 1;
         let span = frames * BWE_HOP;
-        let (Some(ours), Some(original)) = (
-            spectrum(extended.get(..span)),
-            spectrum(upsampled.get(..span)),
-        ) else {
-            panic!("spectrum failed");
-        };
+        let ours = spectrum(extended.get(..span).unwrap_or_default())?;
+        let original = spectrum(upsampled.get(..span).unwrap_or_default())?;
         let below = ((CROSSOVER_HZ - CROSSOVER_WIDTH_HZ / 2.0) / HIFI_SAMPLE_RATE as f32
             * span as f32) as usize;
         let changed: f32 = ours
@@ -431,7 +422,7 @@ mod tests {
             .take(below)
             .map(|(a, b)| (a - b).norm_sqr())
             .sum();
-        let total: f32 = original.iter().take(below).map(|b| b.norm_sqr()).sum();
+        let total: f32 = original.iter().take(below).map(Complex32::norm_sqr).sum();
         assert!(
             changed / total < 1e-9,
             "low band changed by {:e} (relative energy)",
@@ -440,6 +431,7 @@ mod tests {
         let generated = band_energy(&extended, 11_000.0, 24_000.0);
         assert!(generated > band_energy(&upsampled, 11_000.0, 24_000.0) * 10.0);
         assert!(extended.iter().all(|x| x.is_finite() && x.abs() <= 1.5));
+        Ok(())
     }
 
     #[test]

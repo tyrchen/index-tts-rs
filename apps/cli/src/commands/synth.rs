@@ -28,6 +28,7 @@ const MAX_STDIN_BYTES: u64 = 16_385;
 
 /// `itts synth` arguments.
 #[derive(Debug, Args)]
+#[allow(clippy::struct_excessive_bools, reason = "independent CLI flags")]
 pub struct SynthArgs {
     /// Text to synthesize; supports inline controls such as `[[pause=600]]` (or use --stdin).
     #[arg(long, short = 't', conflicts_with = "stdin")]

@@ -321,6 +321,8 @@ fn pauses(voiced: &[bool]) -> Vec<Range<usize>> {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
+
     use super::{Interval, decode_intervals, pauses, share_collapsed, viterbi};
 
     #[test]
@@ -353,7 +355,7 @@ mod tests {
         for v in voiced.iter_mut().skip(10).take(5) {
             *v = true;
         }
-        assert!(pauses(&voiced).is_empty());
+        assert_eq!(pauses(&voiced), Vec::<Range<usize>>::new());
     }
 
     #[test]
@@ -382,9 +384,11 @@ mod tests {
             }
         }
         let spans = decode_intervals(&attention, 10, 2, &[0, 1], &pcm, 1000);
-        let (first, second) = (spans[0], spans[1]);
-        assert!((first.end - 0.3).abs() < 0.011, "{first:?}");
-        assert!((second.start - 0.6).abs() < 0.011, "{second:?}");
+        assert_eq!(spans.len(), 2, "{spans:?}");
+        if let [first, second] = spans.as_slice() {
+            assert!((first.end - 0.3).abs() < 0.011, "{first:?}");
+            assert!((second.start - 0.6).abs() < 0.011, "{second:?}");
+        }
     }
 
     #[test]
@@ -417,6 +421,9 @@ mod tests {
 
     #[test]
     fn test_should_return_nothing_without_states_or_frames() {
-        assert!(decode_intervals(&[], 0, 0, &[], &[], 22_050).is_empty());
+        assert_eq!(
+            decode_intervals(&[], 0, 0, &[], &[], 22_050),
+            Vec::<Interval>::new()
+        );
     }
 }

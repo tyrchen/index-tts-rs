@@ -289,21 +289,27 @@ pub fn sentences(alignment: &Alignment) -> Vec<SentenceTiming> {
     let chars: Vec<char> = alignment.text.chars().collect();
     let mut out = Vec::new();
     let mut begin = 0_usize;
+    // A terminal mark followed by closing quotes ends the sentence after the last closer.
+    let mut pending = false;
     for i in 0..chars.len() {
         let ch = chars.get(i).copied().unwrap_or(' ');
         let next = chars.get(i + 1).copied();
         let terminal = matches!(ch, '。' | '！' | '？' | '!' | '?' | '…' | '\n')
             || (ch == '.' && next.is_none_or(char::is_whitespace));
-        let closes =
-            next.is_some_and(|n| matches!(n, '”' | '’' | '」' | '』' | ')' | '）' | '"' | '\''));
-        if terminal && !closes || i + 1 == chars.len() {
+        pending = terminal || pending && is_closer(ch);
+        if pending && !next.is_some_and(is_closer) || i + 1 == chars.len() {
             if let Some(sentence) = sentence(&chars, alignment, begin..i + 1) {
                 out.push(sentence);
             }
             begin = i + 1;
+            pending = false;
         }
     }
     out
+}
+
+fn is_closer(ch: char) -> bool {
+    matches!(ch, '”' | '’' | '」' | '』' | ')' | '）' | '"' | '\'')
 }
 
 fn sentence(chars: &[char], alignment: &Alignment, range: Range<usize>) -> Option<SentenceTiming> {
@@ -409,7 +415,7 @@ mod tests {
         let spans = t.project_spans(0, &engine, 0.0);
         let a = t.alignment(&(0..6), &spans, 0.0, 2.0);
         assert!(
-            (a.start[1] - 0.44).abs() < 1e-6,
+            a.start.get(1).is_some_and(|s| (s - 0.44).abs() < 1e-6),
             "{:?} from {spans:?}",
             a.start
         );
@@ -429,23 +435,40 @@ mod tests {
         let t = transcript("abc")?;
         let spans = vec![(0..1, 0.5, 0.6), (1..2, 0.2, 0.3), (2..3, 5.0, 6.0)];
         let a = t.alignment(&(0..3), &spans, 0.0, 1.0);
-        assert!(a.start.windows(2).all(|w| w[0] <= w[1]));
+        assert!(a.start.is_sorted());
         assert!(a.start.iter().zip(&a.end).all(|(s, e)| s <= e && *e <= 1.0));
         Ok(())
     }
 
+    fn timed(text: &str) -> Alignment {
+        let n = u16::try_from(text.chars().count()).unwrap_or(u16::MAX);
+        Alignment {
+            text: text.to_owned(),
+            start: (0..n).map(|i| f32::from(i) * 0.1).collect(),
+            end: (1..=n).map(|i| f32::from(i) * 0.1).collect(),
+        }
+    }
+
     #[test]
     fn test_should_split_sentences_at_terminal_marks() {
-        let alignment = Alignment {
-            text: "Hi there. 3.5 is fine! 好的。".to_owned(),
-            start: (0..26).map(|i| i as f32 * 0.1).collect(),
-            end: (1..27).map(|i| i as f32 * 0.1).collect(),
-        };
-        let found = sentences(&alignment);
+        let found = sentences(&timed("Hi there. 3.5 is fine! 好的。"));
         let texts: Vec<&str> = found.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(texts, ["Hi there.", "3.5 is fine!", "好的。"]);
-        let first = &found[0];
-        assert_eq!(first.chars, 0..9);
-        assert!((first.start - 0.0).abs() < 1e-6 && (first.end - 0.8).abs() < 1e-6);
+        let first = found.first().map(|s| (s.chars.clone(), s.start, s.end));
+        assert!(
+            first
+                .as_ref()
+                .is_some_and(|(chars, start, end)| *chars == (0..9)
+                    && start.abs() < 1e-6
+                    && (end - 0.8).abs() < 1e-6),
+            "{first:?}"
+        );
+    }
+
+    #[test]
+    fn test_should_end_sentence_after_closing_quotes() {
+        let found = sentences(&timed("她说：“你好。” 他答：“再见！”）好。"));
+        let texts: Vec<&str> = found.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["她说：“你好。”", "他答：“再见！”）", "好。"]);
     }
 }
