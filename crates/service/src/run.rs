@@ -79,6 +79,8 @@ pub struct JobRun {
     current_voice: Option<(SpeakerSource, Language)>,
     /// Last segment of the previous utterance, with the speaker and language it was spoken in.
     last_spoken: Option<(SpeechContext, SpeakerSource, Language)>,
+    /// End of the last chunk's spoken-text range; chunk texts never overlap it.
+    text_cursor: usize,
 }
 
 impl JobRun {
@@ -98,6 +100,7 @@ impl JobRun {
             active: None,
             current_voice: None,
             last_spoken: None,
+            text_cursor: 0,
         }
     }
 
@@ -167,9 +170,11 @@ impl JobRun {
             self.last_spoken = Some((audio.spoken.clone(), speaker.clone(), *language));
         }
         let utterance_index = self.next_index.saturating_sub(1);
-        let chars = self
-            .transcript
-            .segment_range(self.transcript.project(utterance_index, &audio.text_chars));
+        let chars = self.transcript.segment_range(
+            self.transcript.project(utterance_index, &audio.text_chars),
+            self.text_cursor,
+        );
+        self.text_cursor = chars.end;
         let alignment = self.timestamps.then(|| {
             let speech_start = start_secs + silence_ms as f32 / 1000.0;
             let spans =

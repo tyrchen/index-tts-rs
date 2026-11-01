@@ -15,7 +15,8 @@ jobs:
   verify:
     # MLX / Metal and CoreAudio require a native Apple Silicon runner.
     runs-on: macos-15
-    timeout-minutes: 45
+    # A cold build (no cache) compiles MLX three times: workspace, release smoke, package check.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Check native build tools
@@ -29,6 +30,9 @@ jobs:
           rustup toolchain install
           rustup toolchain install nightly --profile minimal --component rustfmt
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Keep compiled dependencies even when a later step fails or times out.
+          cache-on-failure: true
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit,cargo-deny

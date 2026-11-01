@@ -99,7 +99,7 @@ Useful flags: `--speed 0.9` (larger is faster), `--emo "calm:0.6"`, `--lang en`,
 
 - **Reproducible takes:** every result reports `seed`. Passing it back with `--seed` reproduces the audio bit for bit, so audition several takes and keep the seed of the one you like.
 - **Continuity:** `--continuity` makes each sentence continue after the previous one (no "fresh start" at every sentence); for line-by-line scripts pass the previous line with `--previous-text`. Off by default — audition before adopting.
-- **Per-line direction:** `itts annotate --units --stdin --output json < lines.json` takes `{"units":[{"id","text"}],"brief"?}` and returns per-line `emo`, `temperature`, `speed`, `pauseAfterMs`, and `controls` (MCP tool `annotate_units`). Copy them into each line's synth call.
+- **Per-line direction:** `itts annotate --units --stdin --output json < lines.json` takes `{"units":[{"id","text"}],"brief"?}` and returns per-line `emo`, `temperature`, `speedScale`, `pauseAfterMs`, and `controls` (MCP tool `annotate_units`). Prefix each line with `controls`, or copy the fields into its synth call with `speed` = base speed × `speedScale`.
 - **Timestamps:** `--timestamps` adds `alignment` (`text` without control tags, plus per-character `start`/`end` seconds indexed by Unicode scalar) and `sentences` (`text`, `start`, `end`). Use them for subtitles, cutting one file into per-sentence clips, or syncing visuals to a word.
 
 ## 5. Directing Emotion, Tone Temperature, Speed & Pauses

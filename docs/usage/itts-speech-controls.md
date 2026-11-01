@@ -97,13 +97,14 @@ itts annotate --units --stdin --output json < lines.json
 
 ```json
 { "status": "ok", "deliveries": [
-  { "id": "s1.l1", "emo": "melancholic:0.2,calm:0.45", "temperature": 0.76, "speed": 0.9,
+  { "id": "s1.l1", "emo": "melancholic:0.2,calm:0.45", "temperature": 0.76, "speedScale": 0.9,
     "pauseAfterMs": 520, "controls": "[[emo=melancholic:0.2,calm:0.45]][[temp=0.76]][[speed=0.9]]" },
   ... ] }
 ```
 
-Copy `emo`, `speed`, and `temperature` into the line's `SpeechJob` (`emo`, `speed`,
-`advanced.temperature`) or prefix its text with `controls`; `pauseAfterMs` is a suggestion for
+Either prefix the line's text with `controls`, or copy the fields into its `SpeechJob`: `emo`,
+`advanced.temperature`, and `speed` = your base speed × `speedScale` (the default base speed is
+1.2, so `0.9` becomes `1.08`; `[[speed=0.9]]` applies the same scale). `pauseAfterMs` is a suggestion for
 the gap you place after the line. The same request is served by the daemon (`annotate`), MCP
 (`annotate_units`), and HTTP (`POST /v1/annotate`); `itts schema annotate-job` and
 `itts schema annotate-result` publish the JSON Schemas. The provider sees all lines at once and is

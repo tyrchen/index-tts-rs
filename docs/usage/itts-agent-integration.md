@@ -178,7 +178,7 @@ For direct integrations, the socket speaks newline-delimited JSON (protocol vers
 ← {"id":2,"event":"started",...}  {"id":2,"event":"chunk",...}  {"id":2,"event":"done",...}
 → {"id":3,"method":"cancel","target":2}
 → {"id":4,"method":"annotate","job":{"units":[{"id":"l1","text":"你好。"}]},"apiKey":"sk-..."}
-← {"id":4,"event":"annotated","deliveries":[{"id":"l1","speed":0.95,...}]}
+← {"id":4,"event":"annotated","deliveries":[{"id":"l1","speedScale":0.95,...}]}
 ```
 
 `apiKey` is optional (the daemon's `DEEPSEEK_API_KEY` is the fallback) and is never logged; a key

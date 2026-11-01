@@ -58,8 +58,9 @@ pub struct Delivery {
     /// Sampling temperature for `SpeechJob.advanced.temperature` (`0.5..=1.2`), if chosen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
-    /// Speaking rate for `SpeechJob.speed` (`0.8..=1.2`).
-    pub speed: f64,
+    /// Pace relative to the job's speed (`0.8..=1.2`): set `SpeechJob.speed` to the job's
+    /// base speed times this value, which is what `[[speed=...]]` in `controls` does.
+    pub speed_scale: f64,
     /// Suggested silence after the unit in milliseconds (`0..=2000`; `0` for the last unit).
     pub pause_after_ms: u32,
     /// The same delivery as inline controls to prefix the unit's text with.
@@ -194,7 +195,7 @@ impl Delivery {
             id,
             emo: direction.emotions.map(|emo| emo.format_compact()),
             temperature: direction.temperature.map(hundredths),
-            speed: hundredths(direction.speed),
+            speed_scale: hundredths(direction.speed),
             pause_after_ms: direction.pause_after_ms,
             controls: direction.controls(),
         }

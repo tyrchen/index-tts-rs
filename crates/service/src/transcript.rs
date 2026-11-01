@@ -142,10 +142,12 @@ impl Transcript {
     }
 
     /// Normalizes a projected segment range so consecutive segments partition the spoken text:
-    /// it starts at its first pronounced character and runs up to the next pronounced one,
-    /// keeping closing punctuation and the whitespace after it.
+    /// it starts at its first pronounced character at or after `after` (the end of the previous
+    /// segment) and runs up to the next pronounced one, keeping closing punctuation and the
+    /// whitespace after it. `after` matters when a segment boundary splits a normalization
+    /// expansion (`100%` → `one hundred percent`), whose source characters both halves map to.
     #[must_use]
-    pub fn segment_range(&self, chars: Range<usize>) -> Range<usize> {
+    pub fn segment_range(&self, chars: Range<usize>, after: usize) -> Range<usize> {
         let silent_run = |from: usize| {
             self.spoken
                 .get(from..)
@@ -154,8 +156,10 @@ impl Transcript {
                 .take_while(|&&ch| !is_spoken_char(ch))
                 .count()
         };
-        let start = (chars.start + silent_run(chars.start)).min(chars.end);
-        start..chars.end + silent_run(chars.end)
+        let begin = chars.start.max(after);
+        let end = chars.end.max(begin);
+        let start = (begin + silent_run(begin)).min(end);
+        start..end + silent_run(end)
     }
 
     /// Text of a spoken-text character range.
@@ -385,8 +389,20 @@ mod tests {
     #[test]
     fn test_should_partition_segments_at_pronounced_characters() -> Result<(), ServiceError> {
         let t = transcript("你好！」 然后 ok")?;
-        assert_eq!(t.segment_range(0..2), 0..5);
-        assert_eq!(t.segment_range(4..7), 5..8);
+        assert_eq!(t.segment_range(0..2, 0), 0..5);
+        assert_eq!(t.segment_range(4..7, 5), 5..8);
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_not_repeat_characters_of_a_split_expansion() -> Result<(), ServiceError> {
+        // "one hundred | percent." split mid-expansion projects both halves onto "100%".
+        let t = transcript("涨了100%。好")?;
+        let first = t.segment_range(0..4, 0);
+        let second = t.segment_range(2..8, first.end);
+        assert_eq!(first, 0..4);
+        assert_eq!(second, 4..8);
+        assert_eq!(t.text(&first) + &t.text(&second), "涨了100%。好");
         Ok(())
     }
 
