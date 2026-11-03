@@ -11,7 +11,7 @@ interval_silence_ms: 200
 
 sampling:
   greedy: false
-  top_k: 10
+  top_k: 3
   top_p: 0.8
   temperature: 0.8
   repetition_penalty: 10.0
