@@ -17,3 +17,11 @@ original right-holder disclaims all liability related to this Derivative Work.
 
 Retain this notice and LICENSE-INDEXTTS when redistributing these assets or binaries
 that contain them. See the agreement for the full usage and redistribution terms.
+
+## CMU Pronouncing Dictionary
+
+`cmudict.dict` is derived from [cmusphinx/cmudict](https://github.com/cmusphinx/cmudict)
+(commit pinned in the `Makefile`, regenerate with `make update-cmudict`): the first
+pronunciation of each word with comments and stress digits removed. It is embedded in the
+core library for `itts align --phones` and is distributed under its BSD-style license in
+[CMUDICT-LICENSE](CMUDICT-LICENSE).

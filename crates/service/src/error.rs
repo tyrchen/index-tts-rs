@@ -27,7 +27,7 @@ pub enum ErrorCode {
     VoiceNotFound,
     /// Model weights are missing, incomplete, or failed to load.
     ModelUnavailable,
-    /// Reference audio could not be decoded.
+    /// Reference or recording audio could not be decoded.
     AudioDecodeFailed,
     /// No usable audio output device for playback.
     AudioOutputUnavailable,
@@ -47,13 +47,15 @@ pub enum ErrorCode {
     AnnotationFailed,
     /// A filesystem operation failed.
     Io,
+    /// An input exceeds what one request can process (e.g. a recording beyond one alignment).
+    TooLong,
     /// An unexpected internal failure.
     Internal,
 }
 
 impl ErrorCode {
     /// Every code, in documentation order.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::InvalidArgument,
         Self::VoiceNotFound,
         Self::ModelUnavailable,
@@ -67,6 +69,7 @@ impl ErrorCode {
         Self::AnnotationUnavailable,
         Self::AnnotationFailed,
         Self::Io,
+        Self::TooLong,
         Self::Internal,
     ];
 
@@ -91,6 +94,7 @@ impl ErrorCode {
             Self::Timeout => 9,
             Self::AnnotationUnavailable | Self::AnnotationFailed => 10,
             Self::Io => 11,
+            Self::TooLong => 12,
         }
     }
 
@@ -111,6 +115,7 @@ impl ErrorCode {
             Self::AnnotationUnavailable => "ANNOTATION_UNAVAILABLE",
             Self::AnnotationFailed => "ANNOTATION_FAILED",
             Self::Io => "IO",
+            Self::TooLong => "TOO_LONG",
             Self::Internal => "INTERNAL",
         }
     }
@@ -122,7 +127,7 @@ impl ErrorCode {
             Self::InvalidArgument => "A request field, flag, control tag, or config is invalid.",
             Self::VoiceNotFound => "The requested voice is not registered.",
             Self::ModelUnavailable => "Model weights are missing, incomplete, or failed to load.",
-            Self::AudioDecodeFailed => "Reference audio could not be decoded.",
+            Self::AudioDecodeFailed => "Audio could not be decoded.",
             Self::AudioOutputUnavailable => "No usable audio output device for playback.",
             Self::DaemonUnavailable => "The daemon is not running or not reachable.",
             Self::DaemonVersionMismatch => "The running daemon uses an incompatible protocol.",
@@ -132,6 +137,7 @@ impl ErrorCode {
             Self::AnnotationUnavailable => "Annotation requires DEEPSEEK_API_KEY.",
             Self::AnnotationFailed => "The annotation provider failed or returned bad output.",
             Self::Io => "A filesystem operation failed.",
+            Self::TooLong => "An input exceeds one request; split it into shorter pieces.",
             Self::Internal => "An unexpected internal failure.",
         }
     }
@@ -225,7 +231,13 @@ impl From<&IndexTtsError> for ServiceError {
                 Self::new(ErrorCode::ModelUnavailable, message).with_hint(MODEL_HINT)
             }
             IndexTtsError::AudioDecode { .. } => Self::new(ErrorCode::AudioDecodeFailed, message)
-                .with_hint("use a 3-15 s mono speech clip in .wav, .mp3, .flac, or .m4a format"),
+                .with_hint(
+                    "use .wav, .mp3, .flac, or .m4a audio (voice references: 3-15 s of clean \
+                     speech)",
+                ),
+            IndexTtsError::TooLong { .. } => Self::new(ErrorCode::TooLong, message).with_hint(
+                "split the recording and its text into pieces of at most 72 s and 600 tokens",
+            ),
             IndexTtsError::Io { .. } => Self::new(ErrorCode::Io, message),
             IndexTtsError::Cancelled { .. } => Self::new(ErrorCode::Cancelled, message),
             _ => Self::internal(message),
@@ -309,6 +321,7 @@ mod tests {
         ErrorCode::ModelUnavailable
     )]
     #[case(IndexTtsError::actor("boom"), ErrorCode::Internal)]
+    #[case(IndexTtsError::too_long("audio", "80 s"), ErrorCode::TooLong)]
     fn test_should_map_engine_errors_to_stable_codes(
         #[case] err: IndexTtsError,
         #[case] code: ErrorCode,

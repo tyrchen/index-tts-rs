@@ -94,6 +94,53 @@ consecutive chunks partition the text), `textOffset` (its character index), `sta
 the chunk, including its leading pause, starts in the job audio), and with timestamps an
 `alignment` for that chunk on the job timeline.
 
+## 3a. Aligning any recording (`itts align`)
+
+`itts align` times a recording you already have (another TTS engine, a human take) against the
+text it speaks, on the same 0 s as the file (MP3 encoder delay is trimmed exactly as ffmpeg and
+browsers do). The alignment has the same shape and filling rules as `synth --timestamps`.
+
+```bash
+itts align --audio line.mp3 --lang zh --stdin --phones --output json < say.txt
+itts align --audio line.wav --lang en --text "The engine runs hot." --voice-file tyr.itts_voice --output json
+```
+
+```jsonc
+{
+  "status": "ok", "backend": "daemon",
+  "aligner": { "name": "itts-attn", "version": 1, "model": "yunfengwang/IndexTTS-2.5-mlx",
+               "heads": "L4H10+L5H10", "conditioning": "recording" },
+  "alignment": { "text": "鲲化而为鸟。", "start": [0.21, 0.52, …], "end": [0.52, 0.77, …] },
+  "sentences": [ { "text": "鲲化而为鸟。", "chars": { "start": 0, "end": 6 }, "start": 0.21, "end": 1.64 } ],
+  "quality": { "confidence": 0.99, "coverage": 1.0, "weak": [] },
+  "phones": [ { "i": 0, "p": "k", "k": "ini", "start": 0.21, "end": 0.27 },
+              { "i": 0, "p": "un", "t": 1, "k": "fin", "start": 0.27, "end": 0.52 } ],
+  "phonesMethod": "split",
+  "durationSecs": 2.03, "alignSecs": 0.09,
+  "timings": { "audioMs": 2, "featuresMs": 21, "encodeMs": 4, "conditionMs": 25, "attentionMs": 35, "totalMs": 88 }
+}
+```
+
+- Input: WAV / MP3 / FLAC / M4A at any sample rate, at most about 72 s and 600 text tokens
+  (otherwise `TOO_LONG`). `<字|pinyin>` / `<word|ARPAbet>` overrides are honoured; `[[...]]`
+  controls are removed. Without `--voice` / `--voice-file` the recording itself conditions the
+  decoder (the more accurate choice in the evaluation).
+- `quality` is computed over characters, words, and overrides. On clean speech `confidence` and
+  `coverage` stay above 0.97; below 0.95 the audio most likely does not say the text (omitted,
+  extra, or substituted words). `weak` lists characters (a word's first letter) the audio barely
+  supports; send those lines to speech recognition. Numbers read in another form that shares
+  syllables (`2026年` read 两千零二十六年) are not detected. A result is returned whatever the
+  quality, with exit 0.
+- `phones` (with `--phones`): Mandarin initials / finals in pinyin (`ü` as `v`, `y`/`w` spellings
+  as finals, `t` = tone 1–5), English ARPAbet without stress digits; `i` indexes
+  `alignment.text`. They are cut inside each character or word (`phonesMethod: "split"`).
+- Accuracy (Apple M5 Pro, 166 lines): Chinese character onsets against MMS 18–29 ms mean error,
+  ≥96% within 100 ms for Gemini, ElevenLabs, and Edge speech; English word onsets about 70 ms
+  (median −35 ms, early). About 0.11 s per line up to 10 s on a warm daemon. See
+  [the evaluation](../research/itts-align-evaluation-research.md).
+- `itts schema align-job` / `align-result` print the JSON Schemas; MCP exposes the same as the
+  `align` tool.
+
 ## 4. Errors and exit codes
 
 ```json
@@ -108,13 +155,14 @@ the chunk, including its leading pause, starts in the job audio), and with times
 | 2 | `INVALID_ARGUMENT` | Bad flag, value range, control tag, or config (CLI usage errors also exit 2) |
 | 3 | `VOICE_NOT_FOUND` | Voice not registered (checked for every `[[voice=...]]` before synthesis starts) |
 | 4 | `MODEL_UNAVAILABLE` | Weights missing or unloadable |
-| 5 | `AUDIO_DECODE_FAILED` / `AUDIO_OUTPUT_UNAVAILABLE` | Reference audio unreadable / no playback device |
+| 5 | `AUDIO_DECODE_FAILED` / `AUDIO_OUTPUT_UNAVAILABLE` | Reference or aligned audio unreadable / no playback device |
 | 6 | `DAEMON_UNAVAILABLE` / `DAEMON_VERSION_MISMATCH` | Daemon unreachable / older protocol (run `itts daemon restart`) |
 | 7 | `BUSY` | Daemon already has `--max-in-flight` requests |
 | 8 | `CANCELLED` | Client disconnected or cancelled |
 | 9 | `TIMEOUT` | Startup, stop, or model loading exceeded its budget |
 | 10 | `ANNOTATION_UNAVAILABLE` / `ANNOTATION_FAILED` | `DEEPSEEK_API_KEY` missing / provider failure |
 | 11 | `IO` | Filesystem failure |
+| 12 | `TOO_LONG` | Input beyond one request (`itts align`: more than ~72 s of audio or 600 text tokens) |
 
 ## 5. Warm daemon
 
@@ -136,7 +184,8 @@ itts daemon stop
   not reset the timer. `SIGTERM`/`SIGINT` shut it down gracefully; `SIGHUP` is ignored.
 - Files live next to the socket: `daemon.sock` (mode 0600), `daemon.lock`, `daemon.pid`,
   `daemon.log` (JSON lines, rotated at 10 MiB).
-- `synth` and `voice add` use the daemon when present. Relative paths are resolved by the client,
+- `synth`, `align`, and `voice add` use the daemon when present. The first `align` loads the
+  Stage 0 and codec encoders (about 1.5 GB), which then stay resident until the daemon exits. Relative paths are resolved by the client,
   so they mean the caller's working directory. Disconnecting a client cancels its job at the next
   sentence boundary.
 
@@ -155,6 +204,7 @@ any number of sessions share one model and `initialize` answers immediately.
 | `describe_controls` | The `itts schema controls` catalog |
 | `synthesize` | Write a WAV (`outputPath` required); returns duration, RTF, absolute path, seed, and with `timestamps` the alignment and sentences |
 | `speak` | Play through the default output device |
+| `align` | Force-align an existing recording to its text (`AlignJob` → `AlignResult`, see §3a) |
 | `list_voices`, `inspect_voice`, `register_voice`, `remove_voice` | Voice management |
 | `annotate` | DeepSeek pacing and emotion tags (text is never rewritten) |
 | `annotate_units` | One delivery per caller-supplied line (`AnnotateJob` → `AnnotateResult`; see the speech-controls guide) |
@@ -169,16 +219,18 @@ sentence just finished), and MCP cancellation stops the daemon job.
 
 ## 7. Daemon wire protocol
 
-For direct integrations, the socket speaks newline-delimited JSON (protocol version 3):
+For direct integrations, the socket speaks newline-delimited JSON (protocol version 4):
 
 ```text
-→ {"id":1,"method":"hello","clientVersion":"0.3.1","protocolVersion":3}
-← {"id":1,"event":"welcome","serverVersion":"0.3.1","protocolVersion":3}
+→ {"id":1,"method":"hello","clientVersion":"0.3.1","protocolVersion":4}
+← {"id":1,"event":"welcome","serverVersion":"0.3.1","protocolVersion":4}
 → {"id":2,"method":"synth","job":{"input":"你好","voice":"tyr","outputPath":"/abs/out.wav"},"includePcm":false}
 ← {"id":2,"event":"started",...}  {"id":2,"event":"chunk",...}  {"id":2,"event":"done",...}
 → {"id":3,"method":"cancel","target":2}
 → {"id":4,"method":"annotate","job":{"units":[{"id":"l1","text":"你好。"}]},"apiKey":"sk-..."}
 ← {"id":4,"event":"annotated","deliveries":[{"id":"l1","speedScale":0.95,...}]}
+→ {"id":5,"method":"align","job":{"audio":"/abs/line.mp3","input":"你好。","lang":"zh","phones":true}}
+← {"id":5,"event":"aligned","aligner":{...},"alignment":{...},"quality":{...},...}
 ```
 
 `apiKey` is optional (the daemon's `DEEPSEEK_API_KEY` is the fallback) and is never logged; a key

@@ -28,8 +28,8 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{
     commands::{
-        AnnotateArgs, SchemaTarget, annotate, daemon::DaemonCommand, doctor, models::ModelsCommand,
-        schema, synth::SynthArgs, voice::VoiceCommand,
+        AnnotateArgs, SchemaTarget, align::AlignArgs, annotate, daemon::DaemonCommand, doctor,
+        models::ModelsCommand, schema, synth::SynthArgs, voice::VoiceCommand,
     },
     output::{OutputMode, report_failure},
 };
@@ -63,6 +63,9 @@ struct Cli {
 enum Commands {
     /// Synthesize speech from text with a registered voice or reference audio.
     Synth(Box<SynthArgs>),
+    /// Force-align a recording to the text it speaks: per-character timings (the `synth`
+    /// alignment shape), quality, and optional phones.
+    Align(Box<AlignArgs>),
     /// Add `DeepSeek` pacing and emotion controls without rewriting the text.
     Annotate(AnnotateArgs),
     /// Manage `.itts_voice` speaker snapshots.
@@ -149,6 +152,9 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Annotate(args) => annotate(args, output).await,
         Commands::Synth(args) => {
             commands::synth::run(globals.engine_config()?, *args, output).await
+        }
+        Commands::Align(args) => {
+            commands::align::run(globals.engine_config()?, *args, output).await
         }
         Commands::Voice { action } => {
             commands::voice::run(globals.engine_config()?, action, output).await

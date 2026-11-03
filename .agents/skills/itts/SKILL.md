@@ -7,7 +7,9 @@ description: >-
   manage `.itts_voice` speaker snapshots, control 8-class speech emotions
   (`[[emo=...]]`), tune vocal inflection temperature (`[[temp=...]]`), speed
   (`[[speed=...]]`), pauses (`[[pause=...]]`), manage the warm `itts daemon`,
-  or annotate reading scripts with DeepSeek (`itts annotate`).
+  annotate reading scripts with DeepSeek (`itts annotate`), or get per-character
+  timings and phones for an existing recording from any TTS or speaker
+  (`itts align`).
 ---
 
 # `itts` Speech Synthesis & Emotional Prosody Director Skill
@@ -102,6 +104,14 @@ Useful flags: `--speed 0.9` (larger is faster), `--emo "calm:0.6"`, `--lang en`,
 - **Per-line direction:** `itts annotate --units --stdin --output json < lines.json` takes `{"units":[{"id","text"}],"brief"?}` and returns per-line `emo`, `temperature`, `speedScale`, `pauseAfterMs`, and `controls` (MCP tool `annotate_units`). Prefix each line with `controls`, or copy the fields into its synth call with `speed` = base speed × `speedScale`.
 - **Timestamps:** `--timestamps` adds `alignment` (`text` without control tags, plus per-character `start`/`end` seconds indexed by Unicode scalar) and `sentences` (`text`, `start`, `end`). Use them for subtitles, cutting one file into per-sentence clips, or syncing visuals to a word.
 
+### Aligning an existing recording
+
+`itts align --audio line.mp3 --lang zh --stdin --phones --output json < say.txt` force-aligns any recording (Gemini, ElevenLabs, Edge, a human take; WAV/MP3/FLAC/M4A, at most ~72 s) to the text it speaks and returns the same `alignment` / `sentences` shape as `synth --timestamps`, plus `quality` and, with `--phones`, pinyin initials/finals or English ARPAbet phones (`{i, p, t?, k, start, end}`). Times start at the file's 0 s.
+
+- Treat `confidence` or `coverage` below 0.95 as "the audio probably does not say this text" (omitted/extra/substituted words); `weak` lists character indices worth re-checking with speech recognition. Number readings that share syllables (`2026年` read as 两千零二十六年) are not detected.
+- Default conditioning is the recording itself; `--voice <ID>` / `--voice-file <PATH>` use a snapshot instead (faster, slightly less accurate).
+- Over-long inputs fail with `TOO_LONG` (exit 12): split the audio and text.
+
 ## 5. Directing Emotion, Tone Temperature, Speed & Pauses
 
 When generating expressive speech (poetry, storytelling, audiobooks, dialogues), **do not pass flat unannotated text** if emotional nuance is desired. Either:
@@ -142,7 +152,7 @@ For detailed calibration guidelines and complete poetry/dialogue templates (such
 
 ## 6. MCP Server
 
-`itts mcp` serves the Model Context Protocol over stdio and shares the daemon (starting it on first use), so multiple agent sessions share one resident model. Tools: `status`, `describe_controls`, `synthesize` (requires `outputPath`), `speak`, `list_voices`, `inspect_voice`, `register_voice`, `remove_voice`, `annotate`, `annotate_units`. Tool arguments use the same fields as `itts schema speech-job` (`input`, `voice`, `voiceFile`, `refAudio`, `emo`, `lang`, `speed`, `paragraphPauseMs`, `outputPath`, `sampleRate`, `timestamps`, `continuity`, `previousText`, `advanced`). Failures are `isError` results whose structured content is `{code, message, hint}`. Long jobs report `notifications/progress` per segment and honor cancellation.
+`itts mcp` serves the Model Context Protocol over stdio and shares the daemon (starting it on first use), so multiple agent sessions share one resident model. Tools: `status`, `describe_controls`, `synthesize` (requires `outputPath`), `speak`, `align` (fields of `itts schema align-job`), `list_voices`, `inspect_voice`, `register_voice`, `remove_voice`, `annotate`, `annotate_units`. Tool arguments use the same fields as `itts schema speech-job` (`input`, `voice`, `voiceFile`, `refAudio`, `emo`, `lang`, `speed`, `paragraphPauseMs`, `outputPath`, `sampleRate`, `timestamps`, `continuity`, `previousText`, `advanced`). Failures are `isError` results whose structured content is `{code, message, hint}`. Long jobs report `notifications/progress` per segment and honor cancellation.
 
 ## 7. Verification
 

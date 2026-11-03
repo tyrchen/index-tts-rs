@@ -22,6 +22,7 @@ dashmap.workspace = true
 flume.workspace = true
 hound.workspace = true
 mlx-rs.workspace = true
+pinyin.workspace = true
 realfft.workspace = true
 regex.workspace = true
 rustfft.workspace = true

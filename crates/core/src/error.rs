@@ -89,6 +89,16 @@ pub enum IndexTtsError {
         message: String,
     },
 
+    /// An input exceeds what one request can process (for example a recording longer than the
+    /// decoder's positional capacity).
+    #[error("`{field}` is too long: {reason}")]
+    TooLong {
+        /// Name of the oversized input.
+        field: &'static str,
+        /// The limit that was exceeded.
+        reason: String,
+    },
+
     /// Requested voice snapshot was not found in memory or on disk.
     #[error("voice `{voice_id}` not found")]
     VoiceNotFound {
@@ -132,6 +142,24 @@ impl IndexTtsError {
     #[must_use]
     pub fn validation(field: &'static str, reason: impl Into<String>) -> Self {
         Self::Validation {
+            field,
+            reason: reason.into(),
+        }
+    }
+
+    /// Constructs an [`IndexTtsError::TooLong`] variant.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use index_tts_rs_core::error::IndexTtsError;
+    ///
+    /// let err = IndexTtsError::too_long("audio", "80 s exceeds 72.6 s");
+    /// assert!(err.to_string().contains("audio"));
+    /// ```
+    #[must_use]
+    pub fn too_long(field: &'static str, reason: impl Into<String>) -> Self {
+        Self::TooLong {
             field,
             reason: reason.into(),
         }

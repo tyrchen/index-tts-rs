@@ -15,7 +15,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use mlx_rs::Array;
+use mlx_rs::{Array, ops::indexing::IndexOp};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -36,6 +36,8 @@ pub const DEFAULT_VOICES_SUBDIR: &str = ".cache/index-tts-rs/voices";
 pub const MAX_REF_SAMPLES_22K: usize = (MAX_REF_SECONDS as usize) * (DEFAULT_SAMPLE_RATE as usize);
 /// Maximum number of 16,000 Hz samples retained from reference audio (`15 * 16000 = 240,000`).
 pub const MAX_REF_SAMPLES_16K: usize = (MAX_REF_SECONDS as usize) * (FBANK_SAMPLE_RATE as usize);
+/// `w2v-BERT` feature frames per second (10 ms fbank hop, frames stacked in pairs).
+const SEMANTIC_FRAME_RATE: usize = 50;
 
 /// Summary descriptor for a registered `.itts_voice` snapshot in [`VoiceStore`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -373,6 +375,45 @@ impl VoiceExtractor {
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    /// Normalized `w2v-BERT` features (`hidden_states[17]`) of a whole 16 kHz recording:
+    /// `([1, T, 1024], T)` at 50 Hz.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError`] if feature extraction or GPU inference fails.
+    pub fn semantic_features(&self, audio_16k: &[f32]) -> Result<(Array, usize)> {
+        self.encode_semantic(audio_16k)
+    }
+
+    /// GPT speaker conditioning (`conds`, `[3 * 1280]`) of a recording, computed like a voice
+    /// snapshot from its first [`MAX_REF_SECONDS`]: `features` / `frames` are the recording's
+    /// [`Self::semantic_features`], reused rather than recomputed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError`] if feature extraction or GPU inference fails.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    pub fn recording_conds(
+        &self,
+        features: &Array,
+        frames: usize,
+        audio_16k: &[f32],
+    ) -> Result<Vec<f32>> {
+        let reference = truncate_ref_audio(audio_16k, FBANK_SAMPLE_RATE, MAX_REF_SECONDS);
+        let emo_frames = frames.min(MAX_REF_SECONDS as usize * SEMANTIC_FRAME_RATE);
+        let emo_features = features.index((.., ..emo_frames as i32, ..));
+        let emovec = self.emo_vec.forward(&emo_features, &[emo_frames])?;
+        let fbank = campplus_fbank(reference)?;
+        let fbank_arr = Array::from_slice(&fbank.data, &[1, fbank.num_frames as i32, 80]);
+        let style = self.campplus.forward(&fbank_arr)?;
+        let spk_cond = self.spk_proj.project(style.try_as_slice::<f32>()?)?;
+        SpeakerContext::build_conds(
+            &spk_cond,
+            emovec.try_as_slice::<f32>()?,
+            EmoAlpha::default(),
+        )
+    }
+
     fn encode_semantic(&self, wav_16k: &[f32]) -> Result<(Array, usize)> {
         Self::encode_semantic_with(&self.semantic_model, wav_16k)
     }

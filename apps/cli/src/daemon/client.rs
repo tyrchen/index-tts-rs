@@ -6,7 +6,9 @@ use std::{
 };
 
 use index_tts_rs_core::voice::VoiceEntry;
-use index_tts_rs_service::{ErrorCode, JobEvent, JobSummary, ServiceError, SpeechJob};
+use index_tts_rs_service::{
+    AlignJob, AlignResult, ErrorCode, JobEvent, JobSummary, ServiceError, SpeechJob,
+};
 use serde_json::{Value, from_value};
 use tokio::{
     io::BufReader,
@@ -153,6 +155,24 @@ impl DaemonClient {
                 Response::Error { error } => return Err(error),
                 other => return Err(unexpected(&other)),
             }
+        }
+    }
+
+    /// Force-aligns a recording using the daemon's resident models.
+    ///
+    /// # Errors
+    ///
+    /// Returns the alignment failure.
+    pub async fn align(&mut self, job: &AlignJob) -> Result<AlignResult, ServiceError> {
+        let id = self
+            .send(Request::Align {
+                job: Box::new(job.clone()),
+            })
+            .await?;
+        match self.recv(id).await? {
+            Response::Aligned(result) => Ok(*result),
+            Response::Error { error } => Err(error),
+            other => Err(unexpected(&other)),
         }
     }
 

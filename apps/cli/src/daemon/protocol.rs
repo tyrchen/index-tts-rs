@@ -10,13 +10,13 @@ use std::path::PathBuf;
 
 use index_tts_rs_core::{engine::TelemetrySnapshot, voice::VoiceEntry};
 use index_tts_rs_service::{
-    AnnotateJob, AnnotateResult, ApiKey, ChunkInfo, JobEvent, JobStarted, JobSummary, ServiceError,
-    SpeechJob,
+    AlignJob, AlignResult, AnnotateJob, AnnotateResult, ApiKey, ChunkInfo, JobEvent, JobStarted,
+    JobSummary, ServiceError, SpeechJob,
 };
 use serde::{Deserialize, Serialize};
 
 /// Protocol version; bumped on any incompatible wire change.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 /// Maximum accepted request line length in bytes.
 pub const MAX_LINE_BYTES: usize = 256 * 1024;
 
@@ -58,6 +58,11 @@ pub enum Request {
         /// Provider key for this request only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         api_key: Option<ApiKey>,
+    },
+    /// Force-align a recording to its text.
+    Align {
+        /// Job with absolute paths.
+        job: Box<AlignJob>,
     },
     /// Extract and register a voice using the resident models.
     #[serde(rename_all = "camelCase")]
@@ -210,6 +215,8 @@ pub enum Response {
     },
     /// Deliveries chosen for an `annotate` request.
     Annotated(Box<AnnotateResult>),
+    /// Result of an `align` request.
+    Aligned(Box<AlignResult>),
     /// Job planned.
     Started(JobStarted),
     /// Job chunk.
@@ -343,6 +350,15 @@ mod tests {
             }
         ));
         assert!(!format!("{envelope:?}").contains("sk-secret"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_accept_align_requests() -> serde_json::Result<()> {
+        let envelope: RequestEnvelope = from_str(
+            r#"{"id":5,"method":"align","job":{"audio":"/tmp/a.wav","input":"你好。","phones":true}}"#,
+        )?;
+        assert!(matches!(envelope.request, Request::Align { job } if job.phones));
         Ok(())
     }
 

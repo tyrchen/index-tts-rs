@@ -140,12 +140,13 @@ itts doctor --output json
 itts synth --voice narrator --text "你好。" --out hi.wav --output json
 itts synth --voice narrator --text "第一句。第二句。" --out stream.wav --output jsonl
 itts synth --voice narrator --text "第一句。第二句。" --out timed.wav --timestamps --output json
+itts align --audio take.mp3 --lang zh --text "第一句。第二句。" --phones --output json
 itts schema controls
 itts schema speech-job
 itts schema events
 ```
 
-使用 `--output text|json|jsonl` 或 `ITTS_OUTPUT` 选择格式。JSON 合成结果包含 `status`、`backend`、`durationSecs`、`synthesisSecs`、`rtf`、`outputPath`，以及可复现本次结果的 `seed`；JSONL 按 `started` → `chunk` → `done` 流式输出，每个 chunk 都标明它读的是哪段文字。加 `--timestamps` 会额外返回逐字时间 `alignment`（与 ElevenLabs `with-timestamps` 结构一致）和逐句时间 `sentences`，它们来自模型自身的文本注意力，每个任务只多花几十毫秒；详见[智能体集成指南](docs/usage/itts-agent-integration.md#3-timestamps-sentences-and-reproducible-takes)。运行时错误提供稳定的 `error.code`、`message`、`hint` 和有文档说明的退出码。CLI 参数解析错误使用 Clap 的用法提示，退出码为 2。
+使用 `--output text|json|jsonl` 或 `ITTS_OUTPUT` 选择格式。JSON 合成结果包含 `status`、`backend`、`durationSecs`、`synthesisSecs`、`rtf`、`outputPath`，以及可复现本次结果的 `seed`；JSONL 按 `started` → `chunk` → `done` 流式输出，每个 chunk 都标明它读的是哪段文字。加 `--timestamps` 会额外返回逐字时间 `alignment`（与 ElevenLabs `with-timestamps` 结构一致）和逐句时间 `sentences`，它们来自模型自身的文本注意力，每个任务只多花几十毫秒；详见[智能体集成指南](docs/usage/itts-agent-integration.md#3-timestamps-sentences-and-reproducible-takes)。`itts align` 为已有的录音（其他 TTS 引擎或真人录音）给出同样的逐字对齐，附带指出录音没念到的文字的 `quality`，以及可选的拼音声母/韵母、ARPAbet 音素时间，见[指南 §3a](docs/usage/itts-agent-integration.md#3a-aligning-any-recording-itts-align)。运行时错误提供稳定的 `error.code`、`message`、`hint` 和有文档说明的退出码。CLI 参数解析错误使用 Clap 的用法提示，退出码为 2。
 
 支持 stdio 服务的 MCP 客户端可配置：
 
@@ -157,7 +158,7 @@ itts schema events
 }
 ```
 
-确保客户端 PATH 中能找到 `itts`，也可以使用二进制绝对路径。工具包括 `status`、`describe_controls`、`synthesize`、`speak`、声音管理、`annotate` 和 `annotate_units`。MCP 首次需要时启动 daemon，多个会话共享模型。工具参数、错误、进度、取消和 socket 协议见[智能体集成指南](docs/usage/itts-agent-integration.md)。
+确保客户端 PATH 中能找到 `itts`，也可以使用二进制绝对路径。工具包括 `status`、`describe_controls`、`synthesize`、`speak`、`align`、声音管理、`annotate` 和 `annotate_units`。MCP 首次需要时启动 daemon，多个会话共享模型。工具参数、错误、进度、取消和 socket 协议见[智能体集成指南](docs/usage/itts-agent-integration.md)。
 
 ## 浏览器工作台与 HTTP
 
