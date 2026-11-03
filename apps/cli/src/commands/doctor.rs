@@ -5,7 +5,10 @@ use std::{env, path::Path};
 use anyhow::Result;
 use index_tts_rs_core::{
     config::EngineConfig,
-    models::{HIFI_MODEL_REPO, ModelWeightKind, resolve_hifi_weights, resolve_model_dir},
+    models::{
+        HIFI_MODEL_REPO, ModelWeightKind, SafeTensorsLoader, resolve_hifi_weights,
+        resolve_model_dir,
+    },
     voice::{VoiceStore, default_voices_dir},
 };
 use index_tts_rs_service::ServiceError;
@@ -37,7 +40,7 @@ pub enum CheckStatus {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Check {
-    /// Area (`platform`, `model`, `hifi`, `voices`, `daemon`, `director`, `audio`).
+    /// Area (`platform`, `model`, `hifi`, `align`, `voices`, `daemon`, `director`, `audio`).
     pub name: &'static str,
     /// Health.
     pub status: CheckStatus,
@@ -82,6 +85,7 @@ pub async fn collect(config: &EngineConfig, socket: &Path) -> DoctorReport {
         platform_check(),
         model_check(config).await,
         hifi_check().await,
+        align_check(config).await,
     ];
     checks.extend(voice_checks(config));
     checks.push(daemon_check(socket).await);
@@ -190,6 +194,56 @@ async fn hifi_check() -> Check {
         )
         .hint("run `itts models pull` to fetch the 56 MB extender weights"),
         Err(err) => Check::new("hifi", CheckStatus::Warn, format!("check failed: {err}")),
+    }
+}
+
+/// Codec encoder tensors that `itts align` loads from `raw/semantic_codec.safetensors`.
+const ALIGN_TENSORS: [&str; 3] = [
+    "down.weight",
+    "encoder.0.embed.weight",
+    "quantizer.quantizers.0.in_project.weight",
+];
+
+async fn align_check(config: &EngineConfig) -> Check {
+    let (model_dir, repo) = (config.model_dir.clone(), config.model_repo.clone());
+    let found = spawn_blocking(move || {
+        let dir = resolve_model_dir(model_dir.as_deref(), &repo)?;
+        let kind = ModelWeightKind::SemanticCodecEncoder;
+        SafeTensorsLoader::tensor_names(kind, dir.join(kind.relative_path()))
+            .map_err(ServiceError::from)
+    })
+    .await;
+    match found {
+        Ok(Ok(names)) => {
+            let missing: Vec<&str> = ALIGN_TENSORS
+                .into_iter()
+                .filter(|name| !names.iter().any(|found| found == name))
+                .collect();
+            if missing.is_empty() {
+                Check::new(
+                    "align",
+                    CheckStatus::Ok,
+                    format!(
+                        "forced alignment ready (semantic codec encoder, {} tensors)",
+                        names.len()
+                    ),
+                )
+            } else {
+                Check::new(
+                    "align",
+                    CheckStatus::Warn,
+                    format!("`itts align` unavailable: missing {}", missing.join(", ")),
+                )
+                .hint("run `itts models pull` to restore the full semantic codec weights")
+            }
+        }
+        Ok(Err(err)) => Check::new(
+            "align",
+            CheckStatus::Warn,
+            format!("`itts align` unavailable: {}", err.message),
+        )
+        .hint("run `itts models pull`"),
+        Err(err) => Check::new("align", CheckStatus::Warn, format!("check failed: {err}")),
     }
 }
 

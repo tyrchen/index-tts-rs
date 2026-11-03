@@ -636,6 +636,35 @@ impl SafeTensorsLoader {
         }
     }
 
+    /// Names of the tensors in a `safetensors` file that `kind` keeps, reading only the header.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError`] if the file cannot be read or its header is invalid.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use index_tts_rs_core::models::{ModelWeightKind, SafeTensorsLoader, resolve_model_dir};
+    ///
+    /// if let Ok(dir) = resolve_model_dir(None, "yunfengwang/IndexTTS-2.5-mlx") {
+    ///     let names = SafeTensorsLoader::tensor_names(
+    ///         ModelWeightKind::SemanticCodecEncoder,
+    ///         dir.join("raw/semantic_codec.safetensors"),
+    ///     )?;
+    ///     assert!(names.iter().any(|name| name == "down.weight"));
+    /// }
+    /// # Ok::<(), index_tts_rs_core::error::IndexTtsError>(())
+    /// ```
+    pub fn tensor_names(kind: ModelWeightKind, path: impl AsRef<Path>) -> Result<Vec<String>> {
+        let (_, metadata, _) = read_header(path.as_ref(), kind.relative_path())?;
+        Ok(metadata
+            .offset_keys()
+            .into_iter()
+            .filter(|key| Self::should_keep_tensor(kind, key))
+            .collect())
+    }
+
     /// Loads and transforms a `SafeTensors` byte buffer according to `kind`.
     ///
     /// # Errors
@@ -740,63 +769,9 @@ impl SafeTensorsLoader {
         kind: ModelWeightKind,
         path: impl AsRef<Path>,
     ) -> Result<FilteredWeights> {
-        const MAX_SAFETENSORS_HEADER_BYTES: usize = 100_000_000;
-
         let path_ref = path.as_ref();
-        validate_safe_file_path(path_ref, "weight_path")?;
         let artifact = kind.relative_path();
-
-        let mut file = fs::File::open(path_ref).map_err(|err| IndexTtsError::io(path_ref, err))?;
-        let file_len = usize::try_from(
-            file.metadata()
-                .map_err(|err| IndexTtsError::io(path_ref, err))?
-                .len(),
-        )
-        .map_err(|_| IndexTtsError::weight_load(artifact, "file size exceeds usize::MAX"))?;
-
-        if file_len < 8 {
-            return Err(IndexTtsError::weight_load(
-                artifact,
-                "safetensors file smaller than 8-byte header prefix",
-            ));
-        }
-
-        let mut len_bytes = [0_u8; 8];
-        file.read_exact(&mut len_bytes)
-            .map_err(|err| IndexTtsError::io(path_ref, err))?;
-        let header_len = usize::try_from(u64::from_le_bytes(len_bytes)).map_err(|_| {
-            IndexTtsError::weight_load(artifact, "safetensors header length overflow")
-        })?;
-        if header_len == 0 || header_len > MAX_SAFETENSORS_HEADER_BYTES {
-            return Err(IndexTtsError::weight_load(
-                artifact,
-                format!("invalid safetensors header length {header_len}"),
-            ));
-        }
-        let data_base = 8_usize.checked_add(header_len).ok_or_else(|| {
-            IndexTtsError::weight_load(artifact, "safetensors header offset overflow")
-        })?;
-        if data_base > file_len {
-            return Err(IndexTtsError::weight_load(
-                artifact,
-                "safetensors header length exceeds file size",
-            ));
-        }
-
-        let mut header_buf = vec![0_u8; header_len];
-        file.read_exact(&mut header_buf)
-            .map_err(|err| IndexTtsError::io(path_ref, err))?;
-        let metadata: Metadata = serde_json::from_slice(&header_buf).map_err(|err| {
-            IndexTtsError::weight_load(artifact, format!("safetensors header parse failed: {err}"))
-        })?;
-        drop(header_buf);
-
-        if data_base.saturating_add(metadata.data_len()) != file_len {
-            return Err(IndexTtsError::weight_load(
-                artifact,
-                "safetensors data section length does not match file size",
-            ));
-        }
+        let (mut file, metadata, data_base) = read_header(path_ref, artifact)?;
 
         let mut tensors = HashMap::new();
         let mut buffers = HashMap::new();
@@ -1421,6 +1396,65 @@ fn candidate_hf_hub_roots() -> Vec<PathBuf> {
         );
     }
     roots
+}
+
+/// Largest accepted `safetensors` JSON header.
+const MAX_SAFETENSORS_HEADER_BYTES: usize = 100_000_000;
+
+/// Opens a `safetensors` file and parses its header, returning the open file, the header, and
+/// the byte offset where tensor data starts. Validates that the data section fills the file.
+#[allow(
+    clippy::disallowed_types,
+    reason = "weights load synchronously on the MLX worker thread or in spawn_blocking"
+)]
+fn read_header(path: &Path, artifact: &str) -> Result<(fs::File, Metadata, usize)> {
+    validate_safe_file_path(path, "weight_path")?;
+    let mut file = fs::File::open(path).map_err(|err| IndexTtsError::io(path, err))?;
+    let file_len = usize::try_from(
+        file.metadata()
+            .map_err(|err| IndexTtsError::io(path, err))?
+            .len(),
+    )
+    .map_err(|_| IndexTtsError::weight_load(artifact, "file size exceeds usize::MAX"))?;
+    if file_len < 8 {
+        return Err(IndexTtsError::weight_load(
+            artifact,
+            "safetensors file smaller than 8-byte header prefix",
+        ));
+    }
+    let mut len_bytes = [0_u8; 8];
+    file.read_exact(&mut len_bytes)
+        .map_err(|err| IndexTtsError::io(path, err))?;
+    let header_len = usize::try_from(u64::from_le_bytes(len_bytes))
+        .map_err(|_| IndexTtsError::weight_load(artifact, "safetensors header length overflow"))?;
+    if header_len == 0 || header_len > MAX_SAFETENSORS_HEADER_BYTES {
+        return Err(IndexTtsError::weight_load(
+            artifact,
+            format!("invalid safetensors header length {header_len}"),
+        ));
+    }
+    let data_base = 8_usize.checked_add(header_len).ok_or_else(|| {
+        IndexTtsError::weight_load(artifact, "safetensors header offset overflow")
+    })?;
+    if data_base > file_len {
+        return Err(IndexTtsError::weight_load(
+            artifact,
+            "safetensors header length exceeds file size",
+        ));
+    }
+    let mut header_buf = vec![0_u8; header_len];
+    file.read_exact(&mut header_buf)
+        .map_err(|err| IndexTtsError::io(path, err))?;
+    let metadata: Metadata = serde_json::from_slice(&header_buf).map_err(|err| {
+        IndexTtsError::weight_load(artifact, format!("safetensors header parse failed: {err}"))
+    })?;
+    if data_base.saturating_add(metadata.data_len()) != file_len {
+        return Err(IndexTtsError::weight_load(
+            artifact,
+            "safetensors data section length does not match file size",
+        ));
+    }
+    Ok((file, metadata, data_base))
 }
 
 /// Locates the pinned bandwidth-extender weights in the Hugging Face cache and verifies their

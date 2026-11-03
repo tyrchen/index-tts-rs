@@ -508,10 +508,9 @@ mod tests {
             frames: 0,
             columns: 0,
         };
-        assert!(
-            decode_tokens(empty, &[], 0.04, &[], 22_050)
-                .intervals
-                .is_empty()
+        assert_eq!(
+            decode_tokens(empty, &[], 0.04, &[], 22_050),
+            super::DecodedTokens::default()
         );
     }
 

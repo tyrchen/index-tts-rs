@@ -1,5 +1,6 @@
 //! Subcommand implementations.
 
+pub mod align;
 pub mod daemon;
 pub mod doctor;
 pub mod models;
@@ -56,6 +57,10 @@ pub enum SchemaTarget {
     AnnotateJob,
     /// JSON Schema of `itts annotate --units` output (`AnnotateResult`).
     AnnotateResult,
+    /// JSON Schema of the alignment request (`AlignJob`).
+    AlignJob,
+    /// JSON Schema of `itts align --output json` (`AlignResult`).
+    AlignResult,
 }
 
 /// Runs `itts annotate`.
@@ -122,6 +127,8 @@ pub fn schema(target: SchemaTarget) -> Result<()> {
         SchemaTarget::Error => json_schema(SchemaKind::Error),
         SchemaTarget::AnnotateJob => json_schema(SchemaKind::AnnotateJob),
         SchemaTarget::AnnotateResult => json_schema(SchemaKind::AnnotateResult),
+        SchemaTarget::AlignJob => json_schema(SchemaKind::AlignJob),
+        SchemaTarget::AlignResult => json_schema(SchemaKind::AlignResult),
         SchemaTarget::Controls => to_value(catalog())?,
     };
     OutputMode::Json.emit(&value, |_| Ok(()))

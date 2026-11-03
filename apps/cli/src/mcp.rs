@@ -19,8 +19,8 @@ use index_tts_rs_core::{
 };
 use index_tts_rs_director::{Director, DirectorConfig};
 use index_tts_rs_service::{
-    AnnotateJob, AnnotateResult, Catalog, ErrorCode, JobEvent, JobSummary, ServiceError, SpeechJob,
-    catalog, resolve_input_path,
+    AlignJob, AlignResult, AnnotateJob, AnnotateResult, Catalog, ErrorCode, JobEvent, JobSummary,
+    ServiceError, SpeechJob, catalog, resolve_input_path,
 };
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
@@ -49,13 +49,13 @@ use crate::{
     player::Playback,
 };
 
-const INSTRUCTIONS: &str = "Expressive text-to-speech and voice cloning (IndexTTS-2.5). Call \
-                            `status` first to see registered voices and readiness, and \
-                            `describe_controls` for inline control syntax ([[pause=600]], \
-                            [[speed=0.9]], [[emo=calm:0.6]], [[temp=0.7]]) and emotion names. \
-                            `synthesize` writes a WAV (outputPath required); `speak` plays aloud. \
-                            Relative paths resolve against the server's working directory. Errors \
-                            are structured {code, message, hint}; follow the hint.";
+const INSTRUCTIONS: &str =
+    "Expressive text-to-speech and voice cloning (IndexTTS-2.5). Call `status` first to see \
+     registered voices and readiness, and `describe_controls` for inline control syntax \
+     ([[pause=600]], [[speed=0.9]], [[emo=calm:0.6]], [[temp=0.7]]) and emotion names. \
+     `synthesize` writes a WAV (outputPath required); `speak` plays aloud; `align` times an \
+     existing recording against its text. Relative paths resolve against the server's working \
+     directory. Errors are structured {code, message, hint}; follow the hint.";
 
 /// Arguments for `register_voice`.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -163,6 +163,16 @@ fn tools() -> Vec<Tool> {
             writes.clone(),
         )
         .with_raw_output_schema(schema_for_output::<JobSummary>()),
+        tool::<AlignJob>(
+            "align",
+            "Force-align an existing recording (any TTS or human speech, at most ~72 s) to the \
+             text it speaks: per-character `alignment` in the same shape as synthesize, \
+             `sentences`, `quality` (confidence, coverage, weak character indices; low values \
+             mean the audio may not say the text), and with phones:true pinyin initial/final or \
+             ARPAbet phone timings.",
+            read_only.clone(),
+        )
+        .with_raw_output_schema(schema_for_output::<AlignResult>()),
         tool::<NoArgs>("list_voices", "List registered voices.", read_only.clone()),
         tool::<VoiceIdArgs>(
             "inspect_voice",
@@ -272,6 +282,11 @@ impl IttsMcp {
                 json_value(&self.synthesize(job, false, context).await?)
             }
             "speak" => json_value(&self.synthesize(parse(name, args)?, true, context).await?),
+            "align" => {
+                let mut job: AlignJob = parse(name, args)?;
+                job.resolve_paths(&self.cwd)?;
+                json_value(&self.client().await?.align(&job).await?)
+            }
             "list_voices" => {
                 parse::<NoArgs>(name, args)?;
                 Ok(json!({ "voices": self.store()?.list()? }))
@@ -432,6 +447,7 @@ mod tests {
             "status",
             "describe_controls",
             "register_voice",
+            "align",
         ] {
             assert!(names.contains(expected), "missing tool {expected}");
         }

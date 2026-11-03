@@ -27,8 +27,8 @@ use index_tts_rs_core::{
 };
 use index_tts_rs_director::DirectorConfig;
 use index_tts_rs_service::{
-    Backend, ErrorCode, JobAccumulator, JobRun, JobStarted, JobSummary, PathPolicy, ServiceError,
-    SpeechJob,
+    AlignJob, AlignResult, Backend, ErrorCode, JobAccumulator, JobRun, JobStarted, JobSummary,
+    PathPolicy, ServiceError, SpeechJob, run_align,
 };
 use tokio::{
     fs,
@@ -605,42 +605,28 @@ async fn dispatch(
             send(tx, id, Response::Cancelled { found }).await;
         }
         Request::Synth { job, include_pcm } => {
-            let Some(slot) = shared.try_acquire_slot() else {
-                send(tx, id, error_response(busy(shared))).await;
-                return;
-            };
-            let (shared, tx) = (Arc::clone(shared), tx.clone());
-            let handle = tasks.spawn(async move {
-                let result = synth(&shared, id, *job, include_pcm, &tx).await;
-                finish_request(
-                    &shared,
-                    &tx,
-                    id,
-                    result.map(|s| Response::Done(Box::new(s))),
-                )
-                .await;
-                drop(slot);
-            });
-            jobs.insert(id, handle);
+            spawn_job(shared, tx, id, jobs, tasks, move |shared, tx| async move {
+                synth(&shared, id, *job, include_pcm, &tx)
+                    .await
+                    .map(|s| Response::Done(Box::new(s)))
+            })
+            .await;
         }
         Request::Annotate { job, api_key } => {
-            let Some(slot) = shared.try_acquire_slot() else {
-                send(tx, id, error_response(busy(shared))).await;
-                return;
-            };
-            let (shared, tx) = (Arc::clone(shared), tx.clone());
-            let handle = tasks.spawn(async move {
-                let result = job.run(DirectorConfig::default(), api_key.as_ref()).await;
-                finish_request(
-                    &shared,
-                    &tx,
-                    id,
-                    result.map(|r| Response::Annotated(Box::new(r))),
-                )
-                .await;
-                drop(slot);
-            });
-            jobs.insert(id, handle);
+            spawn_job(shared, tx, id, jobs, tasks, |_, _| async move {
+                job.run(DirectorConfig::default(), api_key.as_ref())
+                    .await
+                    .map(|r| Response::Annotated(Box::new(r)))
+            })
+            .await;
+        }
+        Request::Align { job } => {
+            spawn_job(shared, tx, id, jobs, tasks, |shared, _| async move {
+                align(&shared, *job)
+                    .await
+                    .map(|r| Response::Aligned(Box::new(r)))
+            })
+            .await;
         }
         Request::VoiceAdd {
             voice_id,
@@ -649,22 +635,43 @@ async fn dispatch(
             emo_alpha,
             emo,
         } => {
-            let Some(slot) = shared.try_acquire_slot() else {
-                send(tx, id, error_response(busy(shared))).await;
-                return;
-            };
-            let (shared, tx) = (Arc::clone(shared), tx.clone());
-            let handle = tasks.spawn(async move {
-                let result = voice_add(&shared, voice_id, ref_audio, emo_ref, emo_alpha, emo).await;
-                let response = result.map(|voice| Response::Voice {
-                    voice: Box::new(voice),
-                });
-                finish_request(&shared, &tx, id, response).await;
-                drop(slot);
-            });
-            jobs.insert(id, handle);
+            spawn_job(shared, tx, id, jobs, tasks, |shared, _| async move {
+                voice_add(&shared, voice_id, ref_audio, emo_ref, emo_alpha, emo)
+                    .await
+                    .map(|voice| Response::Voice {
+                        voice: Box::new(voice),
+                    })
+            })
+            .await;
         }
     }
+}
+
+/// Runs one request on its own task when a slot is free (otherwise answers `BUSY`), reporting
+/// its outcome and registering it for cancellation.
+async fn spawn_job<F, Fut>(
+    shared: &Arc<Shared>,
+    tx: &Outbound,
+    id: u64,
+    jobs: &mut HashMap<u64, AbortHandle>,
+    tasks: &mut JoinSet<()>,
+    job: F,
+) where
+    F: FnOnce(Arc<Shared>, Outbound) -> Fut,
+    Fut: Future<Output = Result<Response, ServiceError>> + Send + 'static,
+{
+    let Some(slot) = shared.try_acquire_slot() else {
+        send(tx, id, error_response(busy(shared))).await;
+        return;
+    };
+    let work = job(Arc::clone(shared), tx.clone());
+    let (shared, tx) = (Arc::clone(shared), tx.clone());
+    let handle = tasks.spawn(async move {
+        let result = work.await;
+        finish_request(&shared, &tx, id, result).await;
+        drop(slot);
+    });
+    jobs.insert(id, handle);
 }
 
 async fn finish_request(
@@ -718,6 +725,12 @@ async fn synth(
         }
     }
     acc.finish(started.elapsed(), output_path.as_deref())
+}
+
+async fn align(shared: &Shared, job: AlignJob) -> Result<AlignResult, ServiceError> {
+    let engine = shared.ready_engine().await?;
+    let prepared = job.prepare(engine.config(), PathPolicy::LocalAbsolute)?;
+    run_align(&engine, prepared).await
 }
 
 async fn voice_add(

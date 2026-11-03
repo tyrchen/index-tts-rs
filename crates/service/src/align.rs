@@ -535,12 +535,18 @@ mod tests {
         let mut quality = AlignmentQuality::default();
         quality.confidence = 0.8;
         quality.coverage = 0.5;
-        quality.weak = vec![1..3];
+        quality.weak.push(1..3);
         output.quality = quality;
         let result = assemble(&prepared("你好。", false), &output, 0.05);
         assert_eq!(result.alignment.start.len(), 3);
         assert!(result.alignment.end.iter().all(|&t| t <= 1.0));
-        assert!(result.alignment.start.windows(2).all(|w| w[0] <= w[1]));
+        assert!(
+            result
+                .alignment
+                .start
+                .windows(2)
+                .all(|w| w.first() <= w.last())
+        );
         assert_eq!(result.quality.weak, vec![1]);
         assert_eq!(result.aligner.heads, "L4H10+L5H10");
         assert_eq!(result.sentences.len(), 1);
