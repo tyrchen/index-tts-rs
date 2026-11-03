@@ -1,16 +1,22 @@
-//! `RepCodec` (`raw/semantic_codec.safetensors`) decoder-only MLX implementation.
+//! `RepCodec` (`raw/semantic_codec.safetensors`) MLX implementation.
 //!
-//! Decodes discrete semantic tokens `[B, T]` (`0..8192`) into `[B, 2*T, 1024]` continuous
-//! representations via factorized vector dequantization (`8 -> 1024`), a 12-layer Vocos `ConvNeXt`
-//! backbone (`384` channels), linear projection (`384 -> 1024`), 2x nearest-neighbor repetition,
-//! and a final `Conv1d(1024 -> 1024, k=3)` smoothing layer.
+//! [`SemanticEncoder`] quantizes `w2v-BERT` features into semantic codes (used to align external
+//! recordings); [`SemanticCodec`] decodes discrete semantic tokens `[B, T]` (`0..8192`) into `[B,
+//! 2*T, 1024]` continuous representations via factorized vector dequantization (`8 -> 1024`), a
+//! 12-layer Vocos `ConvNeXt` backbone (`384` channels), linear projection (`384 -> 1024`), 2x
+//! nearest-neighbor repetition, and a final `Conv1d(1024 -> 1024, k=3)` smoothing layer.
 
 use std::path::Path;
 
 use mlx_rs::{
-    Array,
+    Array, Dtype,
     fast::layer_norm,
-    ops::{addmm, conv1d, indexing::TryIndexOp},
+    nn::gelu,
+    ops::{
+        addmm, conv1d,
+        indexing::{TryIndexOp, argmax_axis},
+        matmul, maximum, sqrt,
+    },
 };
 
 use crate::{
@@ -35,12 +41,10 @@ pub const CODEC_NORM_EPS: f32 = 1e-6;
 /// Temporal upsampling repetition factor (`2`).
 pub const CODEC_UPSAMPLE_FACTOR: i32 = 2;
 
-/// Decoder-only `SemanticCodec` (`raw/semantic_codec.safetensors`).
+/// Vocos backbone shared by the codec encoder (`encoder.0`) and decoder (`decoder.0`):
+/// `Conv1d(1024 -> 384, k=7)` → `LayerNorm` → 12 × `ConvNeXt` → `LayerNorm`.
 #[derive(Debug, Clone)]
-pub struct SemanticCodec {
-    codebook_weight: Array,
-    out_proj_weight: Array,
-    out_proj_bias: Array,
+struct VocosBackbone {
     embed_weight: Array,
     embed_bias: Array,
     norm_weight: Array,
@@ -48,6 +52,62 @@ pub struct SemanticCodec {
     convnext: Vec<ConvNeXtBlock>,
     final_norm_weight: Array,
     final_norm_bias: Array,
+}
+
+impl VocosBackbone {
+    fn from_weights(weights: &FilteredWeights, prefix: &str) -> Result<Self> {
+        let tensor = |name: &str, shape: &[usize]| {
+            weights.tensor_array_shaped(&format!("{prefix}.{name}"), shape)
+        };
+        let convnext = (0..CODEC_NUM_LAYERS)
+            .map(|i| {
+                ConvNeXtBlock::from_weights(
+                    weights,
+                    &format!("{prefix}.convnext.{i}"),
+                    CODEC_VOCOS_DIM,
+                    CODEC_INTERMEDIATE,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            embed_weight: tensor("embed.weight", &[CODEC_VOCOS_DIM, 7, CODEC_HIDDEN])?,
+            embed_bias: tensor("embed.bias", &[CODEC_VOCOS_DIM])?,
+            norm_weight: tensor("norm.weight", &[CODEC_VOCOS_DIM])?,
+            norm_bias: tensor("norm.bias", &[CODEC_VOCOS_DIM])?,
+            convnext,
+            final_norm_weight: tensor("final_layer_norm.weight", &[CODEC_VOCOS_DIM])?,
+            final_norm_bias: tensor("final_layer_norm.bias", &[CODEC_VOCOS_DIM])?,
+        })
+    }
+
+    /// `[B, T, 1024]` → `[B, T, 384]`.
+    fn forward(&self, x: &Array) -> Result<Array> {
+        let mut h = conv1d(x, &self.embed_weight, 1, 3, 1, 1)?.add(&self.embed_bias)?;
+        h = layer_norm(
+            &h,
+            Some(&self.norm_weight),
+            Some(&self.norm_bias),
+            CODEC_NORM_EPS,
+        )?;
+        for block in &self.convnext {
+            h = block.forward(&h)?;
+        }
+        Ok(layer_norm(
+            &h,
+            Some(&self.final_norm_weight),
+            Some(&self.final_norm_bias),
+            CODEC_NORM_EPS,
+        )?)
+    }
+}
+
+/// Decoder-only `SemanticCodec` (`raw/semantic_codec.safetensors`).
+#[derive(Debug, Clone)]
+pub struct SemanticCodec {
+    codebook_weight: Array,
+    out_proj_weight: Array,
+    out_proj_bias: Array,
+    backbone: VocosBackbone,
     proj_out_weight: Array,
     proj_out_bias: Array,
     up_weight: Array,
@@ -80,63 +140,24 @@ impl SemanticCodec {
     /// # Ok::<(), index_tts_rs_core::error::IndexTtsError>(())
     /// ```
     pub fn from_weights(weights: &FilteredWeights) -> Result<Self> {
-        let codebook_weight = weights.tensor_array_shaped(
-            "quantizer.quantizers.0.codebook.weight",
-            &[CODEC_CODEBOOK_SIZE, CODEC_CODEBOOK_DIM],
-        )?;
-        let out_proj_weight = weights.tensor_array_shaped(
-            "quantizer.quantizers.0.out_project.weight",
-            &[CODEC_HIDDEN, 1, CODEC_CODEBOOK_DIM],
-        )?;
-        let out_proj_bias = weights
-            .tensor_array_shaped("quantizer.quantizers.0.out_project.bias", &[CODEC_HIDDEN])?;
-
-        let embed_weight = weights.tensor_array_shaped(
-            "decoder.0.embed.weight",
-            &[CODEC_VOCOS_DIM, 7, CODEC_HIDDEN],
-        )?;
-        let embed_bias = weights.tensor_array_shaped("decoder.0.embed.bias", &[CODEC_VOCOS_DIM])?;
-        let norm_weight =
-            weights.tensor_array_shaped("decoder.0.norm.weight", &[CODEC_VOCOS_DIM])?;
-        let norm_bias = weights.tensor_array_shaped("decoder.0.norm.bias", &[CODEC_VOCOS_DIM])?;
-
-        let convnext = (0..CODEC_NUM_LAYERS)
-            .map(|i| {
-                ConvNeXtBlock::from_weights(
-                    weights,
-                    &format!("decoder.0.convnext.{i}"),
-                    CODEC_VOCOS_DIM,
-                    CODEC_INTERMEDIATE,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let final_norm_weight =
-            weights.tensor_array_shaped("decoder.0.final_layer_norm.weight", &[CODEC_VOCOS_DIM])?;
-        let final_norm_bias =
-            weights.tensor_array_shaped("decoder.0.final_layer_norm.bias", &[CODEC_VOCOS_DIM])?;
-        let proj_out_weight =
-            weights.tensor_array_shaped("decoder.1.weight", &[CODEC_HIDDEN, CODEC_VOCOS_DIM])?;
-        let proj_out_bias = weights.tensor_array_shaped("decoder.1.bias", &[CODEC_HIDDEN])?;
-        let up_weight =
-            weights.tensor_array_shaped("up.weight", &[CODEC_HIDDEN, 3, CODEC_HIDDEN])?;
-        let up_bias = weights.tensor_array_shaped("up.bias", &[CODEC_HIDDEN])?;
-
         Ok(Self {
-            codebook_weight,
-            out_proj_weight,
-            out_proj_bias,
-            embed_weight,
-            embed_bias,
-            norm_weight,
-            norm_bias,
-            convnext,
-            final_norm_weight,
-            final_norm_bias,
-            proj_out_weight,
-            proj_out_bias,
-            up_weight,
-            up_bias,
+            codebook_weight: weights.tensor_array_shaped(
+                "quantizer.quantizers.0.codebook.weight",
+                &[CODEC_CODEBOOK_SIZE, CODEC_CODEBOOK_DIM],
+            )?,
+            out_proj_weight: weights.tensor_array_shaped(
+                "quantizer.quantizers.0.out_project.weight",
+                &[CODEC_HIDDEN, 1, CODEC_CODEBOOK_DIM],
+            )?,
+            out_proj_bias: weights
+                .tensor_array_shaped("quantizer.quantizers.0.out_project.bias", &[CODEC_HIDDEN])?,
+            backbone: VocosBackbone::from_weights(weights, "decoder.0")?,
+            proj_out_weight: weights
+                .tensor_array_shaped("decoder.1.weight", &[CODEC_HIDDEN, CODEC_VOCOS_DIM])?,
+            proj_out_bias: weights.tensor_array_shaped("decoder.1.bias", &[CODEC_HIDDEN])?,
+            up_weight: weights
+                .tensor_array_shaped("up.weight", &[CODEC_HIDDEN, 3, CODEC_HIDDEN])?,
+            up_bias: weights.tensor_array_shaped("up.bias", &[CODEC_HIDDEN])?,
         })
     }
 
@@ -153,7 +174,7 @@ impl SemanticCodec {
     /// Returns the number of `ConvNeXt` layers (`12`).
     #[must_use]
     pub fn num_layers(&self) -> usize {
-        self.convnext.len()
+        self.backbone.convnext.len()
     }
 
     /// Decodes a `[B, T]` integer token tensor (`0..8192`) into `[B, 2*T, 1024]` continuous
@@ -199,25 +220,8 @@ impl SemanticCodec {
         let z_q = self.codebook_weight.try_index(codes)?;
         let x = conv1d(&z_q, &self.out_proj_weight, 1, 0, 1, 1)?.add(&self.out_proj_bias)?;
 
-        // 2. VocosBackbone (decoder.0): embed -> norm -> 12x ConvNeXtBlock -> final_layer_norm
-        let mut h = conv1d(&x, &self.embed_weight, 1, 3, 1, 1)?.add(&self.embed_bias)?;
-        h = layer_norm(
-            &h,
-            Some(&self.norm_weight),
-            Some(&self.norm_bias),
-            CODEC_NORM_EPS,
-        )?;
-        for block in &self.convnext {
-            h = block.forward(&h)?;
-        }
-        h = layer_norm(
-            &h,
-            Some(&self.final_norm_weight),
-            Some(&self.final_norm_bias),
-            CODEC_NORM_EPS,
-        )?;
-
-        // 3. Linear projection (decoder.1): [B, T, 384] -> [B, T, 1024]
+        // 2. VocosBackbone (decoder.0) -> 3. Linear projection (decoder.1): [B, T, 384] -> 1024
+        let h = self.backbone.forward(&x)?;
         let h = addmm(
             &self.proj_out_bias,
             &h,
@@ -232,6 +236,116 @@ impl SemanticCodec {
         out.eval()?;
         Ok(out)
     }
+}
+
+/// Encoder half of the `SemanticCodec` (`EnhancedCodec.quantize` upstream): turns normalized
+/// `w2v-BERT` features (50 Hz) into the 25 Hz semantic codes the GPT decoder is trained on.
+///
+/// `down` `Conv1d(k=3, s=2)` → GELU → Vocos backbone (`encoder.0`) → `Linear(384 -> 1024)`
+/// (`encoder.1`) → `in_project` `Conv1d(1024 -> 8)` → nearest codebook entry by cosine
+/// similarity (both sides L2-normalized, as in the factorized vector quantizer).
+#[derive(Debug, Clone)]
+pub struct SemanticEncoder {
+    down_weight: Array,
+    down_bias: Array,
+    backbone: VocosBackbone,
+    proj_weight: Array,
+    proj_bias: Array,
+    in_proj_weight: Array,
+    in_proj_bias: Array,
+    /// Codebook rows L2-normalized once at load, `[8192, 8]`.
+    unit_codebook: Array,
+}
+
+impl SemanticEncoder {
+    /// Constructs a [`SemanticEncoder`] from weights filtered with
+    /// [`ModelWeightKind::SemanticCodecEncoder`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError::WeightLoad`] if a tensor is missing or has an unexpected shape.
+    pub fn from_weights(weights: &FilteredWeights) -> Result<Self> {
+        let codebook = weights.tensor_array_shaped(
+            "quantizer.quantizers.0.codebook.weight",
+            &[CODEC_CODEBOOK_SIZE, CODEC_CODEBOOK_DIM],
+        )?;
+        Ok(Self {
+            down_weight: weights
+                .tensor_array_shaped("down.weight", &[CODEC_HIDDEN, 3, CODEC_HIDDEN])?,
+            down_bias: weights.tensor_array_shaped("down.bias", &[CODEC_HIDDEN])?,
+            backbone: VocosBackbone::from_weights(weights, "encoder.0")?,
+            proj_weight: weights
+                .tensor_array_shaped("encoder.1.weight", &[CODEC_HIDDEN, CODEC_VOCOS_DIM])?,
+            proj_bias: weights.tensor_array_shaped("encoder.1.bias", &[CODEC_HIDDEN])?,
+            in_proj_weight: weights.tensor_array_shaped(
+                "quantizer.quantizers.0.in_project.weight",
+                &[CODEC_CODEBOOK_DIM, 1, CODEC_HIDDEN],
+            )?,
+            in_proj_bias: weights.tensor_array_shaped(
+                "quantizer.quantizers.0.in_project.bias",
+                &[CODEC_CODEBOOK_DIM],
+            )?,
+            unit_codebook: l2_normalize(&codebook)?,
+        })
+    }
+
+    /// Loads the encoder tensors of `raw/semantic_codec.safetensors`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError`] if the file cannot be read or tensors fail validation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mlx_rs::Array;
+    /// use index_tts_rs_core::models::{SemanticEncoder, resolve_model_dir};
+    ///
+    /// if let Ok(dir) = resolve_model_dir(None, "yunfengwang/IndexTTS-2.5-mlx") {
+    ///     let encoder =
+    ///         SemanticEncoder::load_from_path(dir.join("raw/semantic_codec.safetensors"))?;
+    ///     let features = Array::zeros::<f32>(&[1, 9, 1024])?;
+    ///     assert_eq!(encoder.quantize(&features)?.len(), 5);
+    /// }
+    /// # Ok::<(), index_tts_rs_core::error::IndexTtsError>(())
+    /// ```
+    pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let weights =
+            SafeTensorsLoader::load_from_path(ModelWeightKind::SemanticCodecEncoder, path)?;
+        Self::from_weights(&weights)
+    }
+
+    /// Quantizes `[1, T, 1024]` normalized semantic features into `ceil(T / 2)` codes
+    /// (`0..8192`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError::Validation`] for a non-`[1, T, 1024]` input with `T > 0`, or
+    /// [`IndexTtsError::Mlx`] if GPU execution fails.
+    pub fn quantize(&self, features: &Array) -> Result<Vec<i32>> {
+        let shape = features.shape();
+        if shape.len() != 3 || shape.first() != Some(&1) || shape.get(1).is_none_or(|&t| t <= 0) {
+            return Err(IndexTtsError::validation(
+                "features",
+                format!("expected [1, T, {CODEC_HIDDEN}] semantic features, got {shape:?}"),
+            ));
+        }
+        let x = conv1d(features, &self.down_weight, 2, 1, 1, 1)?.add(&self.down_bias)?;
+        let x = gelu(&x)?;
+        let h = self.backbone.forward(&x)?;
+        let h = addmm(&self.proj_bias, &h, self.proj_weight.t(), None, None)?;
+        let z_e = conv1d(&h, &self.in_proj_weight, 1, 0, 1, 1)?.add(&self.in_proj_bias)?;
+        let scores = matmul(&l2_normalize(&z_e)?, self.unit_codebook.t())?;
+        let codes = argmax_axis(&scores, -1, None)?.as_dtype(Dtype::Int32)?;
+        codes.eval()?;
+        Ok(codes.try_as_slice::<i32>()?.to_vec())
+    }
+}
+
+/// `x / max(‖x‖₂, 1e-12)` along the last axis (`torch.nn.functional.normalize`).
+fn l2_normalize(x: &Array) -> Result<Array> {
+    let norm = sqrt(&x.square()?.sum_axis(-1, true)?)?;
+    Ok(x.divide(&maximum(&norm, Array::from_f32(1e-12))?)?)
 }
 
 #[cfg(test)]

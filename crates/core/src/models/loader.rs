@@ -55,6 +55,10 @@ pub enum ModelWeightKind {
     SemanticModel,
     /// `raw/semantic_codec.safetensors` (skips `encoder.*`, `down.*`, `*.in_project.*`).
     SemanticCodec,
+    /// The encoder half of `raw/semantic_codec.safetensors` (keeps `encoder.*`, `down.*`, and the
+    /// quantizer's `in_project` and codebook). Not part of [`Self::ALL`]: same artifact as
+    /// [`Self::SemanticCodec`].
+    SemanticCodecEncoder,
     /// `raw/length_regulator.safetensors` (skips `embedding.weight`, `mask_token`).
     LengthRegulator,
     /// `raw/bigvgan.safetensors` (deduplicates 218 Kaiser-Sinc filters, transposes
@@ -101,7 +105,7 @@ impl ModelWeightKind {
             Self::GptInt8 => "gpt_int8.safetensors",
             Self::CfmEstimator => "cfm_estimator.safetensors",
             Self::SemanticModel => "raw/semantic_model.safetensors",
-            Self::SemanticCodec => "raw/semantic_codec.safetensors",
+            Self::SemanticCodec | Self::SemanticCodecEncoder => "raw/semantic_codec.safetensors",
             Self::LengthRegulator => "raw/length_regulator.safetensors",
             Self::BigVgan => "raw/bigvgan.safetensors",
             Self::EmoVec => "raw/emo.safetensors",
@@ -614,6 +618,12 @@ impl SafeTensorsLoader {
                     && !raw_key.starts_with("down.")
                     && !raw_key.contains(".in_project.")
             }
+            ModelWeightKind::SemanticCodecEncoder => {
+                raw_key.starts_with("encoder.")
+                    || raw_key.starts_with("down.")
+                    || raw_key.starts_with("quantizer.quantizers.0.in_project.")
+                    || raw_key == "quantizer.quantizers.0.codebook.weight"
+            }
             ModelWeightKind::LengthRegulator => {
                 raw_key != "embedding.weight" && raw_key != "mask_token"
             }
@@ -957,6 +967,7 @@ fn remap_key_and_transpose_rule(
         }
         ModelWeightKind::SemanticModel
         | ModelWeightKind::SemanticCodec
+        | ModelWeightKind::SemanticCodecEncoder
         | ModelWeightKind::BandwidthExtender => {
             let rule = if shape.len() == 3 {
                 TransposeRule::Axes021
@@ -1660,6 +1671,20 @@ mod tests {
     }
 
     #[test]
+    fn test_should_keep_only_codec_encoder_tensors_for_the_encoder_kind() {
+        let keep =
+            |key| SafeTensorsLoader::should_keep_tensor(ModelWeightKind::SemanticCodecEncoder, key);
+        assert!(keep("encoder.0.convnext.3.dwconv.weight"));
+        assert!(keep("encoder.1.weight"));
+        assert!(keep("down.weight"));
+        assert!(keep("quantizer.quantizers.0.in_project.weight"));
+        assert!(keep("quantizer.quantizers.0.codebook.weight"));
+        assert!(!keep("quantizer.quantizers.0.out_project.weight"));
+        assert!(!keep("decoder.0.embed.weight"));
+        assert!(!keep("up.weight"));
+    }
+
+    #[test]
     fn test_should_filter_real_semantic_codec_and_length_regulator_checkpoints() {
         let Ok(dir) = resolve_model_dir(None, DEFAULT_MODEL_REPO) else {
             return;
@@ -1688,6 +1713,17 @@ mod tests {
                     .contains_key("quantizer.quantizers.0.out_project.weight")
             );
             assert!(!codec.tensors.keys().any(|k| k.starts_with("encoder.")));
+        }
+
+        let encoder = SafeTensorsLoader::load_from_path(
+            ModelWeightKind::SemanticCodecEncoder,
+            dir.join("raw/semantic_codec.safetensors"),
+        );
+        assert!(encoder.is_ok());
+        if let Ok(encoder) = encoder {
+            assert!(encoder.tensors.contains_key("down.weight"));
+            assert!(encoder.tensors.contains_key("encoder.0.embed.weight"));
+            assert!(!encoder.tensors.keys().any(|k| k.starts_with("decoder.")));
         }
     }
 }
