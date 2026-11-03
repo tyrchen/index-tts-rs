@@ -2,18 +2,18 @@
 
 - **日期**: 2026-11-03
 - **结论落地**: [`specs/itts-align-design.md`](../../specs/itts-align-design.md)，代码 `crates/core/src/align/`、`crates/core/src/models/codec.rs`、`crates/core/src/engine/actor/align.rs`
-- **契约与过关线**: reshape `specs/30-free-voice-alignment.md` §5.5
+- **契约与过关线**: reshape `specs/33-free-voice-alignment.md` §5.5
 - **硬件**: Apple M5 Pro，macOS 27.0.1；模型 `yunfengwang/IndexTTS-2.5-mlx`（GPT int8）；`itts` 0.3.1（分支 `feat/itts-align`，提交 `05dcaab`），warm daemon
 - **脚本**: `tools/align_eval.py`（`make align-eval`），参照为 torchaudio 2.8 `MMS_FA`（CC-BY-NC 4.0，只作评测参照，不进生产）
 
 ## 1. 问题
 
-reshape 改用 Gemini TTS 后，大部分句子没有时间戳。方案 (a)：把外来录音经 w2v-BERT + 语义 codec 编码器量化成 GPT 的语义 codes，teacher forcing 复用 itts 合成时的注意力对齐器（L4H10+L5H10、单调 Viterbi、能量修正）。本文回答两件事：编码器移植是否正确；在 itts 以外的录音上，精度、可疑句识别、音素切分和速度是否达到 reshape 30 §5.5 的过关线。
+reshape 改用 Gemini TTS 后，大部分句子没有时间戳。方案 (a)：把外来录音经 w2v-BERT + 语义 codec 编码器量化成 GPT 的语义 codes，teacher forcing 复用 itts 合成时的注意力对齐器（L4H10+L5H10、单调 Viterbi、能量修正）。本文回答两件事：编码器移植是否正确；在 itts 以外的录音上，精度、可疑句识别、音素切分和速度是否达到 reshape 33 §5.5 的过关线。
 
 ## 2. 编码器移植
 
 - **对上游逐码比对**：同一份 w2v-BERT 特征（itts 合成的 4 s 中文句，198 帧）分别送进 Rust `SemanticEncoder::quantize` 与上游 torch `indextts/codec/models.py::EnhancedCodec.quantize`（同一份 `raw/semantic_codec.safetensors`，先 `remove_weight_norm` 再加载折叠后的权重）：**99/99 个 code 完全一致**。
-- **重新编码 itts 自己的录音**（速度 1.0，GPT 生成 60 个 code）：重新编码得到 60 个 code，但**逐码一致只有 1/60**。逐帧经 codec 解码器还原成连续特征后比较：对齐位置余弦 0.66，错开 2 帧 0.42，错开 10 帧 0.22。即 GPT → S2Mel → BigVGAN → w2v-BERT → 量化这一圈不是恒等映射，重新编码的 code 落在原 code 的语义邻域里而不是同一个 code。reshape 30 §11 第 1 步"一致率预期很高"的假设不成立，但对对齐没有影响（§4.1：外来路径与原生对齐的字起点差 13.5 ms）。模型测试 `test_should_re_encode_synthesized_audio_into_semantically_matching_codes` 检查的是语义邻域（余弦 > 0.5 且比错位高 0.1 以上），不是逐码一致。
+- **重新编码 itts 自己的录音**（速度 1.0，GPT 生成 60 个 code）：重新编码得到 60 个 code，但**逐码一致只有 1/60**。逐帧经 codec 解码器还原成连续特征后比较：对齐位置余弦 0.66，错开 2 帧 0.42，错开 10 帧 0.22。即 GPT → S2Mel → BigVGAN → w2v-BERT → 量化这一圈不是恒等映射，重新编码的 code 落在原 code 的语义邻域里而不是同一个 code。reshape 33 §11 第 1 步"一致率预期很高"的假设不成立，但对对齐没有影响（§4.1：外来路径与原生对齐的字起点差 13.5 ms）。模型测试 `test_should_re_encode_synthesized_audio_into_semantically_matching_codes` 检查的是语义邻域（余弦 > 0.5 且比错位高 0.1 以上），不是逐码一致。
 - **MP3 时间基准**：symphonia 解码 MP3 与 ffmpeg 结果长度相同、互相关滞后 0 样本（ElevenLabs 44.1 kHz、Gemini 48 kHz 各一例）：编码器延迟与尾部填充被同样裁掉，`itts align` 的 0 秒就是播放器的 0 秒。
 
 ## 3. 样本与方法
@@ -38,7 +38,7 @@ reshape 改用 Gemini TTS 后，大部分句子没有时间戳。方案 (a)：�
 
 ### 4.1 对过关线（条件来源 = 录音本身）
 
-| 指标（reshape 30 §5.5） | 过关线 | 结果 | 判定 |
+| 指标（reshape 33 §5.5） | 过关线 | 结果 | 判定 |
 |---|---|---|---|
 | itts 录音：外来路径 vs 原生，字起点平均差 | ≤ 10 ms | 中文 **13.5 ms**（中位 10 ms，P95 35 ms）；英文词 23.5 ms | **不过**（见 §5.1：两套帧网格不同，约 10 ms 是下限） |
 | Gemini / ElevenLabs / Edge vs MMS：中文字起点 MAE、≤100 ms 比例 | ≤ 40 ms，≥ 95% | Gemini（axon）**18.7 ms / 98.8%**；Gemini 其余 **29.4 / 96.0%**；ElevenLabs **21.7 / 98.9%**；Edge **17.8 / 100%**；itts 20.9 / 100% | **过** |
@@ -48,7 +48,7 @@ reshape 改用 Gemini TTS 后，大部分句子没有时间戳。方案 (a)：�
 | 条件来源 `recording` vs 中性快照 | 取误差小者 | `recording` 在 8 组里 7 组更准（中文差 0.4–1.7 ms），只有英文 itts 组相反 | 缺省 **`recording`** |
 | 速度（warm daemon） | 一句 ≤ 0.2 s | ≤ 10 s 的句子平均 **0.11 s**；全部 166 句平均 0.125 s、P95 0.27 s、最长 23.8 s 的句子 0.47 s | **≤ 10 s 的句子过**；长句不过（w2v-BERT 约 7 ms/秒音频） |
 | 音素 `split`：声母 / 韵母分界对 MMS 拼音字母 | MAE ≤ 30 ms | itts 14.5、Gemini 20.1 / 25.9、ElevenLabs 23.5、Edge 21.8、难例 25.8 ms | **过** |
-| QA 回归（axon 的 A007 / A009） | 人工确认 | 未做：属 reshape 侧（30 §11 reshape 第 5 步） | — |
+| QA 回归（axon 的 A007 / A009） | 人工确认 | 未做：属 reshape 侧（33 §11 reshape 第 5 步） | — |
 
 ### 4.2 全表
 
@@ -92,7 +92,7 @@ reshape 改用 Gemini TTS 后，大部分句子没有时间戳。方案 (a)：�
 
 ### 5.3 句末终点
 
-终点由能量包络决定（最后一个有声帧）。ElevenLabs 中文和 Edge 对 MMS 的偏置是 +57 / +68 ms，即 `itts align` 的终点**更晚**：录音尾部的气声、混响被算作有声；CTC 的终点本身偏"尖峰"、偏早（上一份调研已指出不作主指标）。对 A009（剪掉句尾之后多出的声音）而言，终点偏晚只会少剪一点，不会剪到字，是安全的方向；reshape 30 §5.6 对补齐的对齐另加的 0.2 s 余量足以覆盖 P95。
+终点由能量包络决定（最后一个有声帧）。ElevenLabs 中文和 Edge 对 MMS 的偏置是 +57 / +68 ms，即 `itts align` 的终点**更晚**：录音尾部的气声、混响被算作有声；CTC 的终点本身偏"尖峰"、偏早（上一份调研已指出不作主指标）。对 A009（剪掉句尾之后多出的声音）而言，终点偏晚只会少剪一点，不会剪到字，是安全的方向；reshape 33 §5.6 对补齐的对齐另加的 0.2 s 余量足以覆盖 P95。
 
 ### 5.4 可疑句识别（`quality`）
 
@@ -108,7 +108,7 @@ reshape 改用 Gemini TTS 后，大部分句子没有时间戳。方案 (a)：�
 | `confidence < 0.95` 或 `coverage < 0.95` | **9/12**（漏念 5/5、多念 2/2、替换 1/1、数字 1/4） | **0/154**（最低 confidence 0.974、coverage 0.982） |
 | 再加 `weak` 非空 | 9/12 | 5/154 |
 
-`weak` 非空的 5 句干净录音用 whisper 复听：1 句是真错（Gemini 把"Axon **用**伪终端"的"用"读成英文 `used`），1 句是 ElevenLabs 把人名 `Hway-dzuh's` 念成 `Huayza's`，其余 3 句（"查一查"、`has`、"方"）是误报。所以 `weak` 适合作为"送识别复查"的信号（reshape 30 §5.6 ASR 粗筛"`weak` 非空即可疑"），A014 用 `confidence` / `coverage` < 0.95。
+`weak` 非空的 5 句干净录音用 whisper 复听：1 句是真错（Gemini 把"Axon **用**伪终端"的"用"读成英文 `used`），1 句是 ElevenLabs 把人名 `Hway-dzuh's` 念成 `Huayza's`，其余 3 句（"查一查"、`has`、"方"）是误报。所以 `weak` 适合作为"送识别复查"的信号（reshape 33 §5.6 ASR 粗筛"`weak` 非空即可疑"），A014 用 `confidence` / `coverage` < 0.95。
 
 **没解决的**：数字读法不一致且共享音节时（文本 `2026年` 归一化为"二零二六年"，录音念"两千零二十六年"；`11月3日` 念成"十一月三号"）注意力和似然都把多出的音节吸收掉，4 句只标出 1 句（英文 `2026` 念成 `twenty twenty-six`）。这类句子要靠识别，reshape 可以对含阿拉伯数字的补齐句子一律送 whisper。
 

@@ -4,7 +4,7 @@
 - **版本**: 1.0
 - **日期**: 2026-11-03
 - **关联组件**: `index-tts-rs-core`（`models::codec`、`align`、`engine`、`voice`）、`index-tts-rs-director`、`index-tts-rs-service`、`itts`（CLI / Daemon / MCP）
-- **上游契约**: reshape `specs/30-free-voice-alignment.md` §5.1（命令契约）、§5.2 方案 (a)、§5.5（评测与过关线）、§6（音素数据）
+- **上游契约**: reshape `specs/33-free-voice-alignment.md` §5.1（命令契约）、§5.2 方案 (a)、§5.5（评测与过关线）、§6（音素数据）
 - **前置规范**: [`itts-timestamps-and-hifi-design`](itts-timestamps-and-hifi-design.md)（注意力对齐器、`Alignment` 形状）、[`itts-agent-usability-design`](itts-agent-usability-design.md)（错误码、daemon 协议、MCP）
 - **调研 / 评测**: [GPT 注意力对齐实验](../docs/research/gpt-attention-alignment-research.md)、[`itts align` 评测](../docs/research/itts-align-evaluation-research.md)
 
@@ -25,12 +25,12 @@ itts align --audio line.wav --lang en --text "The engine runs hot." --voice-file
 
 - 识别（ASR）。文本由调用方给定；文本与录音不一致只能由 `quality` 暴露，不纠正。
 - 新模型权重。只用 IndexTTS-2.5 已有权重 + 一份 CMUdict 词典。
-- 真正的音素边界（声学音素对齐，reshape 30 方案 b）。本版音素是字区间内的切分（`split`）。
+- 真正的音素边界（声学音素对齐，reshape 33 方案 b）。本版音素是字区间内的切分（`split`）。
 - HTTP 端点（`index-tts-rs-server`）。reshape 只经 CLI 调用；需要时按本设计的 `AlignJob` 另加。
 
 ## 2. 可行性核对（写设计前已验证）
 
-| 假设（reshape 30 §5.2） | 核对结果 |
+| 假设（reshape 33 §5.2） | 核对结果 |
 |---|---|
 | 语义 codec 编码器权重在 `raw/semantic_codec.safetensors` 里，加载时被跳过 | **属实**。文件含 `encoder.0.*`（Vocos 骨干，12 个 ConvNeXt 块，384/2048）、`encoder.1.*`（Linear 384→1024）、`down.*`（Conv1d 1024→1024，k3 s2 p1）、`quantizer.quantizers.0.in_project.*`（1024→8，weight-norm 已折叠）。`loader.rs` 的 `SemanticCodec` 过滤器跳过它们 |
 | 量化 = 编码器 + 码本最近邻 | 上游 `indextts/codec/models.py::EnhancedCodec.quantize` 与 `amphion_codec/quantize/factorized_vector_quantize.py`：`down → GELU → VocosBackbone → Linear → in_project → L2 归一化后余弦最近邻`（`use_l2_normlize=True`），8 维 × 8192 码 |
@@ -90,7 +90,7 @@ service AlignResult{aligner, alignment, sentences, quality, phones?, phonesMetho
 
 - **缺省 `Recording`**：用录音本身。w2v-BERT 只跑一次（全长），codes 与条件共用它：`EmoVec` 取前 15 s 的特征帧，`CAMPPlus` 取前 15 s 的 fbank，`spk_proj` 投影后 `build_conds`（与音色快照的算法相同，`emo_alpha = 1`）。
 - `--voice <ID>` / `--voice-file <PATH>`：取快照的 `conds`（不混情绪）。
-- 选哪个作缺省由评测决定（reshape 30 §5.5"条件来源 self vs 中性快照"），结果记在评测文档；输出的 `aligner.conditioning` 写 `recording` 或 `voice`。
+- 选哪个作缺省由评测决定（reshape 33 §5.5"条件来源 self vs 中性快照"），结果记在评测文档；输出的 `aligner.conditioning` 写 `recording` 或 `voice`。
 
 ### 5.3 解码
 
@@ -189,20 +189,20 @@ itts align --audio <FILE> (--text <TEXT> | --stdin) [--lang <CODE>] [--voice <ID
 | `<word\|ARPAbet>` 覆盖 | 覆盖里的音素 | `ph` |
 | 其他（假名、阿拉伯文、未展开的数字等） | — | 不出音素 |
 
-拼音拆分（reshape 30 §6.1 的约定）：声母 `b p m f d t n l g k h j q x zh ch sh r z c s`；韵母写全拼书写形式、`ü` 写 `v`（`ju` → `j` + `v`，`lü` → `l` + `v`）；`y` / `w` 开头的音节按韵母记（`yi`→`i`、`wu`→`u`、`yu`→`v`、`ya`→`ia`、`ye`→`ie`、`yao`→`iao`、`you`→`iu`、`yan`→`ian`、`yin`→`in`、`yang`→`iang`、`ying`→`ing`、`yong`→`iong`、`yue`→`ve`、`yuan`→`van`、`yun`→`vn`、`wa`→`ua`、`wo`→`uo`、`wai`→`uai`、`wei`→`ui`、`wan`→`uan`、`wen`→`un`、`wang`→`uang`、`weng`→`ueng`）；零声母字只有韵母；`zhi chi shi ri zi ci si` 的韵母记 `i`。
+拼音拆分（reshape 33 §6.1 的约定）：声母 `b p m f d t n l g k h j q x zh ch sh r z c s`；韵母写全拼书写形式、`ü` 写 `v`（`ju` → `j` + `v`，`lü` → `l` + `v`）；`y` / `w` 开头的音节按韵母记（`yi`→`i`、`wu`→`u`、`yu`→`v`、`ya`→`ia`、`ye`→`ie`、`yao`→`iao`、`you`→`iu`、`yan`→`ian`、`yin`→`in`、`yang`→`iang`、`ying`→`ing`、`yong`→`iong`、`yue`→`ve`、`yuan`→`van`、`yun`→`vn`、`wa`→`ua`、`wo`→`uo`、`wai`→`uai`、`wei`→`ui`、`wan`→`uan`、`wen`→`un`、`wang`→`uang`、`weng`→`ueng`）；零声母字只有韵母；`zhi chi shi ri zi ci si` 的韵母记 `i`。
 
-区间内切分（reshape 30 §6.2）：
+区间内切分（reshape 33 §6.2）：
 
 - 清声母（`p t k q c ch s sh x f h z zh j`，以及不送气塞音 `b d g`——普通话里它们同样是清音，闭塞段无低频能量）：声母终点 = 区间内**低频能量**（二阶低通 1 kHz，10 ms 帧 RMS）第一次超过区间峰值 30% 的帧；夹在 `[区间起点 + 最短段, 区间起点 + 60% 时长]` 内，最短段 = `min(20 ms, 时长 / 4)`。
 - 浊声母（`m n l r`）：按区间的 25% 切。
 - 零声母：整段是韵母。
 - 英文：按音素类别的典型时长权重（元音 1.0、双元音 1.3、塞音 0.5、塞擦音 0.8、擦音 0.8、鼻音 0.6、流音 / 滑音 0.6）分摊词区间。
 
-局限（写进评测）：多音字取字级默认读音（"银行"的"行"会读成 `xing2`），可用读音覆盖纠正；`split` 只是近似，reshape 30 §5.5 的音素过关线（声母 / 韵母分界对 MMS 的拼音字母区间 MAE ≤ 30 ms）不过就启动方案 (b)。
+局限（写进评测）：多音字取字级默认读音（"银行"的"行"会读成 `xing2`），可用读音覆盖纠正；`split` 只是近似，reshape 33 §5.5 的音素过关线（声母 / 韵母分界对 MMS 的拼音字母区间 MAE ≤ 30 ms）不过就启动方案 (b)。
 
 CMUdict：取 `cmusphinx/cmudict` 固定提交，只保留每词首选读音、去掉重音数字和注释（约 3.0 MB，crate 包内压缩后约 0.8 MB），连同其 BSD 许可放在 `crates/core/assets/`，首次使用时解析成表。`make update-cmudict` 重新生成。
 
-## 8. 与 reshape 30 契约的偏差
+## 8. 与 reshape 33 契约的偏差
 
 | 契约 | 本实现 | 理由 |
 |---|---|---|
@@ -223,19 +223,19 @@ CMUdict：取 `cmusphinx/cmudict` 固定提交，只保留每词首选读音、�
 | P2 | `decode` 显式帧长 + 峰值；actor `Align` 命令（特征、codes、条件、注意力、quality）；`IndexTtsEngine::align` |
 | P3 | `phones`（拼音拆分、CMUdict、低频起振切分） |
 | P4 | service `AlignJob` / `AlignResult` / `TOO_LONG`、director `control_ranges`；CLI `itts align`、daemon v4、MCP、schema、doctor |
-| P5 | 评测（reshape 30 §5.5）与调研文档；按结果定 `quality` 阈值与条件缺省；加入似然增益（§5.4） |
+| P5 | 评测（reshape 33 §5.5）与调研文档；按结果定 `quality` 阈值与条件缺省；加入似然增益（§5.4） |
 
 ## 10. 验证
 
 - 单元测试：编码器权重过滤（保留 / 跳过的键）；`decode` 的峰值与覆盖（合成注意力矩阵：干净对角、整列缺失）；拼音拆分全表（`y/w`、`j/q/x + u`、`zhi` 类、`er`、轻声、覆盖大写）；CMUdict 查表与规则回退；低频起振切分在合成 PCM 上的已知答案（静音 → 噪声 → 低频正弦）；音素下标投影（数字展开、读音覆盖）；`Alignment::from_spans` 单调有界；`control_ranges` 与 `plan_utterances` 一致；`AlignJob` 校验（空文本、互斥参数、相对路径）；协议 v4 的 `align` / `aligned` 序列化；MCP 工具列表含 `align`。
 - 模型测试（没有权重时跳过，有权重时随 `make test` 运行）：合成一句（1.0 倍速）→ 重新编码，codes 与生成 codes 的语义邻域；`align` 合成音频的外来路径对原生对齐的起点平均差；输出单调、落在 `[0, duration]`、覆盖每个可读字。
-- 评测（reshape 30 §5.5，结果写进评测文档）：itts 录音（外来 vs 原生）、Gemini（zh / en）、ElevenLabs（zh / en，原生对齐 vs `itts align` vs MMS_FA 三方）、难例（数字读法、漏念、长停顿、中英混排、喊叫）、条件来源、速度、音素分界。
+- 评测（reshape 33 §5.5，结果写进评测文档）：itts 录音（外来 vs 原生）、Gemini（zh / en）、ElevenLabs（zh / en，原生对齐 vs `itts align` vs MMS_FA 三方）、难例（数字读法、漏念、长停顿、中英混排、喊叫）、条件来源、速度、音素分界。
 
 ## 11. 评测结论
 
 详见 [评测调研](../docs/research/itts-align-evaluation-research.md)（166 句，Apple M5 Pro）。
 
-| reshape 30 §5.5 过关线 | 结果 | 判定 |
+| reshape 33 §5.5 过关线 | 结果 | 判定 |
 |---|---|---|
 | 中文字起点对 MMS ≤ 40 ms、≥ 95% ≤ 100 ms | Gemini 18.7 / 29.4 ms，ElevenLabs 21.7 ms，Edge 17.8 ms；96–100% | 过 |
 | 英文词起点 ≤ 60 ms | ElevenLabs 69.7、Gemini 70.2 ms（中位 −35 ms，偏早） | 不过 |
