@@ -23,7 +23,7 @@ use std::ops::Range;
 pub use decode::{Attention, DecodedTokens, Interval, TokenEvidence, decode_tokens};
 pub use request::{
     ALIGNER_NAME, ALIGNER_VERSION, AlignmentOutput, AlignmentRequest, AlignmentTimings,
-    Conditioning, MAX_ALIGN_CODES, MIN_ALIGN_SECS,
+    Conditioning, MAX_ALIGN_CODES, MIN_ALIGN_SECS, Recording,
 };
 use serde::{Deserialize, Serialize};
 pub use textmap::{TextMap, is_punctuation};

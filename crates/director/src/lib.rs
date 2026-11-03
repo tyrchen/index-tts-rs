@@ -15,7 +15,9 @@ use std::{io, result::Result as StdResult};
 
 pub use annotation::{Direction, Director, DirectorConfig, ReadingStyle};
 use config::ConfigError;
-pub use controls::{PlannedUtterance, ReadingPlan, plan_utterances, prepend_silence};
+pub use controls::{
+    PlannedUtterance, ReadingPlan, control_ranges, plan_utterances, prepend_silence,
+};
 use index_tts_rs_core::error::IndexTtsError;
 use reqwest::Error as RequestError;
 use serde_json::Error as JsonError;

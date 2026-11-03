@@ -4,6 +4,8 @@
 //!   [`SpeechJob::prepare`] validates and compiles inline controls exactly once.
 //! - [`JobRun`] / [`run_job`]: execute a [`PreparedJob`] on an engine with pauses applied, placing
 //!   every chunk on the job timeline with its text and (on request) character [`Alignment`].
+//! - [`AlignJob`] / [`run_align`]: force-align a recording to its text ([`AlignResult`]: character
+//!   timings in the `synth` shape, attention quality, optional phones).
 //! - [`AnnotateJob`]: per-unit delivery direction (emotion, temperature, speed, pause) for
 //!   caller-supplied units, with an optional per-request provider [`ApiKey`].
 //! - [`JobEvent`]: the `started` → `chunk`* → `done` | `error` stream every frontend emits.
@@ -13,6 +15,7 @@
 #![forbid(unsafe_code)]
 #![warn(rust_2024_compatibility, missing_docs, missing_debug_implementations)]
 
+mod align;
 mod annotation;
 mod catalog;
 mod error;
@@ -21,6 +24,10 @@ mod request;
 mod run;
 mod transcript;
 
+pub use align::{
+    AlignJob, AlignQuality, AlignResult, AlignTimings, AlignerInfo, Phone, PhoneKindWire,
+    PhonesMethod, PreparedAlign, run_align,
+};
 pub use annotation::{AnnotateJob, AnnotateResult, AnnotationUnit, ApiKey, Delivery};
 pub use catalog::{Catalog, ControlSpec, EmotionSpec, ErrorSpec, SchemaKind, catalog, json_schema};
 pub use error::{ErrorCode, ServiceError};

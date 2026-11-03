@@ -204,34 +204,74 @@ impl Transcript {
         floor: f32,
         ceil: f32,
     ) -> Alignment {
-        let len = chars.len();
-        let mut start: Vec<Option<f32>> = vec![None; len];
-        let mut end: Vec<Option<f32>> = vec![None; len];
-        for (range, s, e) in spans {
-            let spoken: Vec<usize> = (range.start.max(chars.start)..range.end.min(chars.end))
-                .filter(|&i| self.spoken.get(i).copied().is_some_and(is_spoken_char))
-                .collect();
-            #[allow(clippy::cast_precision_loss, reason = "span lengths are tiny")]
-            let step = (e - s) / spoken.len().max(1) as f32;
-            for (k, i) in spoken.into_iter().enumerate() {
-                #[allow(clippy::cast_precision_loss, reason = "span lengths are tiny")]
-                let (cs, ce) = (s + step * k as f32, s + step * (k + 1) as f32);
-                let local = i - chars.start;
-                if let Some(slot) = start.get_mut(local) {
-                    *slot = Some(slot.map_or(cs, |v: f32| v.min(cs)));
-                }
-                if let Some(slot) = end.get_mut(local) {
-                    *slot = Some(slot.map_or(ce, |v: f32| v.max(ce)));
-                }
-            }
-        }
-        let (start, end) = fill_gaps(&start, &end, floor, ceil);
+        let (start, end) = timed_chars(&self.spoken, chars, spans, floor, ceil);
         Alignment {
             text: self.text(chars),
             start,
             end,
         }
     }
+}
+
+impl Alignment {
+    /// Builds the alignment of all of `text` from character-range spans `(chars, start, end)`:
+    /// a span's pronounced characters share its time evenly, and punctuation, whitespace, and
+    /// characters no span covers take the pause between their neighbours, within
+    /// `[floor, ceil]` seconds.
+    ///
+    /// ```
+    /// use index_tts_rs_service::Alignment;
+    /// let alignment = Alignment::from_spans("你好，世界", &[(0..2, 0.1, 0.5), (3..5, 0.7, 1.1)], 0.0, 1.2);
+    /// assert_eq!(alignment.start.len(), 5);
+    /// assert!((alignment.start[2] - 0.5).abs() < 1e-6 && (alignment.end[2] - 0.7).abs() < 1e-6);
+    /// ```
+    #[must_use]
+    pub fn from_spans(
+        text: &str,
+        spans: &[(Range<usize>, f32, f32)],
+        floor: f32,
+        ceil: f32,
+    ) -> Self {
+        let chars: Vec<char> = text.chars().collect();
+        let (start, end) = timed_chars(&chars, &(0..chars.len()), spans, floor, ceil);
+        Self {
+            text: text.to_owned(),
+            start,
+            end,
+        }
+    }
+}
+
+/// Start and end of every character of `text[chars]` from spans over `text` character indices.
+fn timed_chars(
+    text: &[char],
+    chars: &Range<usize>,
+    spans: &[(Range<usize>, f32, f32)],
+    floor: f32,
+    ceil: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let len = chars.len();
+    let mut start: Vec<Option<f32>> = vec![None; len];
+    let mut end: Vec<Option<f32>> = vec![None; len];
+    for (range, s, e) in spans {
+        let spoken: Vec<usize> = (range.start.max(chars.start)..range.end.min(chars.end))
+            .filter(|&i| text.get(i).copied().is_some_and(is_spoken_char))
+            .collect();
+        #[allow(clippy::cast_precision_loss, reason = "span lengths are tiny")]
+        let step = (e - s) / spoken.len().max(1) as f32;
+        for (k, i) in spoken.into_iter().enumerate() {
+            #[allow(clippy::cast_precision_loss, reason = "span lengths are tiny")]
+            let (cs, ce) = (s + step * k as f32, s + step * (k + 1) as f32);
+            let local = i - chars.start;
+            if let Some(slot) = start.get_mut(local) {
+                *slot = Some(slot.map_or(cs, |v: f32| v.min(cs)));
+            }
+            if let Some(slot) = end.get_mut(local) {
+                *slot = Some(slot.map_or(ce, |v: f32| v.max(ce)));
+            }
+        }
+    }
+    fill_gaps(&start, &end, floor, ceil)
 }
 
 impl UtteranceMap {
@@ -345,7 +385,7 @@ fn sentence(chars: &[char], alignment: &Alignment, range: Range<usize>) -> Optio
 }
 
 /// Whether `ch` is pronounced (not whitespace or punctuation).
-fn is_spoken_char(ch: char) -> bool {
+pub(crate) fn is_spoken_char(ch: char) -> bool {
     !ch.is_whitespace() && !is_punctuation(ch)
 }
 

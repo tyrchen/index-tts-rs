@@ -7,6 +7,7 @@ use serde::Serialize;
 use serde_json::{Value, to_value};
 
 use crate::{
+    align::{AlignJob, AlignResult},
     annotation::{AnnotateJob, AnnotateResult},
     error::{ErrorCode, ServiceError},
     events::JobEvent,
@@ -151,6 +152,10 @@ pub enum SchemaKind {
     AnnotateJob,
     /// The [`AnnotateResult`] response.
     AnnotateResult,
+    /// The [`AlignJob`] request.
+    AlignJob,
+    /// The [`AlignResult`] response.
+    AlignResult,
 }
 
 /// Returns the JSON Schema for `kind`.
@@ -168,6 +173,8 @@ pub fn json_schema(kind: SchemaKind) -> Value {
         SchemaKind::Error => schema_for!(ServiceError),
         SchemaKind::AnnotateJob => schema_for!(AnnotateJob),
         SchemaKind::AnnotateResult => schema_for!(AnnotateResult),
+        SchemaKind::AlignJob => schema_for!(AlignJob),
+        SchemaKind::AlignResult => schema_for!(AlignResult),
     };
     to_value(schema).unwrap_or(Value::Null)
 }

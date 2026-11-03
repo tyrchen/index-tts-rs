@@ -4,7 +4,7 @@
 //! the codec encoder), replayed through the decoder with teacher forcing next to the text, and
 //! decoded with the same attention aligner that times synthesized speech.
 
-use std::time::Instant;
+use std::{borrow::Cow, time::Instant};
 
 use mlx_rs::Array;
 use tracing::info;
@@ -12,11 +12,11 @@ use tracing::info;
 use crate::{
     align::{
         AlignmentOutput, AlignmentRequest, AlignmentTimings, CODE_FRAME_SECS, Conditioning,
-        MAX_ALIGN_CODES, MIN_ALIGN_SECS, TextMap, align_recording,
+        MAX_ALIGN_CODES, MIN_ALIGN_SECS, Recording, TextMap, align_recording,
         phones::{SpokenText, split_phones},
     },
     config::EmoAlpha,
-    dsp::{FBANK_SAMPLE_RATE, f32_to_pcm_i16, resample_sinc_hann},
+    dsp::{FBANK_SAMPLE_RATE, audio::decode_audio_file, f32_to_pcm_i16, resample_sinc_hann},
     engine::actor::MlxWorkerState,
     error::{IndexTtsError, Result},
     frontend::PreparedText,
@@ -38,11 +38,23 @@ impl MlxWorkerState {
     )]
     pub(super) fn handle_align(&mut self, req: &AlignmentRequest) -> Result<AlignmentOutput> {
         let started = Instant::now();
-        let duration_secs = check_duration(req)?;
         let prepared = self.prepare_alignment_text(req)?;
+        let (samples, sample_rate) = match &req.recording {
+            Recording::File(path) => {
+                let decoded = decode_audio_file(path)?;
+                (Cow::Owned(decoded.samples), decoded.sample_rate)
+            }
+            Recording::Pcm {
+                samples,
+                sample_rate,
+            } => (Cow::Borrowed(samples.as_slice()), *sample_rate),
+        };
+        let duration_secs = check_duration(samples.len(), sample_rate)?;
+        let audio_ms = ms(started);
 
         let t_features = Instant::now();
-        let audio_16k = resample_sinc_hann(&req.samples, req.sample_rate, FBANK_SAMPLE_RATE)?;
+        let audio_16k = resample_sinc_hann(&samples, sample_rate, FBANK_SAMPLE_RATE)?;
+        drop(samples);
         self.ensure_voice_extractor()?;
         self.ensure_semantic_encoder()?;
         let (Some(extractor), Some(encoder)) = (&self.voice_extractor, &self.semantic_encoder)
@@ -114,6 +126,7 @@ impl MlxWorkerState {
             duration_secs,
             codes: codes.len(),
             timings: AlignmentTimings {
+                audio_ms,
                 features_ms,
                 encode_ms,
                 condition_ms,
@@ -164,14 +177,14 @@ impl MlxWorkerState {
 
 /// Recording duration in seconds, rejecting recordings outside one decoder pass.
 #[allow(clippy::cast_precision_loss)]
-fn check_duration(req: &AlignmentRequest) -> Result<f32> {
-    if req.sample_rate == 0 {
+fn check_duration(samples: usize, sample_rate: u32) -> Result<f32> {
+    if sample_rate == 0 {
         return Err(IndexTtsError::validation(
             "audio",
             "sample rate must be positive",
         ));
     }
-    let duration = req.samples.len() as f32 / req.sample_rate as f32;
+    let duration = samples as f32 / sample_rate as f32;
     let longest = MAX_ALIGN_CODES as f32 * CODE_FRAME_SECS;
     if duration < MIN_ALIGN_SECS {
         return Err(IndexTtsError::validation(
@@ -208,7 +221,7 @@ fn check_sequence(tokens: usize, codes: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::check_sequence;
+    use super::{check_duration, check_sequence};
     use crate::error::IndexTtsError;
 
     #[test]
@@ -222,5 +235,19 @@ mod tests {
             check_sequence(10, 1_816),
             Err(IndexTtsError::TooLong { .. })
         ));
+    }
+
+    #[test]
+    fn test_should_bound_the_recording_duration() {
+        assert!(matches!(
+            check_duration(1_000, 16_000),
+            Err(IndexTtsError::Validation { .. })
+        ));
+        assert!(check_duration(16_000, 16_000).is_ok());
+        assert!(matches!(
+            check_duration(80 * 16_000, 16_000),
+            Err(IndexTtsError::TooLong { .. })
+        ));
+        assert!(check_duration(16_000, 0).is_err());
     }
 }

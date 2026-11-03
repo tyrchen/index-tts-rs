@@ -67,21 +67,20 @@ pub fn plan_utterances(base: &SynthesisRequest, paragraph_pause_ms: u32) -> Resu
         return Err(invalid("paragraph pause must be between 0 and 5000 ms"));
     }
     let script = base.text.as_str();
+    let controls = control_ranges(script)?;
     let mut plan = Vec::new();
-    let mut controls = Vec::new();
     let mut state = base.clone();
     let mut pause = 0;
     let mut explicit_pause = false;
-    let mut input = script;
-    while let Some(position) = input.find("[[") {
-        let offset = script.len() - input.len();
-        let before = input
-            .get(..position)
+    let mut cursor = 0;
+    for control in &controls {
+        let before = script
+            .get(cursor..control.start)
             .ok_or_else(|| invalid("invalid control boundary"))?;
         let previous_len = plan.len();
         push_text(
             before,
-            offset,
+            cursor,
             &state,
             paragraph_pause_ms,
             &mut pause,
@@ -90,26 +89,22 @@ pub fn plan_utterances(base: &SynthesisRequest, paragraph_pause_ms: u32) -> Resu
         if plan.len() > previous_len {
             explicit_pause = false;
         }
-        input = input
-            .get(position.saturating_add(2)..)
+        let command = script
+            .get(control.start + 2..control.end - 2)
             .ok_or_else(|| invalid("invalid control boundary"))?;
-        let command: &str = take_until::<_, _, ContextError>(1..=256, "]]")
-            .parse_next(&mut input)
-            .map_err(|_| invalid("control must end with ]] and fit within 256 bytes"))?;
-        input = input
-            .strip_prefix("]]")
-            .ok_or_else(|| invalid("unterminated control"))?;
-        controls.push(offset + position..script.len() - input.len());
         apply_control(command, base, &mut state, &mut pause)?;
         if command.starts_with("pause=") {
             explicit_pause = true;
         }
+        cursor = control.end;
     }
     let previous_len = plan.len();
-    let offset = script.len() - input.len();
+    let tail = script
+        .get(cursor..)
+        .ok_or_else(|| invalid("invalid control boundary"))?;
     push_text(
-        input,
-        offset,
+        tail,
+        cursor,
         &state,
         paragraph_pause_ms,
         &mut pause,
@@ -128,6 +123,40 @@ pub fn plan_utterances(base: &SynthesisRequest, paragraph_pause_ms: u32) -> Resu
         utterances: plan,
         controls,
     })
+}
+
+/// Byte ranges of every `[[...]]` control tag in `script`, ascending. Commands are not
+/// interpreted; each must end with `]]` within 256 bytes.
+///
+/// # Errors
+/// Returns [`DirectorError::Invalid`] for an unterminated or oversized control.
+///
+/// # Examples
+/// ```
+/// use index_tts_rs_director::control_ranges;
+/// let script = "你好[[pause=300]]世界";
+/// let ranges = control_ranges(script)?;
+/// assert_eq!(ranges, vec![6..19]);
+/// assert_eq!(&script[ranges[0].clone()], "[[pause=300]]");
+/// # Ok::<(), index_tts_rs_director::DirectorError>(())
+/// ```
+pub fn control_ranges(script: &str) -> Result<Vec<Range<usize>>> {
+    let mut ranges = Vec::new();
+    let mut input = script;
+    while let Some(position) = input.find("[[") {
+        let start = script.len() - input.len() + position;
+        input = input
+            .get(position.saturating_add(2)..)
+            .ok_or_else(|| invalid("invalid control boundary"))?;
+        take_until::<_, _, ContextError>(1..=256, "]]")
+            .parse_next(&mut input)
+            .map_err(|_| invalid("control must end with ]] and fit within 256 bytes"))?;
+        input = input
+            .strip_prefix("]]")
+            .ok_or_else(|| invalid("unterminated control"))?;
+        ranges.push(start..script.len() - input.len());
+    }
+    Ok(ranges)
 }
 
 fn push_text(
@@ -261,7 +290,7 @@ mod tests {
     };
     use rstest::rstest;
 
-    use super::plan_utterances;
+    use super::{control_ranges, plan_utterances};
     use crate::Result;
 
     fn base(text: &str) -> Result<SynthesisRequest> {
@@ -352,6 +381,21 @@ mod tests {
             Some("<行|hang2>业。")
         );
         assert_eq!(plan.get(1).map(|part| part.pause_before_ms), Some(800));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_find_the_same_control_ranges_the_plan_executes() -> Result<()> {
+        let script = "一。[[pause=300]]二[[emo=calm:0.5]]。[[reset]]";
+        assert_eq!(
+            control_ranges(script)?,
+            plan_utterances(&base(script)?, 600)?.controls
+        );
+        assert_eq!(
+            control_ranges("plain text")?,
+            Vec::<std::ops::Range<usize>>::new()
+        );
+        assert!(control_ranges("你好[[pause=10").is_err());
         Ok(())
     }
 }

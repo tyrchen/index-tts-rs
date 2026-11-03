@@ -1,5 +1,7 @@
 //! Request and result types for aligning an external recording ([`AlignmentRequest`]).
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
@@ -46,14 +48,27 @@ impl Conditioning {
     }
 }
 
+/// The audio of an alignment request.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum Recording {
+    /// An audio file (`.wav`/`.mp3`/`.flac`/`.m4a`), decoded on the engine's worker thread.
+    File(PathBuf),
+    /// Mono samples in `[-1, 1]` at `sample_rate` Hz.
+    Pcm {
+        /// Samples.
+        samples: Vec<f32>,
+        /// Sample rate in Hz.
+        sample_rate: u32,
+    },
+}
+
 /// A recording and the text it speaks, to be force-aligned.
 #[derive(Debug, Clone, TypedBuilder)]
 #[non_exhaustive]
 pub struct AlignmentRequest {
-    /// Mono samples in `[-1, 1]`.
-    pub samples: Vec<f32>,
-    /// Sample rate of [`Self::samples`] in Hz.
-    pub sample_rate: u32,
+    /// The recording.
+    pub recording: Recording,
     /// Spoken text (controls already removed); may contain pronunciation overrides.
     pub text: SynthesisText,
     /// Language of the text.
@@ -71,6 +86,8 @@ pub struct AlignmentRequest {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct AlignmentTimings {
+    /// Reading and decoding the audio file.
+    pub audio_ms: f64,
     /// Resampling, fbank, and `w2v-BERT` features.
     pub features_ms: f64,
     /// Codec encoder quantization.
