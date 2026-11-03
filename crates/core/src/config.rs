@@ -612,10 +612,11 @@ impl TopK {
 }
 
 impl Default for TopK {
-    /// `10`: sampling wider than the ten likeliest codes noticeably increases Mandarin tone
-    /// errors (about 2x at `30`) without adding prosodic range.
+    /// `3`: wider candidate sets let sampling pick tone-shifted codes (Mandarin tone errors
+    /// roughly double from `10` to `30`, and words like 困境 still misread in 3 of 8 seeds at
+    /// `10`) without adding audible naturalness or prosodic range.
     fn default() -> Self {
-        Self(10)
+        Self(3)
     }
 }
 
@@ -1287,7 +1288,7 @@ pub struct SamplingParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub seed: Option<u64>,
-    /// Top-K candidate truncation (`0..=8194`, default `10`).
+    /// Top-K candidate truncation (`0..=8194`, default `3`).
     #[builder(default)]
     pub top_k: TopK,
     /// Nucleus sampling threshold (`0.01..=1.0`, default `0.8`).

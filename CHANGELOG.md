@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## 0.3.1
+
+- Changed the default `top_k` from 10 to 3. Sampling wider candidate sets
+  occasionally picks tone-shifted codes that whisper-based checks miss (e.g.
+  困境 read as 捆近 in 3 of 8 seeds at 10, none at 3); listening tests found no
+  loss of naturalness and long text does not loop.
+
 ## 0.3.0
 
 - Added per-character and per-sentence timestamps from GPT attention alignment
