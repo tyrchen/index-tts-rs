@@ -152,6 +152,18 @@ update-cmudict:
 	@curl -fsSL "$(CMUDICT_URL)/cmudict.dict" | awk '{ sub(/ *#.*$$/, ""); if ($$1 ~ /\([0-9]+\)$$/) next; w = $$1; $$1 = ""; gsub(/[0-9]/, ""); sub(/^ /, ""); print w " " $$0 }' > "$(CORE_ASSETS)/cmudict.dict"
 	@wc -l "$(CORE_ASSETS)/cmudict.dict"
 
+# `itts align` evaluation (docs/research/itts-align-evaluation-research.md). ALIGN_EVAL_MANIFEST is a
+# JSONL of {id, set, audio, text, lang, native?, mismatch?}; results land next to it. The MMS_FA
+# reference downloads ~1.2 GB once and is for evaluation only (CC-BY-NC).
+ALIGN_EVAL_MANIFEST ?= target/align-eval/manifest.jsonl
+ALIGN_EVAL_DIR = $(dir $(ALIGN_EVAL_MANIFEST))
+ALIGN_EVAL_UV = uv run -q --python 3.12 --no-project --with torch==2.8.0 --with torchaudio==2.8.0 --with pypinyin==0.55.0 --with numpy python -I tools/align_eval.py
+
+align-eval:
+	@$(ALIGN_EVAL_UV) mms "$(ALIGN_EVAL_MANIFEST)" "$(ALIGN_EVAL_DIR)mms.json"
+	@$(ALIGN_EVAL_UV) itts "$(ALIGN_EVAL_MANIFEST)" "$(ALIGN_EVAL_DIR)itts.json" $(ALIGN_EVAL_ARGS)
+	@$(ALIGN_EVAL_UV) report "$(ALIGN_EVAL_MANIFEST)" --itts "$(ALIGN_EVAL_DIR)itts.json" --mms "$(ALIGN_EVAL_DIR)mms.json" --out "$(ALIGN_EVAL_DIR)report.json"
+
 check-agent-sync:
 	@cmp -s CLAUDE.md AGENTS.md || { \
 		echo "AGENTS.md must stay in sync with CLAUDE.md"; \
@@ -174,6 +186,7 @@ doc:
 smoke:
 	@cargo run --locked -p index-tts-rs-cli -- --version
 	@cargo run --locked -p index-tts-rs-cli -- schema speech-job
+	@cargo run --locked -p index-tts-rs-cli -- schema align-result
 	@cargo run --locked -p index-tts-rs-server -- --help
 
 # A release must not mistake silently skipped golden tests for model verification.
@@ -218,4 +231,4 @@ release: release-check
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: build install install-skill serve test test-nextest lint fmt audit bench generate-fixtures update-cmudict check-agent-sync doc smoke verify-models check-release-tag package release-check release-artifacts publish release update-submodule
+.PHONY: build install install-skill serve test test-nextest lint fmt audit bench generate-fixtures update-cmudict align-eval check-agent-sync doc smoke verify-models check-release-tag package release-check release-artifacts publish release update-submodule
