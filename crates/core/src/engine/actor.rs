@@ -1524,4 +1524,195 @@ mod tests {
         }
         assert!(engine.stop().is_ok());
     }
+
+    /// Synthesizes `text` with the golden speaker and native alignment at `speed`.
+    fn synthesize_aligned(engine: &IndexTtsEngine, text: &str, speed: f32) -> Option<AudioChunk> {
+        use crate::config::{CfmParams, DurationFactor};
+
+        let golden_voice = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("golden_speaker.itts_voice");
+        let req = SynthesisRequest::builder()
+            .text(SynthesisText::new(text).ok()?)
+            .speaker(SpeakerSource::VoiceFile(golden_voice))
+            .language(Language::Zh)
+            .sampling(SamplingParams::builder().seed(Some(7)).build())
+            .cfm(
+                CfmParams::builder()
+                    .duration_factor(DurationFactor::new(speed.recip()).ok()?)
+                    .build(),
+            )
+            .align(true)
+            .build();
+        engine.synthesize_stream(req).ok()?.recv()?.ok()
+    }
+
+    #[test]
+    fn test_should_align_a_synthesized_recording_like_its_native_alignment() {
+        use crate::align::{AlignmentRequest, Recording};
+
+        if resolve_model_dir(None, DEFAULT_MODEL_REPO).is_err() {
+            return;
+        }
+        let Ok(temp_voices) = tempfile::tempdir() else {
+            return;
+        };
+        let cfg = EngineConfig::builder()
+            .voices_dir(Some(temp_voices.path().to_path_buf()))
+            .build();
+        let Ok(engine) = IndexTtsEngine::start(cfg) else {
+            return;
+        };
+        let text = "鲲化而为鸟，其名为鹏。";
+        let chunk = synthesize_aligned(&engine, text, 1.2);
+        assert!(chunk.is_some(), "synthesis failed");
+        let Some(chunk) = chunk else { return };
+        let samples: Vec<f32> = chunk
+            .pcm_i16
+            .iter()
+            .map(|&s| f32::from(s) / 32_768.0)
+            .collect();
+        let Ok(text) = SynthesisText::new(text) else {
+            return;
+        };
+        let req = AlignmentRequest::builder()
+            .recording(Recording::Pcm {
+                samples,
+                sample_rate: chunk.sample_rate,
+            })
+            .text(text)
+            .language(Language::Zh)
+            .phones(true)
+            .build();
+        let aligned = engine.align_blocking(req);
+        assert!(aligned.is_ok(), "{aligned:?}");
+        let Ok(aligned) = aligned else { return };
+        let spans = |list: &[SpanTiming]| list.iter().map(|s| s.chars.clone()).collect::<Vec<_>>();
+        assert_eq!(spans(&aligned.spans), spans(&chunk.alignment));
+        assert!(aligned.spans.windows(2).all(|pair| match pair {
+            [a, b] => a.start_secs <= b.start_secs,
+            _ => true,
+        }));
+        assert!(aligned.spans.iter().all(|span| {
+            0.0 <= span.start_secs
+                && span.start_secs <= span.end_secs
+                && span.end_secs <= aligned.duration_secs + 1e-3
+        }));
+        #[allow(clippy::cast_precision_loss, reason = "a handful of spans")]
+        let onset_error = aligned
+            .spans
+            .iter()
+            .zip(&chunk.alignment)
+            .map(|(ours, native)| (ours.start_secs - native.start_secs).abs())
+            .sum::<f32>()
+            / aligned.spans.len().max(1) as f32;
+        assert!(onset_error < 0.03, "mean onset difference {onset_error} s");
+        assert!(aligned.quality.confidence > 0.8, "{:?}", aligned.quality);
+        assert!(aligned.quality.coverage >= 0.9, "{:?}", aligned.quality);
+        assert!(aligned.quality.weak.is_empty(), "{:?}", aligned.quality);
+        // Every one of the nine characters carries a final; punctuation carries nothing.
+        let chars: Vec<char> = "鲲化而为鸟，其名为鹏。".chars().collect();
+        assert!(aligned.phones.iter().all(|p| {
+            chars
+                .get(p.char_index)
+                .is_some_and(|c| !"，。".contains(*c))
+                && p.start <= p.end
+        }));
+        let finals = aligned
+            .phones
+            .iter()
+            .filter(|p| p.kind == crate::align::phones::PhoneKind::Final)
+            .count();
+        assert_eq!(finals, 9, "{:?}", aligned.phones);
+        assert!(engine.stop().is_ok());
+    }
+
+    #[test]
+    fn test_should_re_encode_synthesized_audio_into_semantically_matching_codes() {
+        use crate::{
+            dsp::{FBANK_SAMPLE_RATE, resample_sinc_hann},
+            models::SemanticEncoder,
+        };
+
+        let Ok(dir) = resolve_model_dir(None, DEFAULT_MODEL_REPO) else {
+            return;
+        };
+        let Ok(temp_voices) = tempfile::tempdir() else {
+            return;
+        };
+        let cfg = EngineConfig::builder()
+            .voices_dir(Some(temp_voices.path().to_path_buf()))
+            .build();
+        let Ok(engine) = IndexTtsEngine::start(cfg) else {
+            return;
+        };
+        // At speed 1.0 every generated code lasts exactly one 40 ms encoder frame.
+        let chunk = synthesize_aligned(&engine, "鹏之背，不知其几千里也。", 1.0);
+        assert!(engine.stop().is_ok());
+        let Some(chunk) = chunk else { return };
+        let SpeechContext::Spoken { codes, .. } = &chunk.spoken else {
+            return;
+        };
+        let samples: Vec<f32> = chunk
+            .pcm_i16
+            .iter()
+            .map(|&s| f32::from(s) / 32_768.0)
+            .collect();
+        let (Ok(audio_16k), Ok(extractor), Ok(encoder), Ok(codec)) = (
+            resample_sinc_hann(&samples, chunk.sample_rate, FBANK_SAMPLE_RATE),
+            VoiceExtractor::load_from_model_dir(&dir),
+            SemanticEncoder::load_from_path(dir.join("raw/semantic_codec.safetensors")),
+            SemanticCodec::load_from_path(dir.join("raw/semantic_codec.safetensors")),
+        ) else {
+            return;
+        };
+        let reencoded = extractor
+            .semantic_features(&audio_16k)
+            .and_then(|(features, _)| encoder.quantize(&features));
+        assert!(reencoded.is_ok(), "{reencoded:?}");
+        let Ok(reencoded) = reencoded else { return };
+        assert!(
+            reencoded.len().abs_diff(codes.len()) <= 2,
+            "{reencoded:?} {codes:?}"
+        );
+
+        // The vocoder round trip rarely reproduces a code exactly, but the re-encoded codes stay
+        // in the generated codes' semantic neighbourhood, frame by frame.
+        let n = reencoded.len().min(codes.len());
+        let decode = |c: &[i32]| -> Option<Vec<Vec<f32>>> {
+            let arr = Array::from_slice(c.get(..n)?, &[1, i32::try_from(n).ok()?]);
+            let values = codec
+                .decode(&arr)
+                .ok()?
+                .try_as_slice::<f32>()
+                .ok()?
+                .to_vec();
+            Some(values.chunks(1_024).map(<[f32]>::to_vec).collect())
+        };
+        let (Some(generated), Some(recovered)) = (decode(codes), decode(&reencoded)) else {
+            return;
+        };
+        let mean_cosine = |shift: usize| {
+            let sims: Vec<f32> = generated
+                .iter()
+                .skip(shift)
+                .zip(&recovered)
+                .map(|(x, y)| {
+                    let dot: f32 = x.iter().zip(y).map(|(p, q)| p * q).sum();
+                    let norms = x.iter().map(|p| p * p).sum::<f32>().sqrt()
+                        * y.iter().map(|q| q * q).sum::<f32>().sqrt();
+                    dot / norms.max(1e-9)
+                })
+                .collect();
+            #[allow(clippy::cast_precision_loss, reason = "frame counts are small")]
+            let count = sims.len().max(1) as f32;
+            sims.iter().sum::<f32>() / count
+        };
+        let (aligned, shifted) = (mean_cosine(0), mean_cosine(2));
+        assert!(aligned > 0.5, "aligned cosine {aligned}");
+        assert!(
+            aligned > shifted + 0.1,
+            "aligned {aligned} vs shifted {shifted}"
+        );
+    }
 }
