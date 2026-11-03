@@ -24,8 +24,10 @@ use mlx_rs::{
 };
 use tracing::{debug, info};
 
+mod align;
+
 use crate::{
-    align::{SpanTiming, TextMap, align_segment},
+    align::{AlignmentOutput, AlignmentRequest, SpanTiming, TextMap, align_segment},
     config::{
         DEFAULT_SAMPLE_RATE, EmoAlpha, EngineConfig, SampleRate, SpeakerSource, SpeechContext,
         SynthesisRequest, VoiceExtractRequest,
@@ -39,8 +41,9 @@ use crate::{
     frontend::{Frontend, PreparedSegment},
     models::{
         BandwidthExtender, BigVgan, CFM_IN_CHANNELS, CfmDit, CodePrompt, DEFAULT_KV_MAX_SEQ,
-        GPT_TEXT_POS_LEN, Gpt, KvCache, LengthRegulator, SamplerRng, SemanticCodec, SpkProjWeights,
-        generate_codes, generate_codes_after, resolve_hifi_weights, resolve_model_dir,
+        GPT_TEXT_POS_LEN, Gpt, KvCache, LengthRegulator, SamplerRng, SemanticCodec,
+        SemanticEncoder, SpkProjWeights, generate_codes, generate_codes_after,
+        resolve_hifi_weights, resolve_model_dir,
     },
     voice::{
         CONDS_DIM, CONDS_FRAMES, EmoMatrix, PROMPT_CONDITION_DIM, REF_MEL_BINS, STYLE_DIM,
@@ -73,6 +76,10 @@ enum EngineCommand {
         req: VoiceExtractRequest,
         reply_tx: Sender<Result<VoiceEntry>>,
     },
+    Align {
+        req: Box<AlignmentRequest>,
+        reply_tx: Sender<Result<AlignmentOutput>>,
+    },
     EvictVoiceExtractor {
         reply_tx: Sender<Result<bool>>,
     },
@@ -101,6 +108,7 @@ struct MlxWorkerState {
     spk_proj: SpkProjWeights,
     emo_matrix: EmoMatrix,
     voice_extractor: Option<VoiceExtractor>,
+    semantic_encoder: Option<SemanticEncoder>,
     bandwidth_extender: Option<BandwidthExtender>,
     last_ref_cache: Option<CachedRefAudio>,
     shutdown_flag: Arc<AtomicBool>,
@@ -189,6 +197,7 @@ impl MlxWorkerState {
             spk_proj,
             emo_matrix,
             voice_extractor: None,
+            semantic_encoder: None,
             bandwidth_extender: None,
             last_ref_cache: None,
             shutdown_flag,
@@ -230,49 +239,51 @@ impl MlxWorkerState {
 
     fn resolve_speaker(&mut self, req: &SynthesisRequest) -> Result<(Arc<SpeakerContext>, f64)> {
         let t0 = Instant::now();
-        match &req.speaker {
-            SpeakerSource::VoiceId(voice_id) => {
-                let ctx = self.voice_store.get(voice_id)?;
-                Ok((ctx, t0.elapsed().as_secs_f64() * 1000.0))
-            }
-            SpeakerSource::VoiceFile(path) => {
-                let ctx = Arc::new(SpeakerContext::load_from_path(path)?);
-                Ok((ctx, t0.elapsed().as_secs_f64() * 1000.0))
-            }
+        let ctx = self.speaker_context(&req.speaker, req.emo_audio_path.as_ref(), req.emo_alpha)?;
+        Ok((ctx, t0.elapsed().as_secs_f64() * 1000.0))
+    }
+
+    /// Resolves a speaker snapshot; reference audio is extracted (and the last one cached).
+    fn speaker_context(
+        &mut self,
+        speaker: &SpeakerSource,
+        emo_audio_path: Option<&PathBuf>,
+        emo_alpha: EmoAlpha,
+    ) -> Result<Arc<SpeakerContext>> {
+        match speaker {
+            SpeakerSource::VoiceId(voice_id) => self.voice_store.get(voice_id),
+            SpeakerSource::VoiceFile(path) => Ok(Arc::new(SpeakerContext::load_from_path(path)?)),
             SpeakerSource::ReferenceAudio(ref_path) => {
                 if let Some(cached) = &self.last_ref_cache
                     && cached.ref_path == *ref_path
-                    && cached.emo_path == req.emo_audio_path
-                    && (cached.emo_alpha.get() - req.emo_alpha.get()).abs() < 1e-6
+                    && cached.emo_path.as_ref() == emo_audio_path
+                    && (cached.emo_alpha.get() - emo_alpha.get()).abs() < 1e-6
                 {
-                    return Ok((
-                        Arc::clone(&cached.context),
-                        t0.elapsed().as_secs_f64() * 1000.0,
-                    ));
+                    return Ok(Arc::clone(&cached.context));
                 }
                 let extracted = if let Some(extractor) = self.voice_extractor.as_ref() {
                     Arc::new(extractor.extract_from_path(
                         ref_path,
-                        req.emo_audio_path.as_deref(),
-                        req.emo_alpha,
+                        emo_audio_path.map(PathBuf::as_path),
+                        emo_alpha,
                         &self.regulator,
                     )?)
                 } else {
                     Arc::new(VoiceExtractor::extract_from_model_dir(
                         &self.model_dir,
                         ref_path,
-                        req.emo_audio_path.as_deref(),
-                        req.emo_alpha,
+                        emo_audio_path.map(PathBuf::as_path),
+                        emo_alpha,
                         &self.regulator,
                     )?)
                 };
                 self.last_ref_cache = Some(CachedRefAudio {
                     ref_path: ref_path.clone(),
-                    emo_path: req.emo_audio_path.clone(),
-                    emo_alpha: req.emo_alpha,
+                    emo_path: emo_audio_path.cloned(),
+                    emo_alpha,
                     context: Arc::clone(&extracted),
                 });
-                Ok((extracted, t0.elapsed().as_secs_f64() * 1000.0))
+                Ok(extracted)
             }
         }
     }
@@ -830,6 +841,9 @@ impl MlxWorkerState {
                 let res = self.handle_extract_voice(&req);
                 let _ = reply_tx.send(res);
             }
+            EngineCommand::Align { req, reply_tx } => {
+                let _ = reply_tx.send(self.handle_align(&req));
+            }
             EngineCommand::EvictVoiceExtractor { reply_tx } => {
                 let had_extractor = self.voice_extractor.take().is_some();
                 self.telemetry.set_voice_extractor_loaded(false);
@@ -1080,6 +1094,44 @@ impl IndexTtsEngine {
         reply_rx
             .recv()
             .map_err(|_| IndexTtsError::actor("actor dropped ExtractVoice reply channel"))?
+    }
+
+    /// Force-aligns a recording to the text it speaks: per-character timings, attention
+    /// quality, and (on request) phones. The first call loads the Stage 0 encoders and the codec
+    /// encoder, which then stay resident.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError::Validation`] for empty text or a too-short recording,
+    /// [`IndexTtsError::TooLong`] beyond one decoder pass, or model / GPU failures.
+    pub async fn align(&self, req: AlignmentRequest) -> Result<AlignmentOutput> {
+        let reply_rx = self.send_align(req)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| IndexTtsError::actor("actor dropped Align reply channel"))?
+    }
+
+    /// Blocking variant of [`Self::align`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::align`].
+    pub fn align_blocking(&self, req: AlignmentRequest) -> Result<AlignmentOutput> {
+        self.send_align(req)?
+            .recv()
+            .map_err(|_| IndexTtsError::actor("actor dropped Align reply channel"))?
+    }
+
+    fn send_align(&self, req: AlignmentRequest) -> Result<Receiver<Result<AlignmentOutput>>> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.cmd_tx
+            .send(EngineCommand::Align {
+                req: Box::new(req),
+                reply_tx,
+            })
+            .map_err(|_| IndexTtsError::actor("failed to send Align command to actor"))?;
+        Ok(reply_rx)
     }
 
     /// Asynchronously evicts the Stage 0 [`VoiceExtractor`] models (`w2v-bert-2.0`, `EmoVec`,

@@ -1,5 +1,6 @@
 //! Turns GPT text attention into token timings: a monotone Viterbi path over the spoken tokens,
-//! then pause boundaries snapped to the synthesized waveform's energy envelope.
+//! then pause boundaries snapped to the waveform's energy envelope, plus per-token attention
+//! evidence for judging how trustworthy each timing is.
 
 use std::{iter::once, ops::Range};
 
@@ -25,41 +26,84 @@ pub struct Interval {
     pub end: f32,
 }
 
-/// Aligns `states` spoken tokens to `frames` GPT codes and returns one [`Interval`] per state.
+/// Row-major `[frames, columns]` text attention of the semantic-code queries.
+#[derive(Debug, Clone, Copy)]
+pub struct Attention<'a> {
+    /// Attention weights, `frames * columns` values.
+    pub values: &'a [f32],
+    /// Number of code frames (queries).
+    pub frames: usize,
+    /// Number of text columns (`<BOS>, tokens..., <EOS>`).
+    pub columns: usize,
+}
+
+/// How strongly the attention supports one decoded token.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TokenEvidence {
+    /// Highest attention the token receives, renormalized over the spoken tokens, on the frames
+    /// the path gives it (widened by one frame on each side).
+    pub peak: f32,
+    /// Whether the token is the most attended spoken token on at least one of those frames.
+    pub attended: bool,
+}
+
+/// Decoded timings and attention evidence of every spoken token.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DecodedTokens {
+    /// One interval per spoken token, monotone and non-overlapping.
+    pub intervals: Vec<Interval>,
+    /// One evidence entry per spoken token.
+    pub evidence: Vec<TokenEvidence>,
+}
+
+/// Aligns `state_columns.len()` spoken tokens to the attention's code frames.
 ///
-/// `attention` is row-major `[frames, columns]`; `state_columns[s]` is the attention column of
-/// spoken token `s`. `pcm` is the segment audio (its duration defines the code frame length).
-///
-/// Returns an empty vector when there are no spoken tokens or no frames.
+/// `state_columns[s]` is the attention column of spoken token `s`; every frame lasts
+/// `frame_secs`. `pcm` is the audio the frames describe, whose energy envelope moves token edges
+/// off pauses. Returns empty vectors when there are no spoken tokens or no frames.
 ///
 /// # Examples
 ///
 /// ```
-/// use index_tts_rs_core::align::decode_intervals;
+/// use index_tts_rs_core::align::{Attention, decode_tokens};
 ///
 /// // Four frames over two tokens: frames 0-1 attend to column 0, frames 2-3 to column 1.
-/// let attention = [0.9, 0.1, 0.8, 0.2, 0.1, 0.9, 0.2, 0.8];
+/// let values = [0.9, 0.1, 0.8, 0.2, 0.1, 0.9, 0.2, 0.8];
+/// let attention = Attention { values: &values, frames: 4, columns: 2 };
 /// let pcm = vec![8_000_i16; 400];
-/// let spans = decode_intervals(&attention, 4, 2, &[0, 1], &pcm, 400);
-/// assert_eq!(spans.len(), 2);
-/// assert!((spans[1].start - 0.5).abs() < 1e-6);
+/// let decoded = decode_tokens(attention, &[0, 1], 0.25, &pcm, 400);
+/// assert_eq!(decoded.intervals.len(), 2);
+/// assert!((decoded.intervals[1].start - 0.5).abs() < 1e-6);
+/// assert!(decoded.evidence.iter().all(|e| e.attended));
 /// ```
 #[must_use]
-pub fn decode_intervals(
-    attention: &[f32],
-    frames: usize,
-    columns: usize,
+pub fn decode_tokens(
+    attention: Attention<'_>,
     state_columns: &[usize],
+    frame_secs: f32,
     pcm: &[i16],
     sample_rate: u32,
-) -> Vec<Interval> {
-    if frames == 0 || state_columns.is_empty() || sample_rate == 0 {
-        return Vec::new();
+) -> DecodedTokens {
+    if attention.frames == 0 || state_columns.is_empty() || sample_rate == 0 {
+        return DecodedTokens::default();
     }
-    let path = viterbi(attention, frames, columns, state_columns);
-    #[allow(clippy::cast_precision_loss)]
-    let frame_secs = pcm.len() as f32 / sample_rate as f32 / frames as f32;
-    let mut spans = frame_spans(&path, state_columns.len())
+    let posterior = state_posterior(attention, state_columns);
+    let path = viterbi(&posterior, attention.frames, state_columns.len());
+    let frames = frame_spans(&path, state_columns.len());
+    let evidence = frames
+        .iter()
+        .enumerate()
+        .map(|(state, span)| {
+            token_evidence(
+                &posterior,
+                attention.frames,
+                state_columns.len(),
+                state,
+                span,
+            )
+        })
+        .collect();
+    let mut intervals = frames
         .into_iter()
         .map(|frames| {
             #[allow(clippy::cast_precision_loss)]
@@ -69,32 +113,68 @@ pub fn decode_intervals(
             }
         })
         .collect::<Vec<_>>();
-    snap_to_voicing(&mut spans, pcm, sample_rate);
-    share_collapsed(&mut spans);
-    spans
+    snap_to_voicing(&mut intervals, pcm, sample_rate);
+    share_collapsed(&mut intervals);
+    DecodedTokens {
+        intervals,
+        evidence,
+    }
 }
 
-/// Monotone path where each frame stays on its state or advances by one, from the first state
-/// to the last. Returns the state of every frame.
-fn viterbi(
-    attention: &[f32],
-    frames: usize,
-    columns: usize,
-    state_columns: &[usize],
-) -> Vec<usize> {
-    let states = state_columns.len();
-    let emissions: Vec<f32> = (0..frames)
+/// Attention of every frame renormalized over the spoken tokens, row-major `[frames, states]`.
+fn state_posterior(attention: Attention<'_>, state_columns: &[usize]) -> Vec<f32> {
+    let columns = attention.columns;
+    (0..attention.frames)
         .flat_map(|t| {
-            let row = attention.get(t * columns..(t + 1) * columns).unwrap_or(&[]);
+            let row = attention
+                .values
+                .get(t * columns..(t + 1) * columns)
+                .unwrap_or(&[]);
             let picked: Vec<f32> = state_columns
                 .iter()
                 .map(|&c| row.get(c).copied().unwrap_or(0.0).max(0.0))
                 .collect();
             let total: f32 = picked.iter().sum::<f32>().max(f32::MIN_POSITIVE);
-            picked
-                .into_iter()
-                .map(move |p| (p / total + EMISSION_FLOOR).ln())
+            picked.into_iter().map(move |p| p / total)
         })
+        .collect()
+}
+
+/// Evidence for `state` on its path frames widened by one frame on each side.
+fn token_evidence(
+    posterior: &[f32],
+    frames: usize,
+    states: usize,
+    state: usize,
+    span: &Range<usize>,
+) -> TokenEvidence {
+    let widened = span.start.saturating_sub(1)..(span.end + 1).min(frames);
+    let mut evidence = TokenEvidence {
+        peak: 0.0,
+        attended: false,
+    };
+    for t in widened {
+        let Some(row) = posterior.get(t * states..(t + 1) * states) else {
+            continue;
+        };
+        let value = row.get(state).copied().unwrap_or(0.0);
+        evidence.peak = evidence.peak.max(value);
+        let best = row
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(index, _)| index);
+        evidence.attended |= best == Some(state);
+    }
+    evidence
+}
+
+/// Monotone path over `posterior` (`[frames, states]`) where each frame stays on its state or
+/// advances by one, from the first state to the last. Returns the state of every frame.
+fn viterbi(posterior: &[f32], frames: usize, states: usize) -> Vec<usize> {
+    let emissions: Vec<f32> = posterior
+        .iter()
+        .map(|&p| (p + EMISSION_FLOOR).ln())
         .collect();
     let emission = |t: usize, s: usize| emissions.get(t * states + s).copied().unwrap_or(f32::MIN);
 
@@ -323,7 +403,7 @@ fn pauses(voiced: &[bool]) -> Vec<Range<usize>> {
 mod tests {
     use std::ops::Range;
 
-    use super::{Interval, decode_intervals, pauses, share_collapsed, viterbi};
+    use super::{Attention, Interval, decode_tokens, pauses, share_collapsed, viterbi};
 
     #[test]
     fn test_should_follow_a_diagonal_attention_path() {
@@ -334,16 +414,13 @@ mod tests {
                 *cell = 1.0;
             }
         }
-        assert_eq!(
-            viterbi(&attention, 6, 3, &[0, 1, 2]),
-            vec![0, 0, 1, 1, 2, 2]
-        );
+        assert_eq!(viterbi(&attention, 6, 3), vec![0, 0, 1, 1, 2, 2]);
     }
 
     #[test]
     fn test_should_visit_every_state_even_when_attention_skips_one() {
         let attention = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
-        let path = viterbi(&attention, 4, 3, &[0, 1, 2]);
+        let path = viterbi(&attention, 4, 3);
         assert_eq!(path.first(), Some(&0));
         assert_eq!(path.last(), Some(&2));
         assert!(path.contains(&1));
@@ -383,7 +460,12 @@ mod tests {
                 *cell = 1.0;
             }
         }
-        let spans = decode_intervals(&attention, 10, 2, &[0, 1], &pcm, 1000);
+        let attention = Attention {
+            values: &attention,
+            frames: 10,
+            columns: 2,
+        };
+        let spans = decode_tokens(attention, &[0, 1], 0.1, &pcm, 1000).intervals;
         assert_eq!(spans.len(), 2, "{spans:?}");
         if let [first, second] = spans.as_slice() {
             assert!((first.end - 0.3).abs() < 0.011, "{first:?}");
@@ -421,9 +503,60 @@ mod tests {
 
     #[test]
     fn test_should_return_nothing_without_states_or_frames() {
-        assert_eq!(
-            decode_intervals(&[], 0, 0, &[], &[], 22_050),
-            Vec::<Interval>::new()
+        let empty = Attention {
+            values: &[],
+            frames: 0,
+            columns: 0,
+        };
+        assert!(
+            decode_tokens(empty, &[], 0.04, &[], 22_050)
+                .intervals
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_should_report_a_token_no_frame_attends_to_as_weak_evidence() {
+        // 6 frames over 3 tokens; token 1 never receives attention (an omitted word).
+        let mut values = vec![0.0_f32; 6 * 3];
+        for t in 0..6 {
+            if let Some(cell) = values.get_mut(t * 3 + if t < 3 { 0 } else { 2 }) {
+                *cell = 1.0;
+            }
+        }
+        let attention = Attention {
+            values: &values,
+            frames: 6,
+            columns: 3,
+        };
+        let pcm = vec![8_000_i16; 600];
+        let decoded = decode_tokens(attention, &[0, 1, 2], 0.1, &pcm, 1000);
+        assert_eq!(decoded.evidence.len(), 3);
+        if let [first, missing, last] = decoded.evidence.as_slice() {
+            assert!(first.attended && last.attended);
+            assert!(!missing.attended, "{missing:?}");
+            assert!(missing.peak < 0.01, "{missing:?}");
+            assert!((first.peak - 1.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_should_use_the_given_frame_length() {
+        let values = [1.0_f32, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0];
+        let attention = Attention {
+            values: &values,
+            frames: 4,
+            columns: 2,
+        };
+        // 1 s of audio but 40 ms frames: the second token starts at 80 ms.
+        let pcm = vec![8_000_i16; 1000];
+        let decoded = decode_tokens(attention, &[0, 1], 0.04, &pcm, 1000);
+        assert!(
+            decoded
+                .intervals
+                .get(1)
+                .is_some_and(|second| (second.start - 0.08).abs() < 1e-6),
+            "{decoded:?}"
         );
     }
 }

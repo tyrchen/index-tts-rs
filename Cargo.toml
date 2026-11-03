@@ -31,6 +31,7 @@ hf-hub = "1.0.0"
 hound = "3.5.1"
 memmap2 = "0.9"
 mlx-rs = { version = "0.33.0", features = ["metal", "safetensors"] }
+pinyin = { version = "0.11.0", default-features = false, features = ["with_tone_num_end"] }
 proptest = "1.12"
 realfft = "3.5.1"
 regex = "1"

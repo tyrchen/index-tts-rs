@@ -4,6 +4,9 @@ PACKAGE_ARGS ?=
 DIST_DIR ?= $(CURDIR)/dist
 RELEASE_VERSION = $(shell sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml)
 FIXTURE_DIR := crates/core/fixtures
+CMUDICT_COMMIT ?= 74790861f652b15e4ac49015a90074ad62a27690
+CMUDICT_URL = https://raw.githubusercontent.com/cmusphinx/cmudict/$(CMUDICT_COMMIT)
+CORE_ASSETS := crates/core/assets
 
 build:
 	@cargo build --workspace --all-targets --locked
@@ -142,6 +145,13 @@ os.path.exists("$(FIXTURE_DIR)/golden_speaker.itts_voice.safetensors") and os.re
 print("Generated golden fixtures successfully in $(FIXTURE_DIR)"); \
 '
 
+# CMU Pronouncing Dictionary for `itts align --phones`: first pronunciation of each word, comments
+# and stress digits removed (word<space>PHONES per line).
+update-cmudict:
+	@curl -fsSL "$(CMUDICT_URL)/LICENSE" -o "$(CORE_ASSETS)/CMUDICT-LICENSE"
+	@curl -fsSL "$(CMUDICT_URL)/cmudict.dict" | awk '{ sub(/ *#.*$$/, ""); if ($$1 ~ /\([0-9]+\)$$/) next; w = $$1; $$1 = ""; gsub(/[0-9]/, ""); sub(/^ /, ""); print w " " $$0 }' > "$(CORE_ASSETS)/cmudict.dict"
+	@wc -l "$(CORE_ASSETS)/cmudict.dict"
+
 check-agent-sync:
 	@cmp -s CLAUDE.md AGENTS.md || { \
 		echo "AGENTS.md must stay in sync with CLAUDE.md"; \
@@ -208,4 +218,4 @@ release: release-check
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: build install install-skill serve test test-nextest lint fmt audit bench generate-fixtures check-agent-sync doc smoke verify-models check-release-tag package release-check release-artifacts publish release update-submodule
+.PHONY: build install install-skill serve test test-nextest lint fmt audit bench generate-fixtures update-cmudict check-agent-sync doc smoke verify-models check-release-tag package release-check release-artifacts publish release update-submodule
