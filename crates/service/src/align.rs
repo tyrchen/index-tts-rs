@@ -221,19 +221,21 @@ pub struct AlignerInfo {
     pub conditioning: String,
 }
 
-/// How well the attention supports the alignment. Results are returned whatever the quality;
-/// low values usually mean the recording does not say the text (omitted or extra words,
-/// numbers read differently).
+/// How well the decoder supports the alignment, over units (a Chinese character, a Latin word,
+/// or a pronunciation override). Results are returned whatever the quality. On clean speech
+/// `confidence` and `coverage` stay above 0.97; below 0.95 the recording most likely does not
+/// say the text (omitted, extra, or substituted words). Numbers read in another form that shares
+/// syllables (`2026` as 两千零二十六) are not detected; use speech recognition for those.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct AlignQuality {
-    /// Mean attention peak of the spoken tokens (`0..=1`).
+    /// Mean attention peak of the units (`0..=1`).
     pub confidence: f32,
-    /// Fraction of spoken tokens some frame attends to most (`0..=1`).
+    /// Fraction of units some frame attends to most (`0..=1`).
     pub coverage: f32,
-    /// Indices into `alignment.text` (Unicode scalars) of characters whose timing the attention
-    /// barely supports, ascending.
+    /// Indices into `alignment.text` (Unicode scalars; a word's first letter) of units the audio
+    /// barely supports: weak attention, or frames the text explains worse than no text.
     pub weak: Vec<usize>,
 }
 

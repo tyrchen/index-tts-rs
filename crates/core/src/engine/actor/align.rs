@@ -12,14 +12,14 @@ use tracing::info;
 use crate::{
     align::{
         AlignmentOutput, AlignmentRequest, AlignmentTimings, CODE_FRAME_SECS, Conditioning,
-        MAX_ALIGN_CODES, MIN_ALIGN_SECS, Recording, TextMap, align_recording,
+        MAX_ALIGN_CODES, MIN_ALIGN_SECS, Recording, Replay, TextMap, align_recording,
         phones::{SpokenText, split_phones},
     },
     config::EmoAlpha,
     dsp::{FBANK_SAMPLE_RATE, audio::decode_audio_file, f32_to_pcm_i16, resample_sinc_hann},
     engine::actor::MlxWorkerState,
     error::{IndexTtsError, Result},
-    frontend::PreparedText,
+    frontend::{PreparedSegment, PreparedText},
     models::{DEFAULT_KV_MAX_SEQ, SemanticEncoder},
     voice::{CONDS_DIM, CONDS_FRAMES},
 };
@@ -39,16 +39,7 @@ impl MlxWorkerState {
     pub(super) fn handle_align(&mut self, req: &AlignmentRequest) -> Result<AlignmentOutput> {
         let started = Instant::now();
         let prepared = self.prepare_alignment_text(req)?;
-        let (samples, sample_rate) = match &req.recording {
-            Recording::File(path) => {
-                let decoded = decode_audio_file(path)?;
-                (Cow::Owned(decoded.samples), decoded.sample_rate)
-            }
-            Recording::Pcm {
-                samples,
-                sample_rate,
-            } => (Cow::Borrowed(samples.as_slice()), *sample_rate),
-        };
+        let (samples, sample_rate) = recording_samples(&req.recording)?;
         let duration_secs = check_duration(samples.len(), sample_rate)?;
         let audio_ms = ms(started);
 
@@ -87,32 +78,23 @@ impl MlxWorkerState {
         let condition_ms = ms(t_condition);
 
         let t_attention = Instant::now();
-        let attention = self.gpt.alignment_attention(
-            &segment.token_ids(),
-            &conds,
-            req.language.token_id(),
-            &[],
-            &codes,
-            &mut self.kv_cache,
-        )?;
-        let _ = mlx_rs::memory::clear_cache();
+        let (attention, gain) =
+            self.replay_codes(segment, &conds, req.language.token_id(), &codes)?;
         let pcm = f32_to_pcm_i16(&audio_16k);
         let map = TextMap::new(&prepared.normalized, req.text.as_str());
-        let aligned = align_recording(
-            segment,
-            &map,
-            &attention,
-            codes.len(),
-            &pcm,
-            FBANK_SAMPLE_RATE,
-        );
+        let text = SpokenText {
+            normalized: &prepared.normalized,
+            body: segment.normalized_range(),
+            map: &map,
+            source: req.text.as_str(),
+        };
+        let replay = Replay {
+            attention: &attention,
+            gain: &gain,
+            frames: codes.len(),
+        };
+        let aligned = align_recording(segment, &text, replay, &pcm, FBANK_SAMPLE_RATE);
         let phones = if req.phones {
-            let text = SpokenText {
-                normalized: &prepared.normalized,
-                body: segment.normalized_range(),
-                map: &map,
-                source: req.text.as_str(),
-            };
             split_phones(&text, &aligned.tokens, &pcm, FBANK_SAMPLE_RATE)
         } else {
             Vec::new()
@@ -134,6 +116,40 @@ impl MlxWorkerState {
                 total_ms: ms(started),
             },
         })
+    }
+
+    /// Teacher-forces `codes` after the segment's text: the alignment attention and every code's
+    /// log-probability gain over the language prefix alone (how predictable the code is without
+    /// the words).
+    fn replay_codes(
+        &mut self,
+        segment: &PreparedSegment,
+        conds: &Array,
+        lang_id: i32,
+        codes: &[i32],
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let forced = self.gpt.teacher_forced(
+            &segment.token_ids(),
+            conds,
+            lang_id,
+            codes,
+            &mut self.kv_cache,
+        )?;
+        let baseline = self.gpt.code_log_probs(
+            &language_prefix(segment),
+            conds,
+            lang_id,
+            codes,
+            &mut self.kv_cache,
+        )?;
+        let _ = mlx_rs::memory::clear_cache();
+        let gain = forced
+            .log_probs
+            .iter()
+            .zip(&baseline)
+            .map(|(with_text, without)| with_text - without)
+            .collect();
+        Ok((forced.attention, gain))
     }
 
     /// Normalizes and tokenizes the text as one decoder pass.
@@ -172,6 +188,37 @@ impl MlxWorkerState {
         self.semantic_encoder
             .as_ref()
             .ok_or_else(|| IndexTtsError::actor("failed to initialize SemanticEncoder"))
+    }
+}
+
+/// Mono samples and sample rate of a recording, decoding a file when needed.
+fn recording_samples(recording: &Recording) -> Result<(Cow<'_, [f32]>, u32)> {
+    Ok(match recording {
+        Recording::File(path) => {
+            let decoded = decode_audio_file(path)?;
+            (Cow::Owned(decoded.samples), decoded.sample_rate)
+        }
+        Recording::Pcm {
+            samples,
+            sample_rate,
+        } => (Cow::Borrowed(samples.as_slice()), *sample_rate),
+    })
+}
+
+/// Token IDs of the segment's language prefix (`<|zh|>` ...), never empty: the first token
+/// stands in when the prefix merged into the first word.
+#[allow(clippy::cast_possible_wrap)]
+fn language_prefix(segment: &PreparedSegment) -> Vec<i32> {
+    let prefix: Vec<i32> = segment
+        .tokens
+        .iter()
+        .filter(|token| token.bytes.end <= segment.prefix_len)
+        .map(|token| token.id as i32)
+        .collect();
+    if prefix.is_empty() {
+        segment.token_ids().into_iter().take(1).collect()
+    } else {
+        prefix
     }
 }
 

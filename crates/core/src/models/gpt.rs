@@ -13,10 +13,10 @@ use std::{iter::once, ops::Range, path::Path};
 use mlx_rs::{
     Array,
     fast::{ScaledDotProductAttentionMask, layer_norm, scaled_dot_product_attention},
-    nn::gelu_approximate,
+    nn::{gelu_approximate, log_softmax},
     ops::{
         concatenate,
-        indexing::{TryIndexMutOp, TryIndexOp},
+        indexing::{TryIndexMutOp, TryIndexOp, take_along_axis},
         matmul, quantized_matmul, softmax_axis, split_equal, stack, tri, zeros,
     },
     transforms::eval,
@@ -422,6 +422,17 @@ impl Gpt2Block {
     }
 }
 
+/// Output of [`Gpt::teacher_forced`].
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct TeacherForced {
+    /// Row-major `[codes, text tokens + 2]` attention averaged over [`ALIGNMENT_HEADS`] (empty
+    /// when not requested).
+    pub attention: Vec<f32>,
+    /// Log-probability of every code given the text and the codes before it.
+    pub log_probs: Vec<f32>,
+}
+
 /// Stage 1 Int8-quantized GPT-2 `UnifiedVoice` autoregressive decoder (`gpt_int8.safetensors`).
 #[derive(Debug, Clone)]
 pub struct Gpt {
@@ -740,6 +751,113 @@ impl Gpt {
         cache.eval_with_logits(&logits)?;
 
         Ok(logits.try_as_slice::<f32>()?.to_vec())
+    }
+
+    /// Replays a recording's `codes` with teacher forcing through the full decoder, returning
+    /// both the [`ALIGNMENT_HEADS`] text attention (as [`Self::alignment_attention`]) and every
+    /// code's log-probability `log p(codes[i] | conds, text, codes[..i])`.
+    ///
+    /// `cache` is used as scratch and reset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError::Validation`] for empty or oversized inputs, or
+    /// [`IndexTtsError::Mlx`] if GPU execution fails.
+    pub fn teacher_forced(
+        &self,
+        text_tokens: &[i32],
+        conds: &Array,
+        lang_id: i32,
+        codes: &[i32],
+        cache: &mut KvCache,
+    ) -> Result<TeacherForced> {
+        self.replay(text_tokens, conds, lang_id, codes, cache, true)
+    }
+
+    /// Teacher-forced log-probability of every code under `text_tokens` (see
+    /// [`Self::teacher_forced`]) without reading attention. Scoring the same codes against two
+    /// texts measures how much each text explains every frame of a recording.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexTtsError::Validation`] for empty or oversized inputs, or
+    /// [`IndexTtsError::Mlx`] if GPU execution fails.
+    pub fn code_log_probs(
+        &self,
+        text_tokens: &[i32],
+        conds: &Array,
+        lang_id: i32,
+        codes: &[i32],
+        cache: &mut KvCache,
+    ) -> Result<Vec<f32>> {
+        Ok(self
+            .replay(text_tokens, conds, lang_id, codes, cache, false)?
+            .log_probs)
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn replay(
+        &self,
+        text_tokens: &[i32],
+        conds: &Array,
+        lang_id: i32,
+        codes: &[i32],
+        cache: &mut KvCache,
+        attention: bool,
+    ) -> Result<TeacherForced> {
+        let Some((_, fed)) = codes.split_last() else {
+            return Err(IndexTtsError::validation(
+                "codes",
+                "codes must not be empty",
+            ));
+        };
+        let emb = self.sequence_embedding(text_tokens, conds, lang_id, fed)?;
+        let seq_len = usize::try_from(emb.dim(1)).unwrap_or(0);
+        let text_lo = CONDS_PREFIX as i32;
+        let text_hi = text_lo + text_tokens.len() as i32 + 2;
+
+        cache.reset();
+        let mut h = emb;
+        let mut maps = Vec::with_capacity(ALIGNMENT_HEADS.len());
+        for (layer_idx, block) in self.blocks.iter().enumerate() {
+            if attention {
+                for &(_, head) in ALIGNMENT_HEADS
+                    .iter()
+                    .filter(|(layer, _)| *layer == layer_idx)
+                {
+                    maps.push(block.head_attention(&h, head, text_hi, text_lo..text_hi)?);
+                }
+            }
+            h = block.forward(&h, layer_idx, cache, seq_len, true)?;
+        }
+        cache.reset();
+        let h = layer_norm(
+            &h,
+            Some(&self.ln_f_weight),
+            Some(&self.ln_f_bias),
+            GPT_NORM_EPS,
+        )?;
+        let queries = layer_norm(
+            &h.try_index((.., text_hi.., ..))?,
+            Some(&self.final_norm_weight),
+            Some(&self.final_norm_bias),
+            GPT_NORM_EPS,
+        )?;
+        let log_probs = log_softmax(&self.mel_head.forward(&queries)?, -1)?;
+        let targets = Array::from_slice(codes, &[1, codes.len() as i32, 1]);
+        let picked = take_along_axis(&log_probs, &targets, -1)?;
+        let attention = if maps.is_empty() {
+            Vec::new()
+        } else {
+            let mean = stack(&maps, 0)?.mean_axis(0, None)?;
+            mean.eval()?;
+            mean.try_as_slice::<f32>()?.to_vec()
+        };
+        picked.eval()?;
+        Ok(TeacherForced {
+            attention,
+            log_probs: picked.try_as_slice::<f32>()?.to_vec(),
+        })
     }
 
     /// Replays generated `codes` (after `prior_codes`, as in [`Self::prefill_after`]) with

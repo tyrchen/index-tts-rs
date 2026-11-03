@@ -45,6 +45,9 @@ pub struct TokenEvidence {
     pub peak: f32,
     /// Whether the token is the most attended spoken token on at least one of those frames.
     pub attended: bool,
+    /// Mean per-frame gain over the token's path frames, when frame gains were given: how much
+    /// better the text explains those frames than a text-free baseline (nats per frame).
+    pub gain: Option<f32>,
 }
 
 /// Decoded timings and attention evidence of every spoken token.
@@ -59,8 +62,10 @@ pub struct DecodedTokens {
 /// Aligns `state_columns.len()` spoken tokens to the attention's code frames.
 ///
 /// `state_columns[s]` is the attention column of spoken token `s`; every frame lasts
-/// `frame_secs`. `pcm` is the audio the frames describe, whose energy envelope moves token edges
-/// off pauses. Returns empty vectors when there are no spoken tokens or no frames.
+/// `frame_secs`. `frame_gain` optionally holds one score per frame (see
+/// [`TokenEvidence::gain`]); pass `&[]` when there is none. `pcm` is the audio the frames
+/// describe, whose energy envelope moves token edges off pauses. Returns empty vectors when
+/// there are no spoken tokens or no frames.
 ///
 /// # Examples
 ///
@@ -71,7 +76,7 @@ pub struct DecodedTokens {
 /// let values = [0.9, 0.1, 0.8, 0.2, 0.1, 0.9, 0.2, 0.8];
 /// let attention = Attention { values: &values, frames: 4, columns: 2 };
 /// let pcm = vec![8_000_i16; 400];
-/// let decoded = decode_tokens(attention, &[0, 1], 0.25, &pcm, 400);
+/// let decoded = decode_tokens(attention, &[0, 1], 0.25, &[], &pcm, 400);
 /// assert_eq!(decoded.intervals.len(), 2);
 /// assert!((decoded.intervals[1].start - 0.5).abs() < 1e-6);
 /// assert!(decoded.evidence.iter().all(|e| e.attended));
@@ -81,6 +86,7 @@ pub fn decode_tokens(
     attention: Attention<'_>,
     state_columns: &[usize],
     frame_secs: f32,
+    frame_gain: &[f32],
     pcm: &[i16],
     sample_rate: u32,
 ) -> DecodedTokens {
@@ -94,13 +100,15 @@ pub fn decode_tokens(
         .iter()
         .enumerate()
         .map(|(state, span)| {
-            token_evidence(
+            let mut evidence = token_evidence(
                 &posterior,
                 attention.frames,
                 state_columns.len(),
                 state,
                 span,
-            )
+            );
+            evidence.gain = mean_gain(frame_gain, span);
+            evidence
         })
         .collect();
     let mut intervals = frames
@@ -152,6 +160,7 @@ fn token_evidence(
     let mut evidence = TokenEvidence {
         peak: 0.0,
         attended: false,
+        gain: None,
     };
     for t in widened {
         let Some(row) = posterior.get(t * states..(t + 1) * states) else {
@@ -167,6 +176,13 @@ fn token_evidence(
         evidence.attended |= best == Some(state);
     }
     evidence
+}
+
+/// Mean of `frame_gain` over `span`, or `None` without gains or frames.
+fn mean_gain(frame_gain: &[f32], span: &Range<usize>) -> Option<f32> {
+    let frames = frame_gain.get(span.clone()).filter(|g| !g.is_empty())?;
+    #[allow(clippy::cast_precision_loss, reason = "frame counts are small")]
+    Some(frames.iter().sum::<f32>() / frames.len() as f32)
 }
 
 /// Monotone path over `posterior` (`[frames, states]`) where each frame stays on its state or
@@ -465,7 +481,7 @@ mod tests {
             frames: 10,
             columns: 2,
         };
-        let spans = decode_tokens(attention, &[0, 1], 0.1, &pcm, 1000).intervals;
+        let spans = decode_tokens(attention, &[0, 1], 0.1, &[], &pcm, 1000).intervals;
         assert_eq!(spans.len(), 2, "{spans:?}");
         if let [first, second] = spans.as_slice() {
             assert!((first.end - 0.3).abs() < 0.011, "{first:?}");
@@ -509,7 +525,7 @@ mod tests {
             columns: 0,
         };
         assert_eq!(
-            decode_tokens(empty, &[], 0.04, &[], 22_050),
+            decode_tokens(empty, &[], 0.04, &[], &[], 22_050),
             super::DecodedTokens::default()
         );
     }
@@ -529,13 +545,22 @@ mod tests {
             columns: 3,
         };
         let pcm = vec![8_000_i16; 600];
-        let decoded = decode_tokens(attention, &[0, 1, 2], 0.1, &pcm, 1000);
+        let decoded = decode_tokens(
+            attention,
+            &[0, 1, 2],
+            0.1,
+            &[2.0, 2.0, 2.0, -3.0, -3.0, -3.0],
+            &pcm,
+            1000,
+        );
         assert_eq!(decoded.evidence.len(), 3);
         if let [first, missing, last] = decoded.evidence.as_slice() {
             assert!(first.attended && last.attended);
             assert!(!missing.attended, "{missing:?}");
             assert!(missing.peak < 0.01, "{missing:?}");
             assert!((first.peak - 1.0).abs() < 1e-6);
+            assert_eq!(first.gain, Some(2.0));
+            assert!(last.gain.is_some_and(|g| g < 0.0), "{last:?}");
         }
     }
 
@@ -549,7 +574,7 @@ mod tests {
         };
         // 1 s of audio but 40 ms frames: the second token starts at 80 ms.
         let pcm = vec![8_000_i16; 1000];
-        let decoded = decode_tokens(attention, &[0, 1], 0.04, &pcm, 1000);
+        let decoded = decode_tokens(attention, &[0, 1], 0.04, &[], &pcm, 1000);
         assert!(
             decoded
                 .intervals

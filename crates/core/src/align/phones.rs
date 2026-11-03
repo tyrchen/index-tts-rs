@@ -380,7 +380,7 @@ pub fn split_phones(
 
 /// Characters of the overridden word: inside `<word|PRON>` when the request text spells the
 /// override, otherwise the whole mapped range.
-fn override_word(source: &str, chars: Range<usize>) -> Range<usize> {
+pub(crate) fn override_word(source: &str, chars: Range<usize>) -> Range<usize> {
     let spelled: Vec<char> = source.chars().skip(chars.start).take(chars.len()).collect();
     match (spelled.first(), spelled.iter().position(|&c| c == '|')) {
         (Some('<'), Some(bar)) if bar > 1 => chars.start + 1..chars.start + bar,
@@ -485,6 +485,34 @@ fn initial_end(initial: &str, interval: Interval, envelope: &Envelope) -> f32 {
         interval.start + shortest,
         (interval.start + duration * MAX_INITIAL_SHARE).max(interval.start + shortest),
     )
+}
+
+/// A span of normalized text whose tokens are judged together: a pronunciation override
+/// (markers included) or a Latin word, which BPE may split into several tokens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JudgedSpan {
+    /// Byte range in the normalized text.
+    pub bytes: Range<usize>,
+    /// Whether the span is a `<word|PRON>` override (reported on the overridden word).
+    pub is_override: bool,
+}
+
+/// Overrides and Latin words of `normalized[body]`, in reading order.
+pub(crate) fn judged_spans(normalized: &str, body: Range<usize>) -> Vec<JudgedSpan> {
+    units(normalized, body)
+        .into_iter()
+        .filter_map(|unit| match unit {
+            Unit::Override { whole, .. } => Some(JudgedSpan {
+                bytes: whole,
+                is_override: true,
+            }),
+            Unit::Word(bytes) => Some(JudgedSpan {
+                bytes,
+                is_override: false,
+            }),
+            Unit::Hanzi(_) => None,
+        })
+        .collect()
 }
 
 /// Pronounceable units of `normalized[body]` in reading order.
