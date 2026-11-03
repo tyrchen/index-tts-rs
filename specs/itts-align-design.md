@@ -1,6 +1,6 @@
 # `itts align`：任意录音的强制对齐（字级时间 + 可选音素）设计 (`itts-align-design`)
 
-- **状态**: 设计 (Design)
+- **状态**: 已实施 (Implemented)；评测结论见 §11
 - **版本**: 1.0
 - **日期**: 2026-11-03
 - **关联组件**: `index-tts-rs-core`（`models::codec`、`align`、`engine`、`voice`）、`index-tts-rs-director`、`index-tts-rs-service`、`itts`（CLI / Daemon / MCP）
@@ -38,7 +38,7 @@ itts align --audio line.wav --lang en --text "The engine runs hot." --voice-file
 | codes 帧率 | w2v-BERT 输出 50 Hz（fbank 10 ms 帧、两两拼接），`down` 步长 2 → **25 Hz，每个 code 40 ms**，与 GPT 生成的 codes 同一套 |
 | 音素的拼音"来自 itts 前端" | **不成立**。itts 前端直接把汉字送进 GPT 的字级分词器，没有字→拼音（只有 `<字\|拼音>` 读音覆盖）。需新增 G2P：中文用 `pinyin` crate（MIT，字级默认读音），英文用 CMUdict（见 §7） |
 
-所以方案 (a) 不需要任何新权重，只需移植编码器 + 量化（约 25 M 参数，与解码器对称），其余（`Gpt::alignment_attention`、Viterbi、能量修正、`TextMap`）复用。
+所以方案 (a) 不需要任何新权重，只需移植编码器 + 量化（约 25 M 参数，与解码器对称），其余（teacher forcing 重放、L4H10+L5H10、Viterbi、能量修正、`TextMap`）复用。
 
 ## 3. 设计总览
 
@@ -51,8 +51,9 @@ core actor（Align 命令）
         ├─ SemanticEncoder::quantize → codes [ceil(T50/2)]（25 Hz）
         └─ 条件 conds：录音本身（前 15 s：EmoVec + CAMPPlus → spk_proj）或给定快照
   文本 → Frontend::prepare_text（单段，≤ 600 token）
-  Gpt::alignment_attention(text, conds, codes)   ← teacher forcing，前 6 层，L4H10+L5H10
-  → 单调 Viterbi（40 ms 网格）→ 能量修正 → token 区间 + 每 token 注意力峰值
+  Gpt::teacher_forced(text, conds, codes)        ← teacher forcing 24 层：L4H10+L5H10 注意力 + 每个 code 的对数概率
+  Gpt::code_log_probs(语言前缀, conds, codes)    ← 基线：没有文本时每个 code 的对数概率
+  → 单调 Viterbi（40 ms 网格）→ 能量修正 → token 区间 + 每个字 / 词的注意力峰值与似然增益
   → TextMap 投影到念的文本（字下标）；quality；phones（split）
   ▼
 service AlignResult{aligner, alignment, sentences, quality, phones?, phonesMethod?, durationSecs, alignSecs, timings}
@@ -71,7 +72,7 @@ service AlignResult{aligner, alignment, sentences, quality, phones?, phonesMetho
   ```
 
 - 惰性加载：第一次 `Align` 时加载（约 100 MB），之后常驻。w2v-BERT / EmoVec / CAMPPlus 复用 actor 已有的惰性 `VoiceExtractor`（约 1.4 GB）。align 之后二者都常驻（reshape 一次要对齐一整片的句子，逐句重载会远超 0.2 s/句的目标）；`itts daemon status` 的 `voiceExtractorLoaded` 反映这一点，daemon 空闲超时退出时一并释放。
-- 正确性：对上游 torch `EnhancedCodec.quantize`（同一份权重）做 codes 比对（评测文档 §2）；在 itts 自己合成的音频上，重新编码的 codes 与 GPT 生成的 codes 的一致率作为模型测试。
+- 正确性：对上游 torch `EnhancedCodec.quantize`（同一份权重）做 codes 比对（评测文档 §2）；在 itts 自己合成的音频上，重新编码的 codes 与 GPT 生成的 codes 是否落在同一语义邻域（经解码器逐帧余弦）作为模型测试（逐码一致率很低，见 §8）。
 
 ## 5. 外来录音对齐（`core::align` + actor）
 
@@ -93,24 +94,32 @@ service AlignResult{aligner, alignment, sentences, quality, phones?, phonesMetho
 
 ### 5.3 解码
 
-- 复用 `Gpt::alignment_attention(tokens, conds, lang, &[], codes)`：重放 `[conds, <BOS>, text, <EOS>, <START_MEL>, codes[..N-1]]`，N 个查询 × (token + 2) 列。
+- `Gpt::teacher_forced(tokens, conds, lang, codes)` 重放 `[conds, <BOS>, text, <EOS>, <START_MEL>, codes[..N-1]]`，N 个查询 × (token + 2) 列。
 - 时间网格：外来录音的第 i 个 code 固定是 `[0.04·i, 0.04·(i+1))` 秒（不再像合成那样用"时长 / codes 数"），所以 `decode` 改为显式接收帧长。能量修正在 16 kHz PCM 上做，规则与合成路径相同（首末字钉到首末有声帧、≥80 ms 停顿吸附到 0.2 s 内最近的边界、塌缩平分）。
 - 时间以录音第 0 秒为基准，单调不减，落在 `[0, durationSecs]`。
 
 ### 5.4 `quality`
 
-Viterbi 之后、能量修正之前，在 40 ms 网格上对每个可读 token *s* 计算：
+只看注意力不够：GPT 的文本注意力是"软"的，少念一个字时会平滑地跨过去（评测里 12 句不一致的录音只标出 2 句）。所以对齐时做两遍 teacher forcing：
 
-- **峰值** `peak(s)`：*s* 被分到的帧（左右各扩 1 帧）上，"在可读列上重新归一化的注意力"对 *s* 的最大值。
-- **被注意**：这些帧里至少有一帧的可读列 argmax 就是 *s*。
+1. **完整一遍**（`Gpt::teacher_forced`，24 层）：同时读 L4H10+L5H10 的注意力（用于对齐，与只跑 6 层的结果相同）和每个 code 的对数概率 `log p(code_i | conds, text, codes<i)`。
+2. **基线一遍**（`Gpt::code_log_probs`）：同样的 codes，文本只有语言前缀（`<|zh|>`）。
+
+每帧的**增益** = 两者之差（nats）：文本对这一帧有多大解释力。录音没说的字，它分到的帧上增益为负。
+
+判断以**单位**进行：一个汉字、一个英文词（BPE 切开的几段合并）、一个读音覆盖（`<axon|AE1 K S AA0 N>` 的音素 token 合并）。单位的证据：注意力峰值取最大、"被注意"取任一、增益取平均。对 Viterbi 之后、能量修正之前的 40 ms 网格：
+
+- **峰值** `peak`：单位被分到的帧（左右各扩 1 帧）上，"在可读列上重新归一化的注意力"对它的最大值。
+- **被注意**：这些帧里至少有一帧的可读列 argmax 是它。
+- **增益** `gain`：它被分到的帧上增益的平均。
 
 | 字段 | 定义 |
 |---|---|
-| `confidence` | 所有可读 token 的 `peak` 平均值（0–1） |
-| `coverage` | 被注意的可读 token 比例 |
-| `weak` | `peak < WEAK_PEAK` 或未被注意的 token，取其投影后的首个可读字下标（`alignment.text` 的 Unicode 标量下标），升序 |
+| `confidence` | 所有单位 `peak` 的平均（0–1） |
+| `coverage` | 被注意的单位比例 |
+| `weak` | `peak < 0.3`（`WEAK_PEAK`）、未被注意、或 `gain < −1`（`WEAK_GAIN`）的单位，取其首个可读字下标（覆盖取被覆盖的字），升序 |
 
-`WEAK_PEAK` 与给调用方建议的阈值（reshape 30 §5.1：`confidence` 初值 0.5、`coverage` 0.9）由评测里的难例（漏念、数字读法不一致）与干净句子的分布定，写进 core 常量与评测文档。阈值以下照常输出、退出码 0，判定交给调用方。
+建议调用方的阈值（评测 §5.4，154 句干净录音最低 confidence 0.974、coverage 0.982）：`confidence < 0.95` 或 `coverage < 0.95` → 补齐不可信（reshape A014）；`weak` 非空 → 送识别复查。阈值以下照常输出、退出码 0。代价：每句约 +15～40 ms。
 
 ## 6. 输出
 
@@ -140,7 +149,7 @@ itts align --audio <FILE> (--text <TEXT> | --stdin) [--lang <CODE>] [--voice <ID
               { "i": 0, "p": "un", "t": 1, "k": "fin", "start": 0.27, "end": 0.52 } ],   // 仅 --phones
   "phonesMethod": "split",                                                            // 仅 --phones
   "durationSecs": 2.03, "alignSecs": 0.09,
-  "timings": { "decodeMs": 3.1, "featuresMs": 21.0, "encodeMs": 4.2, "conditionMs": 9.8, "attentionMs": 30.5, "totalMs": 88.0 }
+  "timings": { "audioMs": 3.1, "featuresMs": 21.0, "encodeMs": 4.2, "conditionMs": 9.8, "attentionMs": 30.5, "totalMs": 88.0 }
 }
 ```
 
@@ -202,6 +211,9 @@ CMUdict：取 `cmusphinx/cmudict` 固定提交，只保留每词首选读音、�
 | §6.2 清声母列表 `p t k q c ch s sh x f h z zh j` | 另含 `b d g` | 普通话不送气塞音也是清音，闭塞段同样没有低频能量；否则这三个声母没有规则 |
 | §5.1 摘要字段 | 另有外层 `status` / `backend`（与 synth 一致）、`aligner.conditioning`、`timings`，`sentences[].chars` | 与 synth 摘要保持同形状；多出的字段只增不改 |
 | `--voice-file` | 另支持 `--voice <ID>` | 与 synth 对称；二者互斥 |
+| §11 第 1 步：重新编码 itts 录音，codes 与 GPT 生成的"一致率预期很高" | 逐码一致只有约 2%（1/60）；解码后逐帧余弦 0.66（错位 2 帧 0.42） | GPT → S2Mel → 声码器 → w2v-BERT 不是恒等映射；codes 落在语义邻域内。对齐不受影响，模型测试改为检查语义邻域 |
+| §5.5"itts 录音：外来路径 vs 原生，字起点平均差 ≤ 10 ms" | 13.5 ms（中位 10 ms） | 两条路径的帧网格不同（约 33 ms vs 40 ms），约 10 ms 是下限；建议改为"对 MMS 不劣于原生路径 5 ms 以内"（实测 20.9 vs 16.7 ms） |
+| §5.1 `quality` 只有注意力峰值与覆盖率、`confidence` 初值 0.5 | 加入似然增益，按字 / 词 / 覆盖为单位判断；建议阈值 0.95 | 只用注意力识别不了大多数漏念；0.5 在评测里只标出 2/12 |
 
 ## 9. 分期
 
@@ -211,10 +223,28 @@ CMUdict：取 `cmusphinx/cmudict` 固定提交，只保留每词首选读音、�
 | P2 | `decode` 显式帧长 + 峰值；actor `Align` 命令（特征、codes、条件、注意力、quality）；`IndexTtsEngine::align` |
 | P3 | `phones`（拼音拆分、CMUdict、低频起振切分） |
 | P4 | service `AlignJob` / `AlignResult` / `TOO_LONG`、director `control_ranges`；CLI `itts align`、daemon v4、MCP、schema、doctor |
-| P5 | 评测（reshape 30 §5.5）与调研文档；按结果定 `quality` 阈值与条件缺省 |
+| P5 | 评测（reshape 30 §5.5）与调研文档；按结果定 `quality` 阈值与条件缺省；加入似然增益（§5.4） |
 
 ## 10. 验证
 
 - 单元测试：编码器权重过滤（保留 / 跳过的键）；`decode` 的峰值与覆盖（合成注意力矩阵：干净对角、整列缺失）；拼音拆分全表（`y/w`、`j/q/x + u`、`zhi` 类、`er`、轻声、覆盖大写）；CMUdict 查表与规则回退；低频起振切分在合成 PCM 上的已知答案（静音 → 噪声 → 低频正弦）；音素下标投影（数字展开、读音覆盖）；`Alignment::from_spans` 单调有界；`control_ranges` 与 `plan_utterances` 一致；`AlignJob` 校验（空文本、互斥参数、相对路径）；协议 v4 的 `align` / `aligned` 序列化；MCP 工具列表含 `align`。
-- 模型测试（`#[ignore]`，需权重，`make verify-models` 会跑）：合成一句 → 重新编码，codes 一致率；`align` 合成音频的外来路径对原生对齐的起点平均差；输出单调、落在 `[0, duration]`、覆盖每个可读字。
+- 模型测试（没有权重时跳过，有权重时随 `make test` 运行）：合成一句（1.0 倍速）→ 重新编码，codes 与生成 codes 的语义邻域；`align` 合成音频的外来路径对原生对齐的起点平均差；输出单调、落在 `[0, duration]`、覆盖每个可读字。
 - 评测（reshape 30 §5.5，结果写进评测文档）：itts 录音（外来 vs 原生）、Gemini（zh / en）、ElevenLabs（zh / en，原生对齐 vs `itts align` vs MMS_FA 三方）、难例（数字读法、漏念、长停顿、中英混排、喊叫）、条件来源、速度、音素分界。
+
+## 11. 评测结论
+
+详见 [评测调研](../docs/research/itts-align-evaluation-research.md)（166 句，Apple M5 Pro）。
+
+| reshape 30 §5.5 过关线 | 结果 | 判定 |
+|---|---|---|
+| 中文字起点对 MMS ≤ 40 ms、≥ 95% ≤ 100 ms | Gemini 18.7 / 29.4 ms，ElevenLabs 21.7 ms，Edge 17.8 ms；96–100% | 过 |
+| 英文词起点 ≤ 60 ms | ElevenLabs 69.7、Gemini 70.2 ms（中位 −35 ms，偏早） | 不过 |
+| itts 录音外来 vs 原生 ≤ 10 ms | 13.5 ms | 不过（见 §8，线本身依赖已否定的假设） |
+| 句末终点 P95 ≤ 80 ms | Gemini / itts 65–80 ms；ElevenLabs 96 / 163、Edge 111 ms（偏晚，A009 安全方向） | 部分不过 |
+| 难例被标为可疑 ≥ 80% | 75%（漏念 / 多念 / 替换 8/8，数字读法 1/4），干净句误报 0/154 | 不过（数字读法需 ASR） |
+| 条件来源 | `recording` 在 8 组中 7 组更准 | 缺省 `recording` |
+| 一句 ≤ 0.2 s | ≤ 10 s 的句子平均 0.11 s；24 s 的句子 0.47 s | ≤ 10 s 过 |
+| 音素分界 ≤ 30 ms | 14.5–25.9 ms | 过 |
+
+中文（reshape 的主要缺口）go；英文有条件使用；数字读法不一致交给 ASR。不转方案 (b)。
+
