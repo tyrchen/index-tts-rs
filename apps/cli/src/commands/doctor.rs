@@ -3,6 +3,8 @@
 use std::{env, path::Path};
 
 use anyhow::Result;
+#[cfg(feature = "asr")]
+use index_tts_rs_asr::{AsrModel, models::resolve};
 use index_tts_rs_core::{
     config::EngineConfig,
     models::{
@@ -40,7 +42,8 @@ pub enum CheckStatus {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Check {
-    /// Area (`platform`, `model`, `hifi`, `align`, `voices`, `daemon`, `director`, `audio`).
+    /// Area (`platform`, `model`, `hifi`, `align`, `asr`, `voices`, `daemon`, `director`,
+    /// `audio`).
     pub name: &'static str,
     /// Health.
     pub status: CheckStatus,
@@ -86,6 +89,7 @@ pub async fn collect(config: &EngineConfig, socket: &Path) -> DoctorReport {
         model_check(config).await,
         hifi_check().await,
         align_check(config).await,
+        asr_check(),
     ];
     checks.extend(voice_checks(config));
     checks.push(daemon_check(socket).await);
@@ -245,6 +249,49 @@ async fn align_check(config: &EngineConfig) -> Check {
         .hint("run `itts models pull`"),
         Err(err) => Check::new("align", CheckStatus::Warn, format!("check failed: {err}")),
     }
+}
+
+/// Which recognizer models are cached; missing ones download on first use, so that is not a
+/// failure.
+#[cfg(feature = "asr")]
+fn asr_check() -> Check {
+    let (cached, missing): (Vec<AsrModel>, Vec<AsrModel>) = AsrModel::ALL
+        .into_iter()
+        .partition(|model| resolve(*model).is_ok());
+    let names = |models: &[AsrModel]| {
+        models
+            .iter()
+            .map(|model| model.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut parts = vec!["speech recognition ready (`itts listen`, `itts verify`)".to_owned()];
+    if !cached.is_empty() {
+        parts.push(format!("cached: {}", names(&cached)));
+    }
+    if !missing.is_empty() {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "sizes are displayed approximately"
+        )]
+        let mib = missing.iter().map(|m| m.total_bytes()).sum::<u64>() as f64 / (1024.0 * 1024.0);
+        parts.push(format!(
+            "downloaded on first use: {} ({mib:.0} MiB)",
+            names(&missing)
+        ));
+    }
+    let summary = parts.join("; ");
+    Check::new("asr", CheckStatus::Ok, summary)
+}
+
+#[cfg(not(feature = "asr"))]
+fn asr_check() -> Check {
+    Check::new(
+        "asr",
+        CheckStatus::Warn,
+        "built without speech recognition: `itts listen` / `itts verify` unavailable",
+    )
+    .hint("rebuild with `cargo install index-tts-rs-cli --features asr`")
 }
 
 fn voice_checks(config: &EngineConfig) -> Vec<Check> {

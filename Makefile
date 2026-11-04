@@ -164,6 +164,19 @@ align-eval:
 	@$(ALIGN_EVAL_UV) itts "$(ALIGN_EVAL_MANIFEST)" "$(ALIGN_EVAL_DIR)itts.json" $(ALIGN_EVAL_ARGS)
 	@$(ALIGN_EVAL_UV) report "$(ALIGN_EVAL_MANIFEST)" --itts "$(ALIGN_EVAL_DIR)itts.json" --mms "$(ALIGN_EVAL_DIR)mms.json" --out "$(ALIGN_EVAL_DIR)report.json"
 
+# `itts listen` / `itts verify` evaluation (docs/research/itts-asr-evaluation.md). ASR_EVAL_MANIFEST is
+# a JSONL of {id, set, audio, text, lang, kind, scribe?} (`asr_eval.py synth` writes the synthetic
+# part). Needs the daemon and whisper-cli; never calls a paid recognizer.
+ASR_EVAL_MANIFEST ?= target/asr-eval/manifest.jsonl
+ASR_EVAL_DIR = $(dir $(ASR_EVAL_MANIFEST))
+ASR_EVAL_UV = uv run -q --python 3.12 --no-project --with pypinyin==0.55.0 --with numpy --with soundfile python -I tools/asr_eval.py
+
+asr-eval:
+	@$(ASR_EVAL_UV) whisper "$(ASR_EVAL_MANIFEST)" "$(ASR_EVAL_DIR)whisper.json"
+	@$(ASR_EVAL_UV) itts "$(ASR_EVAL_MANIFEST)" "$(ASR_EVAL_DIR)verify.json" $(ASR_EVAL_ARGS)
+	@$(ASR_EVAL_UV) itts "$(ASR_EVAL_MANIFEST)" "$(ASR_EVAL_DIR)verify-sense-voice.json" --model sense-voice $(ASR_EVAL_ARGS)
+	@$(ASR_EVAL_UV) report "$(ASR_EVAL_MANIFEST)" --verify "$(ASR_EVAL_DIR)verify.json" --alt "$(ASR_EVAL_DIR)verify-sense-voice.json" --alt-label "verify (sense-voice)" --whisper "$(ASR_EVAL_DIR)whisper.json" --out "$(ASR_EVAL_DIR)asr-report.json"
+
 check-agent-sync:
 	@cmp -s CLAUDE.md AGENTS.md || { \
 		echo "AGENTS.md must stay in sync with CLAUDE.md"; \
@@ -231,4 +244,4 @@ release: release-check
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: build install install-skill serve test test-nextest lint fmt audit bench generate-fixtures update-cmudict align-eval check-agent-sync doc smoke verify-models check-release-tag package release-check release-artifacts publish release update-submodule
+.PHONY: build install install-skill serve test test-nextest lint fmt audit bench generate-fixtures update-cmudict align-eval asr-eval check-agent-sync doc smoke verify-models check-release-tag package release-check release-artifacts publish release update-submodule

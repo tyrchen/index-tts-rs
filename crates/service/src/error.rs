@@ -3,6 +3,7 @@
 //! Agents branch on [`ErrorCode`]; humans read `message`; `hint` is always an actionable next
 //! step (usually a concrete `itts` command). Each code maps to a fixed process exit code.
 
+use index_tts_rs_asr::AsrError;
 use index_tts_rs_core::error::IndexTtsError;
 use index_tts_rs_director::DirectorError;
 use schemars::JsonSchema;
@@ -245,6 +246,24 @@ impl From<&IndexTtsError> for ServiceError {
     }
 }
 
+impl From<AsrError> for ServiceError {
+    fn from(err: AsrError) -> Self {
+        let message = err.to_string();
+        match err {
+            AsrError::InvalidArgument(_) => Self::invalid(message),
+            AsrError::ModelUnavailable { .. } => Self::new(ErrorCode::ModelUnavailable, message)
+                .with_hint(
+                    "recognizer models download from Hugging Face on first use; check the \
+                     network, or run `itts doctor`",
+                ),
+            AsrError::TooLong(_) => Self::new(ErrorCode::TooLong, message)
+                .with_hint("split the recording and its text into shorter pieces"),
+            AsrError::Io { .. } => Self::new(ErrorCode::Io, message),
+            _ => Self::internal(message),
+        }
+    }
+}
+
 impl From<DirectorError> for ServiceError {
     fn from(err: DirectorError) -> Self {
         Self::from(&err)
@@ -281,6 +300,7 @@ impl From<&DirectorError> for ServiceError {
 mod tests {
     use std::collections::HashSet;
 
+    use index_tts_rs_asr::AsrError;
     use index_tts_rs_core::error::IndexTtsError;
     use index_tts_rs_director::DirectorError;
     use rstest::rstest;
@@ -324,6 +344,21 @@ mod tests {
     #[case(IndexTtsError::too_long("audio", "80 s"), ErrorCode::TooLong)]
     fn test_should_map_engine_errors_to_stable_codes(
         #[case] err: IndexTtsError,
+        #[case] code: ErrorCode,
+    ) {
+        assert_eq!(ServiceError::from(err).code, code);
+    }
+
+    #[rstest]
+    #[case(AsrError::invalid("bad model"), ErrorCode::InvalidArgument)]
+    #[case(
+        AsrError::model("sense-voice", "not downloaded"),
+        ErrorCode::ModelUnavailable
+    )]
+    #[case(AsrError::TooLong("long".to_owned()), ErrorCode::TooLong)]
+    #[case(AsrError::actor("gone"), ErrorCode::Internal)]
+    fn test_should_map_recognizer_errors_to_stable_codes(
+        #[case] err: AsrError,
         #[case] code: ErrorCode,
     ) {
         assert_eq!(ServiceError::from(err).code, code);

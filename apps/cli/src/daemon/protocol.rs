@@ -11,12 +11,12 @@ use std::path::PathBuf;
 use index_tts_rs_core::{engine::TelemetrySnapshot, voice::VoiceEntry};
 use index_tts_rs_service::{
     AlignJob, AlignResult, AnnotateJob, AnnotateResult, ApiKey, ChunkInfo, JobEvent, JobStarted,
-    JobSummary, ServiceError, SpeechJob,
+    JobSummary, ListenJob, ListenResult, ServiceError, SpeechJob, VerifyJob, VerifyResult,
 };
 use serde::{Deserialize, Serialize};
 
 /// Protocol version; bumped on any incompatible wire change.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 /// Maximum accepted request line length in bytes.
 pub const MAX_LINE_BYTES: usize = 256 * 1024;
 
@@ -63,6 +63,16 @@ pub enum Request {
     Align {
         /// Job with absolute paths.
         job: Box<AlignJob>,
+    },
+    /// Recognize a recording verbatim.
+    Listen {
+        /// Job with absolute paths.
+        job: Box<ListenJob>,
+    },
+    /// Check that a recording says its script (alignment, recognition, comparison).
+    Verify {
+        /// Job with absolute paths.
+        job: Box<VerifyJob>,
     },
     /// Extract and register a voice using the resident models.
     #[serde(rename_all = "camelCase")]
@@ -148,6 +158,14 @@ pub struct LastError {
     pub at_unix_secs: u64,
 }
 
+/// Speech recognizer state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AsrStatus {
+    /// Recognizer models resident in memory (`sense-voice`, `paraformer`, `parakeet`).
+    pub loaded: Vec<String>,
+}
+
 /// `itts daemon status` payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -180,6 +198,9 @@ pub struct DaemonStatus {
     /// Engine runtime telemetry (once ready).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<TelemetrySnapshot>,
+    /// Speech recognizer state (builds with the `asr` feature).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asr: Option<AsrStatus>,
     /// Job counters.
     pub jobs: JobCounters,
     /// Most recent failure.
@@ -217,6 +238,10 @@ pub enum Response {
     Annotated(Box<AnnotateResult>),
     /// Result of an `align` request.
     Aligned(Box<AlignResult>),
+    /// Result of a `listen` request.
+    Heard(Box<ListenResult>),
+    /// Result of a `verify` request.
+    Verified(Box<VerifyResult>),
     /// Job planned.
     Started(JobStarted),
     /// Job chunk.
@@ -359,6 +384,36 @@ mod tests {
             r#"{"id":5,"method":"align","job":{"audio":"/tmp/a.wav","input":"你好。","phones":true}}"#,
         )?;
         assert!(matches!(envelope.request, Request::Align { job } if job.phones));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_accept_listen_and_verify_requests() -> serde_json::Result<()> {
+        let listen: RequestEnvelope = from_str(
+            r#"{"id":6,"method":"listen","job":{"audio":"/tmp/a.wav","model":"paraformer"}}"#,
+        )?;
+        assert!(
+            matches!(listen.request, Request::Listen { job } if job.model.as_deref() == Some("paraformer"))
+        );
+        let verify: RequestEnvelope = from_str(
+            r#"{"id":7,"method":"verify","job":{"audio":"/tmp/a.wav","input":"你好。","lang":"zh"}}"#,
+        )?;
+        assert!(matches!(verify.request, Request::Verify { job } if job.input == "你好。"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_read_heard_events() -> serde_json::Result<()> {
+        let envelope: ResponseEnvelope = from_str(
+            r#"{"id":6,"event":"heard","recognizer":{"name":"sherpa-onnx","version":1,
+                "model":"paraformer","repo":"r","revision":"v"},"text":"北北","tokens":[
+                {"text":"北","start":0.5,"end":0.75},{"text":"北","start":0.75,"end":1.0}],
+                "durationSecs":1.0,"listenSecs":0.05,"timings":{"audioMs":1.0,"loadMs":0.0,
+                "recognizeMs":40.0,"totalMs":42.0}}"#,
+        )?;
+        assert!(
+            matches!(envelope.response, Response::Heard(result) if result.tokens.len() == 2 && !result.model_downloaded)
+        );
         Ok(())
     }
 

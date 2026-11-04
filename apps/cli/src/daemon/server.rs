@@ -20,15 +20,23 @@ use std::{
 };
 
 use arc_swap::ArcSwapOption;
+#[cfg(feature = "asr")]
+use index_tts_rs_asr::AsrEngine;
 use index_tts_rs_core::{
     config::{EmoAlpha, EmotionVector, EngineConfig, VoiceExtractRequest, VoiceId},
     engine::{IndexTtsEngine, StartupEvent},
     voice::{VoiceEntry, VoiceStore, default_voices_dir},
 };
 use index_tts_rs_director::DirectorConfig;
+#[cfg(not(feature = "asr"))]
+use index_tts_rs_service::asr_unavailable;
 use index_tts_rs_service::{
     AlignJob, AlignResult, Backend, ErrorCode, JobAccumulator, JobRun, JobStarted, JobSummary,
     PathPolicy, ServiceError, SpeechJob, run_align,
+};
+#[cfg(feature = "asr")]
+use index_tts_rs_service::{
+    ListenJob, ListenResult, VerifyJob, VerifyResult, run_listen, run_verify,
 };
 use tokio::{
     fs,
@@ -44,8 +52,8 @@ use tracing::{info, warn};
 use crate::daemon::{
     DaemonPaths,
     protocol::{
-        DaemonState, DaemonStatus, JobCounters, LastError, PROTOCOL_VERSION, ReadyInfo, Request,
-        RequestEnvelope, Response, ResponseEnvelope, StartupLine, VoiceSummary,
+        AsrStatus, DaemonState, DaemonStatus, JobCounters, LastError, PROTOCOL_VERSION, ReadyInfo,
+        Request, RequestEnvelope, Response, ResponseEnvelope, StartupLine, VoiceSummary,
     },
     transport::{encode_line, read_line, write_json},
 };
@@ -97,9 +105,20 @@ enum Phase {
     Failed(ServiceError),
 }
 
+/// The speech recognizer actor and the configuration its jobs are validated against; it does
+/// not wait for the MLX engine.
+#[cfg(feature = "asr")]
+#[derive(Debug)]
+struct Recognition {
+    asr: AsrEngine,
+    config: EngineConfig,
+}
+
 #[derive(Debug)]
 struct Shared {
     opts: DaemonOptions,
+    #[cfg(feature = "asr")]
+    recognition: Recognition,
     voices: VoiceStore,
     started: Instant,
     last_active_ms: AtomicU64,
@@ -181,6 +200,29 @@ impl Shared {
         }
     }
 
+    #[cfg(feature = "asr")]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "`None` in builds without the asr feature"
+    )]
+    fn asr_status(&self) -> Option<AsrStatus> {
+        Some(AsrStatus {
+            loaded: self
+                .recognition
+                .asr
+                .loaded()
+                .iter()
+                .map(|model| model.as_str().to_owned())
+                .collect(),
+        })
+    }
+
+    #[cfg(not(feature = "asr"))]
+    #[allow(clippy::unused_self, reason = "mirrors the asr build")]
+    const fn asr_status(&self) -> Option<AsrStatus> {
+        None
+    }
+
     fn status(&self) -> DaemonStatus {
         let phase = self.phase.borrow().clone();
         let (state, engine) = match &phase {
@@ -207,6 +249,7 @@ impl Shared {
                 .map(VoiceSummary::from)
                 .collect(),
             engine: engine.map(IndexTtsEngine::telemetry),
+            asr: self.asr_status(),
             jobs: JobCounters {
                 in_flight: self.in_flight.load(Ordering::Acquire),
                 max_in_flight: self.opts.max_in_flight,
@@ -269,6 +312,11 @@ async fn serve(
     let shared = Arc::new(Shared {
         voices: VoiceStore::new(voices_dir)?,
         opts,
+        #[cfg(feature = "asr")]
+        recognition: Recognition {
+            asr: AsrEngine::start().map_err(ServiceError::from)?,
+            config: config.clone(),
+        },
         started: Instant::now(),
         last_active_ms: AtomicU64::new(now_unix_ms()),
         phase: phase_rx,
@@ -301,6 +349,8 @@ async fn serve(
     accept_task.abort();
     drain_in_flight(&shared).await;
     remove_runtime_files(&paths).await;
+    #[cfg(feature = "asr")]
+    shared.recognition.asr.stop().map_err(ServiceError::from)?;
     spawn_blocking(move || engine.stop().map_err(ServiceError::from))
         .await
         .map_err(|err| ServiceError::internal(format!("engine shutdown task failed: {err}")))??;
@@ -628,6 +678,28 @@ async fn dispatch(
             })
             .await;
         }
+        #[cfg(feature = "asr")]
+        Request::Listen { job } => {
+            spawn_job(shared, tx, id, jobs, tasks, |shared, _| async move {
+                listen(&shared, *job)
+                    .await
+                    .map(|r| Response::Heard(Box::new(r)))
+            })
+            .await;
+        }
+        #[cfg(feature = "asr")]
+        Request::Verify { job } => {
+            spawn_job(shared, tx, id, jobs, tasks, |shared, _| async move {
+                verify(&shared, *job)
+                    .await
+                    .map(|r| Response::Verified(Box::new(r)))
+            })
+            .await;
+        }
+        #[cfg(not(feature = "asr"))]
+        Request::Listen { .. } | Request::Verify { .. } => {
+            send(tx, id, error_response(asr_unavailable())).await;
+        }
         Request::VoiceAdd {
             voice_id,
             ref_audio,
@@ -731,6 +803,20 @@ async fn align(shared: &Shared, job: AlignJob) -> Result<AlignResult, ServiceErr
     let engine = shared.ready_engine().await?;
     let prepared = job.prepare(engine.config(), PathPolicy::LocalAbsolute)?;
     run_align(&engine, prepared).await
+}
+
+#[cfg(feature = "asr")]
+async fn listen(shared: &Shared, job: ListenJob) -> Result<ListenResult, ServiceError> {
+    let recognition = &shared.recognition;
+    let prepared = job.prepare(&recognition.config, PathPolicy::LocalAbsolute)?;
+    run_listen(&recognition.asr, prepared).await
+}
+
+#[cfg(feature = "asr")]
+async fn verify(shared: &Shared, job: VerifyJob) -> Result<VerifyResult, ServiceError> {
+    let engine = shared.ready_engine().await?;
+    let prepared = job.prepare(engine.config(), PathPolicy::LocalAbsolute)?;
+    run_verify(&engine, &shared.recognition.asr, prepared).await
 }
 
 async fn voice_add(
@@ -890,10 +976,16 @@ mod tests {
     };
 
     use arc_swap::ArcSwapOption;
+    #[cfg(feature = "asr")]
+    use index_tts_rs_asr::AsrEngine;
+    #[cfg(feature = "asr")]
+    use index_tts_rs_core::config::EngineConfig;
     use index_tts_rs_core::voice::VoiceStore;
     use index_tts_rs_service::{ErrorCode, ServiceError};
     use tokio::sync::watch;
 
+    #[cfg(feature = "asr")]
+    use super::Recognition;
     use super::{DaemonOptions, Phase, Shared, now_unix_ms};
     use crate::daemon::{DaemonPaths, protocol::DaemonState};
 
@@ -905,6 +997,11 @@ mod tests {
                 paths: DaemonPaths::new(&voices.join("d.sock")),
                 idle_timeout_secs: 600,
                 max_in_flight,
+            },
+            #[cfg(feature = "asr")]
+            recognition: Recognition {
+                asr: AsrEngine::start().map_err(ServiceError::from)?,
+                config: EngineConfig::default(),
             },
             voices: VoiceStore::new(voices)?,
             started: Instant::now(),
@@ -942,6 +1039,7 @@ mod tests {
         let status = shared.status();
         assert_eq!(status.state, DaemonState::Loading);
         assert!(shared.status().idle_secs >= 29);
+        assert_eq!(status.asr.is_some(), cfg!(feature = "asr"));
         Ok(())
     }
 

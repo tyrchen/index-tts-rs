@@ -141,12 +141,13 @@ itts synth --voice narrator --text "你好。" --out hi.wav --output json
 itts synth --voice narrator --text "第一句。第二句。" --out stream.wav --output jsonl
 itts synth --voice narrator --text "第一句。第二句。" --out timed.wav --timestamps --output json
 itts align --audio take.mp3 --lang zh --text "第一句。第二句。" --phones --output json
+itts verify take.mp3 --lang zh --text "第一句。第二句。" --output json
 itts schema controls
 itts schema speech-job
 itts schema events
 ```
 
-Use `--output text|json|jsonl` or `ITTS_OUTPUT`. JSON synthesis returns fields such as `status`, `backend`, `durationSecs`, `synthesisSecs`, `rtf`, `outputPath`, and the `seed` that reproduces the take. JSONL streams `started` → `chunk` → `done` events; each chunk names the text it reads. `--timestamps` adds per-character `alignment` (ElevenLabs `with-timestamps` shape) and per-sentence `sentences`, derived from the model's own text attention at a cost of tens of milliseconds per job; see the [agent integration guide](docs/usage/itts-agent-integration.md#3-timestamps-sentences-and-reproducible-takes). `itts align` gives the same alignment for a recording you already have (another TTS engine or a human take), with a `quality` report that flags text the audio does not say and optional pinyin/ARPAbet phone timings; see [§3a of the guide](docs/usage/itts-agent-integration.md#3a-aligning-any-recording-itts-align). Runtime failures expose stable `error.code`, `message`, and `hint` fields plus documented exit codes. CLI argument parsing errors use Clap's usage diagnostics and exit code 2.
+Use `--output text|json|jsonl` or `ITTS_OUTPUT`. JSON synthesis returns fields such as `status`, `backend`, `durationSecs`, `synthesisSecs`, `rtf`, `outputPath`, and the `seed` that reproduces the take. JSONL streams `started` → `chunk` → `done` events; each chunk names the text it reads. `--timestamps` adds per-character `alignment` (ElevenLabs `with-timestamps` shape) and per-sentence `sentences`, derived from the model's own text attention at a cost of tens of milliseconds per job; see the [agent integration guide](docs/usage/itts-agent-integration.md#3-timestamps-sentences-and-reproducible-takes). `itts align` gives the same alignment for a recording you already have (another TTS engine or a human take), with a `quality` report that flags text the audio does not say and optional pinyin/ARPAbet phone timings; see [§3a of the guide](docs/usage/itts-agent-integration.md#3a-aligning-any-recording-itts-align). `itts listen` transcribes a recording verbatim with a local non-autoregressive recognizer (Paraformer, SenseVoice, Parakeet via sherpa-onnx; stutters and numbers come back as spoken), and `itts verify` checks a recording against its script, reporting repeats, omissions, insertions, substitutions, and numbers read as other values with times and severities; see [§3b](docs/usage/itts-agent-integration.md#3b-hearing-and-checking-a-recording-itts-listen-itts-verify). Runtime failures expose stable `error.code`, `message`, and `hint` fields plus documented exit codes. CLI argument parsing errors use Clap's usage diagnostics and exit code 2.
 
 For an MCP client that supports stdio servers:
 
@@ -158,7 +159,7 @@ For an MCP client that supports stdio servers:
 }
 ```
 
-Ensure the client can find `itts` on its PATH, or use the absolute binary path. Tools include `status`, `describe_controls`, `synthesize`, `speak`, `align`, voice management, `annotate`, and `annotate_units`. MCP starts the daemon on first use and shares it across sessions. See the [agent integration guide](docs/usage/itts-agent-integration.md) for tool schemas, errors, progress, cancellation, and the socket protocol.
+Ensure the client can find `itts` on its PATH, or use the absolute binary path. Tools include `status`, `describe_controls`, `synthesize`, `speak`, `align`, `listen`, `verify`, voice management, `annotate`, and `annotate_units`. MCP starts the daemon on first use and shares it across sessions. See the [agent integration guide](docs/usage/itts-agent-integration.md) for tool schemas, errors, progress, cancellation, and the socket protocol.
 
 ## Browser studio and HTTP
 
