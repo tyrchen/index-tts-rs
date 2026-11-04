@@ -299,11 +299,13 @@ mod tests {
             &raw(&[("梯田", 1.0), ("水", 3.0)]),
             4.0,
         );
-        assert_eq!(heard.len(), 3);
-        assert!((heard[0].end - (1.0 + MAX_TOKEN_SECS / 2.0)).abs() < 1e-6);
-        assert!((heard[1].start - heard[0].end).abs() < 1e-6);
-        assert!(heard[2].end <= 3.0 + MAX_TOKEN_SECS + 1e-6);
-        assert!(heard.windows(2).all(|w| w[0].start <= w[1].start));
+        let [first, second, third] = heard.as_slice() else {
+            unreachable!("expected 3 tokens, got {}", heard.len());
+        };
+        assert!((first.end - (1.0 + MAX_TOKEN_SECS / 2.0)).abs() < 1e-6);
+        assert!((second.start - first.end).abs() < 1e-6);
+        assert!(third.end <= 3.0 + MAX_TOKEN_SECS + 1e-6);
+        assert!(heard.is_sorted_by(|a, b| a.start <= b.start));
     }
 
     #[test]
@@ -314,7 +316,7 @@ mod tests {
             duration: Some(0.4),
         }];
         let heard = heard_tokens(AsrModel::Parakeet, &tokens, 2.0);
-        assert!((heard[0].end - 2.0).abs() < 1e-6);
+        assert!(heard.first().is_some_and(|t| (t.end - 2.0).abs() < 1e-6));
     }
 
     #[test]

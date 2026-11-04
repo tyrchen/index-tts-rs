@@ -409,12 +409,7 @@ mod tests {
             .collect();
         let transcript = engine.transcribe(AsrModel::SenseVoice, samples).await?;
         assert!(transcript.load_ms > 0.0);
-        assert!(
-            transcript
-                .tokens
-                .windows(2)
-                .all(|w| w[0].start <= w[1].start)
-        );
+        assert!(transcript.tokens.is_sorted_by(|a, b| a.start <= b.start));
         assert!(transcript.tokens.iter().all(|t| t.end <= 1.0));
         assert_eq!(engine.loaded(), [AsrModel::SenseVoice]);
         assert_eq!(engine.evict().await?, 1);

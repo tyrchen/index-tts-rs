@@ -1,11 +1,12 @@
 //! Script verification: what the recognizer heard against what the script says.
 //!
-//! Both texts become pronounced [units](units) — CJK characters compared by toneless pinyin,
-//! numbers by value, Latin words letter by letter — and are aligned by edit distance. Each gap
-//! between matched runs becomes a [`Finding`]: a `repeat` (stutter), `insertion`, `omission`,
-//! `substitution`, or `number` read as another value. Severity combines the size of the gap
-//! with the forced aligner's evidence ([`AlignEvidence`]): a one-character difference the
-//! aligner does not also find weak is most likely the recognizer mishearing a rare word.
+//! Both texts become pronounced units (the private `units` module) — CJK characters compared by
+//! toneless pinyin, numbers by value, Latin words letter by letter — and are aligned by edit
+//! distance. Each gap between matched runs becomes a [`Finding`]: a `repeat` (stutter),
+//! `insertion`, `omission`, `substitution`, or `number` read as another value. Severity combines
+//! the size of the gap with the forced aligner's evidence ([`AlignEvidence`]): a one-character
+//! difference the aligner does not also find weak is most likely the recognizer mishearing a rare
+//! word.
 
 pub mod numbers;
 mod units;
