@@ -9,7 +9,9 @@ description: >-
   (`[[speed=...]]`), pauses (`[[pause=...]]`), manage the warm `itts daemon`,
   annotate reading scripts with DeepSeek (`itts annotate`), or get per-character
   timings and phones for an existing recording from any TTS or speaker
-  (`itts align`).
+  (`itts align`), transcribe a recording verbatim (`itts listen`), or check that
+  a recording says its script — stutters, omissions, misreads, numbers
+  (`itts verify`).
 ---
 
 # `itts` Speech Synthesis & Emotional Prosody Director Skill
@@ -112,6 +114,16 @@ Useful flags: `--speed 0.9` (larger is faster), `--emo "calm:0.6"`, `--lang en`,
 - Default conditioning is the recording itself; `--voice <ID>` / `--voice-file <PATH>` use a snapshot instead (faster, slightly less accurate).
 - Over-long inputs fail with `TOO_LONG` (exit 12): split the audio and text.
 
+### Hearing and checking a recording
+
+`itts listen line.wav --lang zh --output json` transcribes verbatim with a local non-autoregressive recognizer (Paraformer for `zh`/`zh/en`, SenseVoice for `yue`/`ja`, Parakeet for `en`; `--model` overrides; each model downloads once on first use). Unlike Whisper it keeps stutters and repeats and returns numbers as spoken; `tokens` are one per character or word with approximate `start`/`end`.
+
+`itts verify line.mp3 --lang zh --stdin --output json < say.txt` aligns and recognizes at once and returns `verdict` (`clean`/`info`/`warning`/`error`), `findings` (`kind`: `repeat`, `insertion`, `omission`, `substitution`, `number`; `severity`; `expected`, `heard`; `chars` into the script; `start`/`end` seconds), the recognizer output under `heard`, and the full alignment under `align`.
+
+- Treat `error` (a stutter/re-read, or a number read as another value) as "re-record"; `warning` (two or more units differ, or one the aligner also doubts) as "listen and probably re-record"; `info` (one character/word, usually the recognizer mishearing a rare word or product name) as "glance at it".
+- Homophones written differently by the recognizer and numbers read in another form with the same value (`2026年` as 两千零二十六年) are not findings. Same-character misreadings (行业 as xíng yè) are not detected.
+- The command exits 0 whatever the verdict; failures use the usual codes (`INVALID_ARGUMENT` for a language without a recognizer, `MODEL_UNAVAILABLE` when a model cannot be downloaded).
+
 ## 5. Directing Emotion, Tone Temperature, Speed & Pauses
 
 When generating expressive speech (poetry, storytelling, audiobooks, dialogues), **do not pass flat unannotated text** if emotional nuance is desired. Either:
@@ -152,7 +164,7 @@ For detailed calibration guidelines and complete poetry/dialogue templates (such
 
 ## 6. MCP Server
 
-`itts mcp` serves the Model Context Protocol over stdio and shares the daemon (starting it on first use), so multiple agent sessions share one resident model. Tools: `status`, `describe_controls`, `synthesize` (requires `outputPath`), `speak`, `align` (fields of `itts schema align-job`), `list_voices`, `inspect_voice`, `register_voice`, `remove_voice`, `annotate`, `annotate_units`. Tool arguments use the same fields as `itts schema speech-job` (`input`, `voice`, `voiceFile`, `refAudio`, `emo`, `lang`, `speed`, `paragraphPauseMs`, `outputPath`, `sampleRate`, `timestamps`, `continuity`, `previousText`, `advanced`). Failures are `isError` results whose structured content is `{code, message, hint}`. Long jobs report `notifications/progress` per segment and honor cancellation.
+`itts mcp` serves the Model Context Protocol over stdio and shares the daemon (starting it on first use), so multiple agent sessions share one resident model. Tools: `status`, `describe_controls`, `synthesize` (requires `outputPath`), `speak`, `align` (fields of `itts schema align-job`), `listen` / `verify` (`itts schema listen-job` / `verify-job`), `list_voices`, `inspect_voice`, `register_voice`, `remove_voice`, `annotate`, `annotate_units`. Tool arguments use the same fields as `itts schema speech-job` (`input`, `voice`, `voiceFile`, `refAudio`, `emo`, `lang`, `speed`, `paragraphPauseMs`, `outputPath`, `sampleRate`, `timestamps`, `continuity`, `previousText`, `advanced`). Failures are `isError` results whose structured content is `{code, message, hint}`. Long jobs report `notifications/progress` per segment and honor cancellation.
 
 ## 7. Verification
 
