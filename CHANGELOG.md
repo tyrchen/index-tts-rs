@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## 0.4.0
+
+- Added `itts align`: force-align any recording (another TTS provider or a
+  human speaker) to its text, returning the `synth` per-character timing shape,
+  an alignment quality score, and optional pinyin / ARPAbet phones.
+- Added local verbatim ASR on sherpa-onnx (`index-tts-rs-asr`, cargo feature
+  `asr`, on by default): `itts listen` transcribes with per-token timestamps
+  (Paraformer for Mandarin, SenseVoice for Cantonese / Japanese, Parakeet for
+  English), and `itts verify` combines alignment and recognition to report
+  stutters, omissions, insertions, substitutions and misread numbers against
+  the script. Models download on first use with pinned revisions.
+- The daemon protocol is now 5 (`align`, `listen`, `verify`); restart a
+  running daemon after upgrading. MCP gains `align`, `listen` and `verify`.
+
 ## 0.3.1
 
 - Changed the default `top_k` from 10 to 3. Sampling wider candidate sets
