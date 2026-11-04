@@ -26,6 +26,8 @@ use clap::{Parser, Subcommand};
 use index_tts_rs_core::config::EngineConfig;
 use tracing_subscriber::EnvFilter;
 
+#[cfg(feature = "asr")]
+use crate::commands::{listen::ListenArgs, verify::VerifyArgs};
 use crate::{
     commands::{
         AnnotateArgs, SchemaTarget, align::AlignArgs, annotate, daemon::DaemonCommand, doctor,
@@ -66,6 +68,14 @@ enum Commands {
     /// Force-align a recording to the text it speaks: per-character timings (the `synth`
     /// alignment shape), quality, and optional phones.
     Align(Box<AlignArgs>),
+    /// Recognize a recording verbatim (stutters and numbers as spoken): text and per-character
+    /// / per-word timings.
+    #[cfg(feature = "asr")]
+    Listen(Box<ListenArgs>),
+    /// Check that a recording says its script: alignment plus recognition, compared into
+    /// findings (repeats, omissions, insertions, substitutions, numbers) with times.
+    #[cfg(feature = "asr")]
+    Verify(Box<VerifyArgs>),
     /// Add `DeepSeek` pacing and emotion controls without rewriting the text.
     Annotate(AnnotateArgs),
     /// Manage `.itts_voice` speaker snapshots.
@@ -155,6 +165,14 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Align(args) => {
             commands::align::run(globals.engine_config()?, *args, output).await
+        }
+        #[cfg(feature = "asr")]
+        Commands::Listen(args) => {
+            commands::listen::run(globals.engine_config()?, *args, output).await
+        }
+        #[cfg(feature = "asr")]
+        Commands::Verify(args) => {
+            commands::verify::run(globals.engine_config()?, *args, output).await
         }
         Commands::Voice { action } => {
             commands::voice::run(globals.engine_config()?, action, output).await

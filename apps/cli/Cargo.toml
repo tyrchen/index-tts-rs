@@ -15,6 +15,12 @@ homepage.workspace = true
 name = "itts"
 path = "src/main.rs"
 
+[features]
+default = ["asr"]
+# `itts listen` / `itts verify`, their daemon requests and MCP tools: local speech recognition with
+# sherpa-onnx (ONNX Runtime, linked statically).
+asr = ["dep:index-tts-rs-asr", "index-tts-rs-service/asr"]
+
 [dependencies]
 anyhow.workspace = true
 arc-swap.workspace = true
@@ -22,6 +28,7 @@ clap.workspace = true
 cpal.workspace = true
 flume.workspace = true
 hf-hub.workspace = true
+index-tts-rs-asr = { workspace = true, optional = true, features = ["recognizer"] }
 index-tts-rs-core.workspace = true
 index-tts-rs-director.workspace = true
 index-tts-rs-service.workspace = true

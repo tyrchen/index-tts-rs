@@ -22,6 +22,8 @@ use index_tts_rs_service::{
     AlignJob, AlignResult, AnnotateJob, AnnotateResult, Catalog, ErrorCode, JobEvent, JobSummary,
     ServiceError, SpeechJob, catalog, resolve_input_path,
 };
+#[cfg(feature = "asr")]
+use index_tts_rs_service::{ListenJob, ListenResult, VerifyJob, VerifyResult};
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
     handler::server::tool::{schema_for_input, schema_for_output},
@@ -54,8 +56,10 @@ const INSTRUCTIONS: &str =
      registered voices and readiness, and `describe_controls` for inline control syntax \
      ([[pause=600]], [[speed=0.9]], [[emo=calm:0.6]], [[temp=0.7]]) and emotion names. \
      `synthesize` writes a WAV (outputPath required); `speak` plays aloud; `align` times an \
-     existing recording against its text. Relative paths resolve against the server's working \
-     directory. Errors are structured {code, message, hint}; follow the hint.";
+     existing recording against its text; `listen` transcribes a recording verbatim and `verify` \
+     checks it against its script (stutters, omissions, misreads, numbers). Relative paths \
+     resolve against the server's working directory. Errors are structured {code, message, hint}; \
+     follow the hint.";
 
 /// Arguments for `register_voice`.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -146,7 +150,11 @@ fn tool<In: JsonSchema + 'static>(
 fn tools() -> Vec<Tool> {
     let read_only = ToolAnnotations::new().read_only(true).destructive(false);
     let writes = ToolAnnotations::new().read_only(false).destructive(false);
-    vec![
+    #[cfg_attr(
+        not(feature = "asr"),
+        allow(unused_mut, reason = "asr tools are appended")
+    )]
+    let mut all = vec![
         tool::<SpeechJob>(
             "synthesize",
             "Synthesize speech to a 22.05 kHz mono WAV at outputPath. Supports inline controls \
@@ -214,10 +222,32 @@ fn tools() -> Vec<Tool> {
         tool::<NoArgs>(
             "describe_controls",
             "Inline control syntax, emotion names, languages, parameter ranges, and error codes.",
-            read_only,
+            read_only.clone(),
         )
         .with_raw_output_schema(schema_for_output::<Catalog>()),
-    ]
+    ];
+    #[cfg(feature = "asr")]
+    all.extend([
+        tool::<ListenJob>(
+            "listen",
+            "Transcribe a recording verbatim with a local non-autoregressive recognizer \
+             (Paraformer for Mandarin, SenseVoice for Cantonese / Japanese, Parakeet for English; \
+             at most 120 s): text and one timed token per character or word. Stutters and repeats \
+             are kept and numbers come back as spoken.",
+            read_only.clone(),
+        )
+        .with_raw_output_schema(schema_for_output::<ListenResult>()),
+        tool::<VerifyJob>(
+            "verify",
+            "Check that a recording says its script: forced alignment and verbatim recognition \
+             compared into findings (repeat, insertion, omission, substitution, number) with \
+             severity (error / warning / info), script character range, and time span; `verdict` \
+             is the worst severity. Also returns the alignment (same shape as align).",
+            read_only,
+        )
+        .with_raw_output_schema(schema_for_output::<VerifyResult>()),
+    ]);
+    all
 }
 
 impl ServerHandler for IttsMcp {
@@ -286,6 +316,18 @@ impl IttsMcp {
                 let mut job: AlignJob = parse(name, args)?;
                 job.resolve_paths(&self.cwd)?;
                 json_value(&self.client().await?.align(&job).await?)
+            }
+            #[cfg(feature = "asr")]
+            "listen" => {
+                let mut job: ListenJob = parse(name, args)?;
+                job.resolve_paths(&self.cwd)?;
+                json_value(&self.client().await?.listen(&job).await?)
+            }
+            #[cfg(feature = "asr")]
+            "verify" => {
+                let mut job: VerifyJob = parse(name, args)?;
+                job.resolve_paths(&self.cwd)?;
+                json_value(&self.client().await?.verify(&job).await?)
             }
             "list_voices" => {
                 parse::<NoArgs>(name, args)?;
@@ -448,6 +490,10 @@ mod tests {
             "describe_controls",
             "register_voice",
             "align",
+            #[cfg(feature = "asr")]
+            "listen",
+            #[cfg(feature = "asr")]
+            "verify",
         ] {
             assert!(names.contains(expected), "missing tool {expected}");
         }

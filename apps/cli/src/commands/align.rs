@@ -15,7 +15,10 @@ use serde::Serialize;
 use tokio::task::spawn_blocking;
 
 use crate::{
-    commands::synth::{MAX_STDIN_TEXT_BYTES, read_text},
+    commands::{
+        synth::{MAX_STDIN_TEXT_BYTES, read_text},
+        warn_daemon_unusable,
+    },
     daemon::{client::DaemonClient, default_socket_path},
     output::OutputMode,
 };
@@ -104,18 +107,7 @@ async fn execute(
         match DaemonClient::connect(socket).await {
             Ok(Some(mut client)) => return Ok((client.align(job).await?, Backend::Daemon, None)),
             Ok(None) => {}
-            Err(error) => {
-                let mut err = io::stderr().lock();
-                let _ = writeln!(
-                    err,
-                    "⚠ daemon unusable [{}]: {}; aligning in-process instead",
-                    error.code.as_str(),
-                    error.message
-                );
-                if let Some(hint) = &error.hint {
-                    let _ = writeln!(err, "  hint: {hint}");
-                }
-            }
+            Err(error) => warn_daemon_unusable(&error, "aligning in-process instead"),
         }
     }
     let started = Instant::now();

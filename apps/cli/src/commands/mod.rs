@@ -3,11 +3,18 @@
 pub mod align;
 pub mod daemon;
 pub mod doctor;
+#[cfg(feature = "asr")]
+pub mod listen;
 pub mod models;
 pub mod synth;
+#[cfg(feature = "asr")]
+pub mod verify;
 pub mod voice;
 
-use std::path::PathBuf;
+use std::{
+    io::{self, Write},
+    path::PathBuf,
+};
 
 use anyhow::Result;
 use clap::{Args, ValueEnum};
@@ -42,6 +49,20 @@ pub struct AnnotateArgs {
     director_config: Option<PathBuf>,
 }
 
+/// Tells the user on stderr that the daemon cannot be used and what happens instead.
+pub(crate) fn warn_daemon_unusable(error: &ServiceError, fallback: &str) {
+    let mut err = io::stderr().lock();
+    let _ = writeln!(
+        err,
+        "⚠ daemon unusable [{}]: {}; {fallback}",
+        error.code.as_str(),
+        error.message
+    );
+    if let Some(hint) = &error.hint {
+        let _ = writeln!(err, "  hint: {hint}");
+    }
+}
+
 /// Documents published by `itts schema`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SchemaTarget {
@@ -61,6 +82,14 @@ pub enum SchemaTarget {
     AlignJob,
     /// JSON Schema of `itts align --output json` (`AlignResult`).
     AlignResult,
+    /// JSON Schema of the recognition request (`ListenJob`).
+    ListenJob,
+    /// JSON Schema of `itts listen --output json` (`ListenResult`).
+    ListenResult,
+    /// JSON Schema of the verification request (`VerifyJob`).
+    VerifyJob,
+    /// JSON Schema of `itts verify --output json` (`VerifyResult`).
+    VerifyResult,
 }
 
 /// Runs `itts annotate`.
@@ -129,6 +158,10 @@ pub fn schema(target: SchemaTarget) -> Result<()> {
         SchemaTarget::AnnotateResult => json_schema(SchemaKind::AnnotateResult),
         SchemaTarget::AlignJob => json_schema(SchemaKind::AlignJob),
         SchemaTarget::AlignResult => json_schema(SchemaKind::AlignResult),
+        SchemaTarget::ListenJob => json_schema(SchemaKind::ListenJob),
+        SchemaTarget::ListenResult => json_schema(SchemaKind::ListenResult),
+        SchemaTarget::VerifyJob => json_schema(SchemaKind::VerifyJob),
+        SchemaTarget::VerifyResult => json_schema(SchemaKind::VerifyResult),
         SchemaTarget::Controls => to_value(catalog())?,
     };
     OutputMode::Json.emit(&value, |_| Ok(()))

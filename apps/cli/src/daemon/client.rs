@@ -7,7 +7,8 @@ use std::{
 
 use index_tts_rs_core::voice::VoiceEntry;
 use index_tts_rs_service::{
-    AlignJob, AlignResult, ErrorCode, JobEvent, JobSummary, ServiceError, SpeechJob,
+    AlignJob, AlignResult, ErrorCode, JobEvent, JobSummary, ListenJob, ListenResult, ServiceError,
+    SpeechJob, VerifyJob, VerifyResult,
 };
 use serde_json::{Value, from_value};
 use tokio::{
@@ -171,6 +172,50 @@ impl DaemonClient {
             .await?;
         match self.recv(id).await? {
             Response::Aligned(result) => Ok(*result),
+            Response::Error { error } => Err(error),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Recognizes a recording with the daemon's recognizer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the recognition failure.
+    #[cfg_attr(
+        not(feature = "asr"),
+        allow(dead_code, reason = "used by `itts listen` and MCP")
+    )]
+    pub async fn listen(&mut self, job: &ListenJob) -> Result<ListenResult, ServiceError> {
+        let id = self
+            .send(Request::Listen {
+                job: Box::new(job.clone()),
+            })
+            .await?;
+        match self.recv(id).await? {
+            Response::Heard(result) => Ok(*result),
+            Response::Error { error } => Err(error),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Verifies a recording against its script with the daemon's resident models.
+    ///
+    /// # Errors
+    ///
+    /// Returns the verification failure.
+    #[cfg_attr(
+        not(feature = "asr"),
+        allow(dead_code, reason = "used by `itts verify` and MCP")
+    )]
+    pub async fn verify(&mut self, job: &VerifyJob) -> Result<VerifyResult, ServiceError> {
+        let id = self
+            .send(Request::Verify {
+                job: Box::new(job.clone()),
+            })
+            .await?;
+        match self.recv(id).await? {
+            Response::Verified(result) => Ok(*result),
             Response::Error { error } => Err(error),
             other => Err(unexpected(&other)),
         }

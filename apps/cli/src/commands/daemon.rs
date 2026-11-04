@@ -305,6 +305,14 @@ fn render_status(status: &DaemonStatus, output: OutputMode) -> Result<()> {
                 }
             )?;
         }
+        if let Some(asr) = &status.asr {
+            let loaded = if asr.loaded.is_empty() {
+                "none loaded".to_owned()
+            } else {
+                asr.loaded.join(", ")
+            };
+            writeln!(out, "  asr      {loaded}")?;
+        }
         let names: Vec<&str> = status.voices.iter().map(|v| v.id.as_str()).collect();
         writeln!(
             out,
