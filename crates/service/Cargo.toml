@@ -11,8 +11,15 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 
+[features]
+default = ["asr"]
+# Local speech recognition (`run_listen`, `run_verify`) through sherpa-onnx. The listen / verify job
+# and result types compile without it.
+asr = ["index-tts-rs-asr/recognizer", "dep:tokio"]
+
 [dependencies]
 base64.workspace = true
+index-tts-rs-asr.workspace = true
 index-tts-rs-core.workspace = true
 index-tts-rs-director.workspace = true
 schemars.workspace = true
@@ -20,6 +27,7 @@ secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, optional = true }
 typed-builder.workspace = true
 
 [dev-dependencies]

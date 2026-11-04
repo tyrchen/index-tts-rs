@@ -11,7 +11,9 @@ use crate::{
     annotation::{AnnotateJob, AnnotateResult},
     error::{ErrorCode, ServiceError},
     events::JobEvent,
+    listen::{ListenJob, ListenResult},
     request::{MAX_SILENCE_MS, MAX_SPEED, MIN_SPEED, SpeechJob},
+    verify::{VerifyJob, VerifyResult},
 };
 
 /// Chinese aliases accepted for each emotion, in [`EMOTION_NAMES`] order.
@@ -156,6 +158,14 @@ pub enum SchemaKind {
     AlignJob,
     /// The [`AlignResult`] response.
     AlignResult,
+    /// The [`ListenJob`] request.
+    ListenJob,
+    /// The [`ListenResult`] response.
+    ListenResult,
+    /// The [`VerifyJob`] request.
+    VerifyJob,
+    /// The [`VerifyResult`] response.
+    VerifyResult,
 }
 
 /// Returns the JSON Schema for `kind`.
@@ -175,6 +185,10 @@ pub fn json_schema(kind: SchemaKind) -> Value {
         SchemaKind::AnnotateResult => schema_for!(AnnotateResult),
         SchemaKind::AlignJob => schema_for!(AlignJob),
         SchemaKind::AlignResult => schema_for!(AlignResult),
+        SchemaKind::ListenJob => schema_for!(ListenJob),
+        SchemaKind::ListenResult => schema_for!(ListenResult),
+        SchemaKind::VerifyJob => schema_for!(VerifyJob),
+        SchemaKind::VerifyResult => schema_for!(VerifyResult),
     };
     to_value(schema).unwrap_or(Value::Null)
 }
