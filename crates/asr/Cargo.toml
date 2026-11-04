@@ -1,0 +1,36 @@
+[package]
+name = "index-tts-rs-asr"
+description = "Local verbatim speech recognition (sherpa-onnx SenseVoice, Paraformer, Parakeet) and script verification for itts"
+categories = ["multimedia::audio", "science"]
+keywords = ["asr", "speech-recognition", "sherpa-onnx", "sensevoice", "verification"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+
+[features]
+default = ["recognizer"]
+# The sherpa-onnx recognizer actor and first-use model downloads. Without it the crate is the
+# pure-Rust model table and script comparison.
+recognizer = ["dep:arc-swap", "dep:blake3", "dep:flume", "dep:hf-hub", "dep:sherpa-onnx", "dep:tokio", "dep:tracing"]
+
+[dependencies]
+arc-swap = { workspace = true, optional = true }
+blake3 = { workspace = true, optional = true }
+flume = { workspace = true, optional = true }
+hf-hub = { workspace = true, optional = true }
+pinyin = { workspace = true, features = ["heteronym", "plain"] }
+sherpa-onnx = { workspace = true, optional = true }
+thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+rstest.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
